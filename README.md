@@ -113,8 +113,12 @@ All under `services.claude-box`:
 
 ## Security model
 
-- **Unprivileged by default.** Agents run as normal users, not root — this also
-  matters because Claude Code refuses `--dangerously-skip-permissions` as root.
+- **Unprivileged by default.** Agents run as normal users, not root — this is
+  the OS-level sandbox boundary, and it's separate from Claude's own approval
+  prompts. (`skipPermissions` defaults to `true`, i.e. *no* in-tool prompts;
+  that's autonomy inside Claude Code, not OS privilege — see the heads-up
+  below.) Running non-root also matters because Claude Code refuses
+  `--dangerously-skip-permissions` as root.
 - **Scoped elevation.** `sudoAllowlist` is the entire set of root-capable
   actions; there is no blanket sudo.
 - **Isolation.** For a skip-permissions agent, prefer the VM target — a KVM
