@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >
+  claude-box — 1-click NixOS host running Claude Code inside a persistent tmux
+  session, accessed through a browser terminal (Caddy + ttyd).
+  Source: https://github.com/defangdevs/claude-box
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m6i.large
+      - m6i.xlarge
+      - c6i.large
+    Description: >-
+      EC2 instance type. t3.small (~2 GB RAM) is fine for a single light agent.
+      Bump up for heavier builds.
+
+  WebPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    MaxLength: 64
+    AllowedPattern: ^[A-Za-z0-9!@#%^&*()_+=,./?~-]{12,64}$
+    Description: >-
+      Password for the browser terminal (HTTP Basic Auth, username "claude").
+      12–64 chars, no spaces or quote characters.
+
+  AllowCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: ^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$
+    Description: >-
+      CIDR range allowed to reach ports 22 (SSH) and 443 (web terminal). Default
+      is open to the internet — restrict to your IP for stricter access.
+
+  ClaudeBoxRev:
+    Type: String
+    Default: beb8d317a0ad0c61cbb90ec80f680eea51e5657d
+    Description: >-
+      Git rev of defangdevs/claude-box (the module to install).
+
+  ClaudeBoxSha256:
+    Type: String
+    Default: 0nsi906jhs8l5ghfmk63s6f0v5wycdc373f7p95l3scdgm4hy93a
+    Description: >-
+      Nix base-32 sha256 of the module tarball at ClaudeBoxRev. Regenerate via
+      `nix-prefetch-url --unpack https://github.com/defangdevs/claude-box/archive/<REV>.tar.gz`.
+
+Mappings:
+  # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
+  RegionMap:
+    us-east-1:
+      AMI: ami-0afa19b238bdf9da0
+    us-west-2:
+      AMI: ami-0521ba8e76c2094b9
+    eu-central-1:
+      AMI: ami-00ae5c892b1a9cb23
+    eu-west-1:
+      AMI: ami-0a7e28f614241d0af
+  # END AMI MAP
+
+Resources:
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'claude-box: 443 (web terminal) + 22 (SSH)'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowCidr
+          Description: Web terminal (Caddy)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowCidr
+          Description: SSH (needs an EC2 key pair — attach via the console if desired)
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
+      SecurityGroupIds:
+        - !GetAtt SecurityGroup.GroupId
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      Tags:
+        - Key: Name
+          Value: claude-box
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            { config, pkgs, lib, modulesPath, ... }:
+            let
+              claude-box = builtins.fetchTarball {
+                url = "https://github.com/defangdevs/claude-box/archive/${ClaudeBoxRev}.tar.gz";
+                sha256 = "${ClaudeBoxSha256}";
+              };
+              hostname = "${EIP}.sslip.io";
+              webPassword = "${WebPassword}";
+            in {
+              imports = [
+                "${!modulesPath}/virtualisation/amazon-image.nix"
+                (claude-box + "/modules/claude-box.nix")
+              ];
+
+              services.claude-box = {
+                enable = true;
+                users.agent = {
+                  environment = { TERM = "xterm-256color"; };
+                };
+              };
+
+              networking.firewall.allowedTCPPorts = [ 22 443 ];
+
+              services.caddy = {
+                enable = true;
+                virtualHosts."${!hostname}" = {
+                  extraConfig = ''
+                    tls {
+                      issuer acme {
+                        disable_http_challenge
+                      }
+                    }
+                    reverse_proxy 127.0.0.1:7681
+                  '';
+                };
+              };
+
+              systemd.services.claude-web-terminal = {
+                description = "Browser terminal (ttyd) attached to agent's tmux";
+                after = [ "claude-box-agent.service" "network-online.target" ];
+                wants = [ "network-online.target" ];
+                wantedBy = [ "multi-user.target" ];
+                serviceConfig = {
+                  User = "agent";
+                  Restart = "always";
+                  RestartSec = "5s";
+                  ExecStart = "${!pkgs.ttyd}/bin/ttyd -p 7681 -i 127.0.0.1 -c claude:${!webPassword} -t titleFixed=claude-box ${!pkgs.tmux}/bin/tmux -L claude-box attach -t main";
+                };
+              };
+
+              # Don't re-apply user-data on every reboot — protects local edits.
+              systemd.services.amazon-init.enable = lib.mkForce false;
+            }
+
+  EIPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref Instance
+      AllocationId: !GetAtt EIP.AllocationId
+
+Outputs:
+  WebURL:
+    Description: >-
+      Browser terminal. First load takes ~2–3 minutes while the instance
+      provisions and Caddy issues an ACME cert. Username: claude.
+    Value: !Sub https://${EIP}.sslip.io/
+
+  PublicIP:
+    Description: Elastic IP address of the instance.
+    Value: !Ref EIP
+
+  InstanceId:
+    Description: EC2 instance id.
+    Value: !Ref Instance

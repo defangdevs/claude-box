@@ -1,0 +1,50 @@
+name: Publish CFN template to S3
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'aws/template.yaml'
+      - '.github/workflows/publish-template.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: publish-template
+  cancel-in-progress: false
+
+permissions:
+  id-token: write   # for OIDC AssumeRoleWithWebIdentity
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: defang-claude-box   # matches trust policy prefix "defang-"
+    env:
+      AWS_REGION: us-east-1
+      BUCKET: defang-claude-box
+      OBJECT_KEY: template.yaml
+      ROLE_ARN: arn:aws:iam::180162796851:role/defang-cd-CIRole
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Validate template locally
+        run: |
+          pip install --quiet cfn-lint
+          cfn-lint aws/template.yaml
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate template with CloudFormation
+        run: aws cloudformation validate-template --template-body "file://aws/template.yaml"
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp aws/template.yaml "s3://${BUCKET}/${OBJECT_KEY}" \
+            --content-type "application/x-yaml" \
+            --cache-control "no-cache, max-age=0"
+          echo "::notice::Published to https://${BUCKET}.s3.amazonaws.com/${OBJECT_KEY}"

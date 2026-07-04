@@ -60,6 +60,31 @@ sudo -u alice tmux -L claude-box attach -t main
 Credentials live in that user's `~/.claude` — per-user runtime state, never
 baked into the config.
 
+## 1-click AWS launch
+
+Provisions one EC2 instance (NixOS 25.11) with the module + a browser terminal
+(Caddy → ttyd) already wired up. First load takes ~2–3 minutes while the AMI
+provisions, `nixos-rebuild switch` applies the config, and Caddy issues a
+Let's Encrypt cert against `<eip>.sslip.io`.
+
+| Region | Launch |
+| --- | --- |
+| us-east-1 (N. Virginia) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
+| us-west-2 (Oregon) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
+| eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
+| eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
+
+Set a `WebPassword` (12+ chars), pick an instance size, launch. The stack's
+Outputs show the URL, which prompts for HTTP Basic Auth (user `claude`,
+password whatever you set). Log in and complete the one-time Claude sign-in.
+
+Costs: ~$0.02/hr for `t3.small` on-demand + $0/hr for the Elastic IP while
+attached (~$3.60/mo if you keep it up). Terminate the stack to stop billing.
+
+Template source: [`aws/template.yaml`](./aws/template.yaml).
+See [`aws/README.md`](./aws/README.md) for the region → AMI refresh workflow
+and the S3-hosting setup.
+
 ## VM image
 
 Build from the same config:

@@ -1,0 +1,36 @@
+name: Refresh NixOS AMIs
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays 06:17 UTC (offset to avoid GH's on-the-hour bursts)
+  workflow_dispatch:
+
+permissions:
+  contents: write   # push AMI-map bump directly to master
+
+concurrency:
+  group: refresh-amis
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Regenerate AMI map
+        run: python3 scripts/refresh_amis.py
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet aws/template.yaml; then
+            echo "No AMI changes."
+            exit 0
+          fi
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add aws/template.yaml
+          git commit -m "Refresh NixOS AMI map (25.11)"
+          git push
