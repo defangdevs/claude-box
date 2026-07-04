@@ -104,7 +104,7 @@ jobs:
           web_url=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
             --query 'Stacks[0].Outputs[?OutputKey==`WebURL`].OutputValue | [0]' --output text)
           public_ip=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-            --query 'Stacks[0].Outputs[?OutputKey==`PublicIP`].OutputValue | [0]' --output text)
+            --query 'Stacks[0].Outputs[?OutputKey==`PublicAddress`].OutputValue | [0]' --output text)
           echo "web_url=$web_url"   >> "$GITHUB_OUTPUT"
           echo "public_ip=$public_ip" >> "$GITHUB_OUTPUT"
           echo "::notice::Stack up. WebURL=$web_url  PublicIP=$public_ip"

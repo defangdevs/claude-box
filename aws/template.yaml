@@ -125,6 +125,10 @@ Resources:
         - 0
         - !Cidr [!Select [0, !GetAtt Vpc.Ipv6CidrBlocks], 1, 64]
       AssignIpv6AddressOnCreation: true
+      # DNS64: the VPC resolver returns synthesized AAAA in 64:ff9b::/96 for
+      # IPv4-only hostnames (github.com etc.). Combined with the NAT64 route
+      # below, an IPv6-only instance can reach IPv4-only upstreams via the IGW.
+      EnableDns64: true
 
   RouteTable:
     Type: AWS::EC2::RouteTable
@@ -145,6 +149,17 @@ Resources:
     Properties:
       RouteTableId: !Ref RouteTable
       DestinationIpv6CidrBlock: ::/0
+      GatewayId: !Ref Igw
+
+  # NAT64: IGW translates traffic to 64:ff9b::/96 into IPv4 automatically
+  # (since Nov 2023). Together with EnableDns64 on the subnet, this lets an
+  # IPv6-only instance reach IPv4-only sites like github.com.
+  RouteNat64:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationIpv6CidrBlock: 64:ff9b::/96
       GatewayId: !Ref Igw
 
   SubnetRouteAssoc:
@@ -204,6 +219,20 @@ Resources:
 
   Instance:
     Type: AWS::EC2::Instance
+    # In IPv4 mode: wait for EIPAssoc so the instance has a public IPv4 the
+    # moment it starts booting. Otherwise amazon-init can't reach GitHub
+    # (github.com is IPv4-only) to fetch the claude-box module tarball.
+    # EIPAssoc is conditional, but CFN correctly skips the wait when the
+    # condition is false. cfn-lint's E3005 is over-eager here.
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3005
+    DependsOn:
+      - IgwAttach
+      - SubnetRouteAssoc
+      - EIPAssoc
     Properties:
       InstanceType: !Ref InstanceType
       ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
