@@ -74,11 +74,19 @@ Let's Encrypt cert against `<eip>.sslip.io`.
 | eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
 | eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
 
-Set a `WebPassword` (16+ URL-safe chars — it's embedded in the URL as a path
-token, since browsers don't reliably attach Basic Auth to WebSocket upgrades),
-pick an instance size, launch. The stack's Outputs show a URL like
-`https://<eip>.sslip.io/<token>/` — open it, complete the one-time Claude
-sign-in, and you're in.
+At launch pick your **default VPC + a default subnet** from the dropdowns (any
+AZ works), set a `WebPassword` (16+ URL-safe chars — the URL includes it as a
+path token since browsers don't reliably attach Basic Auth to WebSocket
+upgrades), and go. The stack Outputs show
+`https://<v6-or-v4>.sslip.io/<token>/` — open, complete the one-time Claude
+sign-in, done.
+
+**Cost note (Feb-2024 AWS IPv4 pricing).** The default is **IPv6-only** to
+avoid the ~$3.60/mo public-IPv4 charge that AWS bills for *every* public IPv4,
+elastic or not. Works if your client has IPv6 connectivity (most consumer ISPs
+in NA/EU do; corporate/coffee-shop nets often don't). If IPv6 isn't reachable
+for you, set `PublicIpv4: true` at launch — allocates an EIP, adds $3.60/mo,
+works everywhere.
 
 Costs: ~$0.02/hr for `t3.small` on-demand + $0/hr for the Elastic IP while
 attached (~$3.60/mo if you keep it up). Terminate the stack to stop billing.

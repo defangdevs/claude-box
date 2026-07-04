@@ -62,6 +62,20 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Look up default VPC + subnet
+        id: net
+        run: |
+          vpc=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" \
+            --query 'Vpcs[0].VpcId' --output text)
+          subnet=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$vpc" "Name=default-for-az,Values=true" \
+            --query 'Subnets[0].SubnetId' --output text)
+          [ -n "$vpc" ] && [ "$vpc" != "None" ] || { echo "::error::no default VPC"; exit 1; }
+          [ -n "$subnet" ] && [ "$subnet" != "None" ] || { echo "::error::no default subnet"; exit 1; }
+          echo "vpc=$vpc" >> "$GITHUB_OUTPUT"
+          echo "subnet=$subnet" >> "$GITHUB_OUTPUT"
+          echo "::notice::Using VPC=$vpc Subnet=$subnet"
+
       - name: Generate WebPassword (URL-safe path token)
         id: pw
         run: |
@@ -71,12 +85,15 @@ jobs:
       - name: Create stack
         id: create
         run: |
-          # Use DO_NOTHING (not DELETE) so we can inspect events on failure;
-          # the always-run destroy step below cleans up in any case.
+          # GH Actions runners are IPv4-only, so this test forces PublicIpv4=true
+          # even though the template's default is IPv6-only.
           aws cloudformation create-stack \
             --stack-name "$STACK_NAME" \
             --template-body "file://aws/template.yaml" \
             --parameters \
+              "ParameterKey=VpcId,ParameterValue=${{ steps.net.outputs.vpc }}" \
+              "ParameterKey=SubnetId,ParameterValue=${{ steps.net.outputs.subnet }}" \
+              "ParameterKey=PublicIpv4,ParameterValue=true" \
               "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
               "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't3.small' }}" \
             --on-failure DO_NOTHING \

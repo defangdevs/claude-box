@@ -16,6 +16,20 @@ Description: >
   Source: https://github.com/defangdevs/claude-box
 
 Parameters:
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      A subnet in your **default VPC** (any AZ works). The AWS console will
+      show you a dropdown - pick any subnet whose "Default subnet" column
+      says Yes. Required even in IPv6-only mode so we can attach an explicit
+      NetworkInterface and read the assigned IPv6 back into the CFN Output.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >-
+      The VPC that contains the subnet above. Console shows a dropdown -
+      pick your **default VPC** (marked "Default: Yes").
+
   InstanceType:
     Type: String
     Default: t3.small
@@ -29,7 +43,16 @@ Parameters:
       - c6i.large
     Description: >-
       EC2 instance type. t3.small (~2 GB RAM) is fine for a single light agent.
-      Bump up for heavier builds.
+
+  PublicIpv4:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      false (default): IPv6-only. No public IPv4 charge (~$0/mo for the
+      network address). Requires the client to have IPv6 connectivity.
+      true: allocate an Elastic IP for a stable IPv4. ~$3.60/mo per AWS's
+      2024 IPv4 pricing (charged for any public IPv4, EIP or not).
 
   WebPassword:
     Type: String
@@ -48,14 +71,13 @@ Parameters:
     Default: 0.0.0.0/0
     AllowedPattern: ^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$
     Description: >-
-      CIDR range allowed to reach ports 22 (SSH) and 443 (web terminal). Default
-      is open to the internet - restrict to your IP for stricter access.
+      IPv4 CIDR allowed to reach 22/443. Default is open. IPv6 ingress is
+      always ::/0 - restrict at the SG level after launch if needed.
 
   ClaudeBoxRev:
     Type: String
     Default: beb8d317a0ad0c61cbb90ec80f680eea51e5657d
-    Description: >-
-      Git rev of defangdevs/claude-box (the module to install).
+    Description: Git rev of defangdevs/claude-box (the module to install).
 
   ClaudeBoxSha256:
     Type: String
@@ -63,6 +85,9 @@ Parameters:
     Description: >-
       Nix base-32 sha256 of the module tarball at ClaudeBoxRev. Regenerate via
       `nix-prefetch-url --unpack https://github.com/defangdevs/claude-box/archive/<REV>.tar.gz`.
+
+Conditions:
+  UseIpv4: !Equals [!Ref PublicIpv4, 'true']
 
 Mappings:
   # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py - do not edit by hand)
@@ -78,34 +103,63 @@ Mappings:
   # END AMI MAP
 
 Resources:
-  EIP:
-    Type: AWS::EC2::EIP
-    Properties:
-      Domain: vpc
-
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: 'claude-box: 443 (web terminal) + 22 (SSH)'
+      GroupDescription: 'claude-box: 443 (web terminal) + 22 (SSH), v4 + v6'
+      VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: !Ref AllowCidr
-          Description: Web terminal (Caddy)
+          Description: Web terminal (Caddy) v4
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: ::/0
+          Description: Web terminal (Caddy) v6
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
           CidrIp: !Ref AllowCidr
-          Description: SSH (needs an EC2 key pair - attach via the console if desired)
+          Description: SSH v4
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIpv6: ::/0
+          Description: SSH v6
+
+  # NetworkInterface: created explicitly so we can Fn::GetAtt.PrimaryIpv6Address.
+  NetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref SubnetId
+      Ipv6AddressCount: 1
+      GroupSet:
+        - !GetAtt SecurityGroup.GroupId
+
+  EIP:
+    Type: AWS::EC2::EIP
+    Condition: UseIpv4
+    Properties:
+      Domain: vpc
+
+  EIPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Condition: UseIpv4
+    Properties:
+      NetworkInterfaceId: !Ref NetworkInterface
+      AllocationId: !GetAtt EIP.AllocationId
 
   Instance:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: !Ref InstanceType
       ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
-      SecurityGroupIds:
-        - !GetAtt SecurityGroup.GroupId
+      NetworkInterfaces:
+        - NetworkInterfaceId: !Ref NetworkInterface
+          DeviceIndex: 0
       MetadataOptions:
         HttpTokens: required
         HttpPutResponseHopLimit: 2
@@ -114,83 +168,95 @@ Resources:
           Value: claude-box
       UserData:
         Fn::Base64:
-          Fn::Sub: |
-            { config, pkgs, lib, modulesPath, ... }:
-            let
-              claude-box = builtins.fetchTarball {
-                url = "https://github.com/defangdevs/claude-box/archive/${ClaudeBoxRev}.tar.gz";
-                sha256 = "${ClaudeBoxSha256}";
-              };
-              hostname = "${EIP}.sslip.io";
-              webPassword = "${WebPassword}";
-            in {
-              imports = [
-                "${!modulesPath}/virtualisation/amazon-image.nix"
-                (claude-box + "/modules/claude-box.nix")
-              ];
-
-              services.claude-box = {
-                enable = true;
-                users.agent = {
-                  environment = { TERM = "xterm-256color"; };
+          Fn::Sub:
+            - |
+              { config, pkgs, lib, modulesPath, ... }:
+              let
+                claude-box = builtins.fetchTarball {
+                  url = "https://github.com/defangdevs/claude-box/archive/${ClaudeBoxRev}.tar.gz";
+                  sha256 = "${ClaudeBoxSha256}";
                 };
-              };
+                hostname = "${WebHostname}";
+                webPassword = "${WebPassword}";
+              in {
+                imports = [
+                  "${!modulesPath}/virtualisation/amazon-image.nix"
+                  (claude-box + "/modules/claude-box.nix")
+                ];
 
-              networking.firewall.allowedTCPPorts = [ 22 443 ];
+                services.claude-box = {
+                  enable = true;
+                  users.agent = {
+                    environment = { TERM = "xterm-256color"; };
+                  };
+                };
 
-              services.caddy = {
-                enable = true;
-                virtualHosts."${!hostname}" = {
-                  extraConfig = ''
-                    tls {
-                      issuer acme {
-                        disable_http_challenge
+                networking.firewall.allowedTCPPorts = [ 22 443 ];
+
+                services.caddy = {
+                  enable = true;
+                  virtualHosts."${!hostname}" = {
+                    extraConfig = ''
+                      tls {
+                        issuer acme {
+                          disable_http_challenge
+                        }
                       }
-                    }
-                    @authed path /${!webPassword}/*
-                    handle @authed {
-                      reverse_proxy 127.0.0.1:7681
-                    }
-                    respond 404
-                  '';
+                      @authed path /${!webPassword}/*
+                      handle @authed {
+                        reverse_proxy 127.0.0.1:7681
+                      }
+                      respond 404
+                    '';
+                  };
                 };
-              };
 
-              systemd.services.claude-web-terminal = {
-                description = "Browser terminal (ttyd) attached to agent's tmux";
-                after = [ "claude-box-agent.service" "network-online.target" ];
-                wants = [ "network-online.target" ];
-                wantedBy = [ "multi-user.target" ];
-                serviceConfig = {
-                  User = "agent";
-                  Restart = "always";
-                  RestartSec = "5s";
-                  ExecStart = "${!pkgs.ttyd}/bin/ttyd --writable -p 7681 -i 127.0.0.1 -b /${!webPassword}/ -t titleFixed=claude-box ${!pkgs.tmux}/bin/tmux -L claude-box attach -t main";
+                systemd.services.claude-web-terminal = {
+                  description = "Browser terminal (ttyd) attached to agent's tmux";
+                  after = [ "claude-box-agent.service" "network-online.target" ];
+                  wants = [ "network-online.target" ];
+                  wantedBy = [ "multi-user.target" ];
+                  serviceConfig = {
+                    User = "agent";
+                    Restart = "always";
+                    RestartSec = "5s";
+                    ExecStart = "${!pkgs.ttyd}/bin/ttyd --writable -p 7681 -i 127.0.0.1 -b /${!webPassword}/ -t titleFixed=claude-box ${!pkgs.tmux}/bin/tmux -L claude-box attach -t main";
+                  };
                 };
-              };
 
-              # Don't re-apply user-data on every reboot - protects local edits.
-              systemd.services.amazon-init.enable = lib.mkForce false;
-            }
-
-  EIPAssoc:
-    Type: AWS::EC2::EIPAssociation
-    Properties:
-      InstanceId: !Ref Instance
-      AllocationId: !GetAtt EIP.AllocationId
+                # Don't re-apply user-data on every reboot - protects local edits.
+                systemd.services.amazon-init.enable = lib.mkForce false;
+              }
+            - WebHostname: !If
+                - UseIpv4
+                - !Sub "${EIP}.sslip.io"
+                - !Sub
+                  - "${IpDashed}.sslip.io"
+                  - IpDashed: !Join
+                      - '-'
+                      - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
 
 Outputs:
   WebURL:
     Description: >-
       Browser terminal. First load takes ~2-3 minutes while the instance
       provisions and Caddy issues an ACME cert. The URL includes your
-      WebPassword as a path segment - keep it private (treat it like a
-      pre-shared key).
-    Value: !Sub https://${EIP}.sslip.io/${WebPassword}/
+      WebPassword as a path segment - keep it private.
+    Value: !If
+      - UseIpv4
+      - !Sub "https://${EIP}.sslip.io/${WebPassword}/"
+      - !Sub
+        - "https://${IpDashed}.sslip.io/${WebPassword}/"
+        - IpDashed: !Join
+            - '-'
+            - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
 
-  PublicIP:
-    Description: Elastic IP address of the instance.
-    Value: !Ref EIP
+  PublicAddress:
+    Description: Elastic IP (IPv4 mode) or primary IPv6 (IPv6 mode).
+    Value: !If
+      - UseIpv4
+      - !Ref EIP
+      - !GetAtt NetworkInterface.PrimaryIpv6Address
 
   InstanceId:
     Description: EC2 instance id.
