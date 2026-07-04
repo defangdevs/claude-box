@@ -74,9 +74,11 @@ Let's Encrypt cert against `<eip>.sslip.io`.
 | eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
 | eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
 
-Set a `WebPassword` (12+ chars), pick an instance size, launch. The stack's
-Outputs show the URL, which prompts for HTTP Basic Auth (user `claude`,
-password whatever you set). Log in and complete the one-time Claude sign-in.
+Set a `WebPassword` (16+ URL-safe chars — it's embedded in the URL as a path
+token, since browsers don't reliably attach Basic Auth to WebSocket upgrades),
+pick an instance size, launch. The stack's Outputs show a URL like
+`https://<eip>.sslip.io/<token>/` — open it, complete the one-time Claude
+sign-in, and you're in.
 
 Costs: ~$0.02/hr for `t3.small` on-demand + $0/hr for the Elastic IP while
 attached (~$3.60/mo if you keep it up). Terminate the stack to stop billing.

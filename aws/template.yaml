@@ -1,5 +1,15 @@
 AWSTemplateFormatVersion: '2010-09-09'
 
+# W2010: WebPassword is NoEcho but appears in the WebURL output. That is by
+# design - the whole point of the output is to give the user the URL, and the
+# token is part of the URL. Anyone with cloudformation:DescribeStacks on this
+# stack can see it; treat that as the same trust boundary as the shared secret.
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        - W2010
+
 Description: >
   claude-box - 1-click NixOS host running Claude Code inside a persistent tmux
   session, accessed through a browser terminal (Caddy + ttyd).
@@ -24,12 +34,14 @@ Parameters:
   WebPassword:
     Type: String
     NoEcho: true
-    MinLength: 12
+    MinLength: 16
     MaxLength: 64
-    AllowedPattern: ^[A-Za-z0-9!@#%^&*()_+=,./?~-]{12,64}$
+    AllowedPattern: ^[A-Za-z0-9._~-]{16,64}$
     Description: >-
-      Password for the browser terminal (HTTP Basic Auth, username "claude").
-      12–64 chars, no spaces or quote characters.
+      Shared secret for the browser terminal. Embedded into the URL as a path
+      token (browsers do not reliably attach Basic Auth to WebSocket upgrades,
+      so we go path-token instead of a username/password prompt).
+      16-64 URL-safe chars: [A-Za-z0-9._~-].
 
   AllowCidr:
     Type: String
@@ -135,7 +147,11 @@ Resources:
                         disable_http_challenge
                       }
                     }
-                    reverse_proxy 127.0.0.1:7681
+                    @authed path /${!webPassword}/*
+                    handle @authed {
+                      reverse_proxy 127.0.0.1:7681
+                    }
+                    respond 404
                   '';
                 };
               };
@@ -149,7 +165,7 @@ Resources:
                   User = "agent";
                   Restart = "always";
                   RestartSec = "5s";
-                  ExecStart = "${!pkgs.ttyd}/bin/ttyd --writable -p 7681 -i 127.0.0.1 -c claude:${!webPassword} -t titleFixed=claude-box ${!pkgs.tmux}/bin/tmux -L claude-box attach -t main";
+                  ExecStart = "${!pkgs.ttyd}/bin/ttyd --writable -p 7681 -i 127.0.0.1 -b /${!webPassword}/ -t titleFixed=claude-box ${!pkgs.tmux}/bin/tmux -L claude-box attach -t main";
                 };
               };
 
@@ -166,9 +182,11 @@ Resources:
 Outputs:
   WebURL:
     Description: >-
-      Browser terminal. First load takes ~2–3 minutes while the instance
-      provisions and Caddy issues an ACME cert. Username: claude.
-    Value: !Sub https://${EIP}.sslip.io/
+      Browser terminal. First load takes ~2-3 minutes while the instance
+      provisions and Caddy issues an ACME cert. The URL includes your
+      WebPassword as a path segment - keep it private (treat it like a
+      pre-shared key).
+    Value: !Sub https://${EIP}.sslip.io/${WebPassword}/
 
   PublicIP:
     Description: Elastic IP address of the instance.

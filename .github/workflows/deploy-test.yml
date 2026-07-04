@@ -62,10 +62,10 @@ jobs:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Generate WebPassword
+      - name: Generate WebPassword (URL-safe path token)
         id: pw
         run: |
-          # 48 hex chars — well within the template's AllowedPattern.
+          # 48 hex chars — matches the template's AllowedPattern [A-Za-z0-9._~-]{16,64}.
           echo "value=$(openssl rand -hex 24)" >> "$GITHUB_OUTPUT"
 
       - name: Create stack
@@ -108,32 +108,44 @@ jobs:
           echo "public_ip=$public_ip" >> "$GITHUB_OUTPUT"
           echo "::notice::Stack up. WebURL=$web_url  PublicIP=$public_ip"
 
-      - name: Smoke test — expect 401 Basic-Auth challenge
+      - name: Smoke test — wait for the token URL to serve ttyd HTML
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
-          # NixOS boot + nixos-rebuild + Caddy ACME can add 5-10 min after CFN reports done.
+          # NixOS boot + nixos-rebuild + Caddy ACME can add 2-10 min after CFN reports done.
           for i in $(seq 1 60); do
             code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$url" || true)
             echo "[$i/60] GET $url -> $code"
-            if [ "$code" = "401" ]; then
-              echo "::notice::Got 401 (Basic-Auth challenge) — Caddy + ttyd are up."
+            if [ "$code" = "200" ]; then
+              echo "::notice::Token URL is serving (HTTP 200) - Caddy + ttyd are up."
               break
             fi
             sleep 10
           done
-          if [ "$code" != "401" ]; then
-            echo "::error::Never got a 401 from $url after 10 min."
+          if [ "$code" != "200" ]; then
+            echo "::error::Never got 200 from $url after 10 min."
             exit 1
           fi
 
-      - name: Smoke test — authenticate and verify ttyd is serving
+      - name: Smoke test — verify wrong-token URL returns 404
+        run: |
+          # Path other than /$TOKEN/* must NOT reach ttyd.
+          host=$(echo '${{ steps.outputs.outputs.web_url }}' | awk -F/ '{print $3}')
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 5 "https://$host/" || true)
+          if [ "$code" = "404" ]; then
+            echo "::notice::Bare host returns 404 as expected (token path required)."
+          else
+            echo "::error::Expected 404 at https://$host/ (no token), got $code."
+            exit 1
+          fi
+
+      - name: Smoke test — verify ttyd HTML body
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
-          body=$(curl -sS --max-time 15 -u "claude:${{ steps.pw.outputs.value }}" "$url")
+          body=$(curl -sS --max-time 15 "$url")
           if echo "$body" | grep -qi "ttyd\|terminal"; then
             echo "::notice::ttyd HTML served correctly."
           else
-            echo "::error::Authenticated but response body doesn't look like ttyd:"
+            echo "::error::Response body doesn't look like ttyd:"
             echo "$body" | head -20
             exit 1
           fi
@@ -141,11 +153,10 @@ jobs:
       - name: Smoke test — WebSocket upgrade
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
-          # A successful upgrade returns 101 Switching Protocols. Anything else
-          # (401 = auth not reaching ttyd through Caddy, 502 = Caddy can't proxy the
-          # upgrade, 000 = network) means the browser terminal will disconnect.
+          # 101 = Switching Protocols (success). Anything else means the browser
+          # terminal will show 'disconnected'. No Basic Auth needed - the token
+          # is in the path.
           code=$(curl -sS -o /dev/null -w "%{http_code}" --http1.1 --max-time 10 \
-            -u "claude:${{ steps.pw.outputs.value }}" \
             -H "Connection: Upgrade" \
             -H "Upgrade: websocket" \
             -H "Sec-WebSocket-Version: 13" \
@@ -156,7 +167,7 @@ jobs:
           if [ "$code" = "101" ]; then
             echo "::notice::WebSocket upgrade succeeded (101 Switching Protocols)."
           else
-            echo "::error::WebSocket upgrade failed (got $code, expected 101). Terminal will show 'disconnected'."
+            echo "::error::WebSocket upgrade failed (got $code, expected 101)."
             exit 1
           fi
 
