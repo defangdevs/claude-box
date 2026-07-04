@@ -69,17 +69,33 @@ jobs:
           echo "value=$(openssl rand -hex 24)" >> "$GITHUB_OUTPUT"
 
       - name: Create stack
+        id: create
         run: |
+          # Use DO_NOTHING (not DELETE) so we can inspect events on failure;
+          # the always-run destroy step below cleans up in any case.
           aws cloudformation create-stack \
             --stack-name "$STACK_NAME" \
             --template-body "file://aws/template.yaml" \
             --parameters \
               "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
               "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't3.small' }}" \
-            --on-failure DELETE \
+            --on-failure DO_NOTHING \
             --tags "Key=Purpose,Value=claude-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
           echo "::notice::Waiting for stack ${STACK_NAME} to reach CREATE_COMPLETE (up to 30 min)..."
           aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
+
+      - name: Dump failed stack events
+        if: failure() && steps.create.outcome == 'failure'
+        run: |
+          echo "::group::Stack events (CREATE_FAILED only)"
+          aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+            --query 'reverse(StackEvents[?ResourceStatus==`CREATE_FAILED`].[LogicalResourceId,ResourceStatusReason])' \
+            --output table || true
+          echo "::endgroup::"
+          echo "::group::Stack status"
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].[StackStatus,StackStatusReason]' --output table || true
+          echo "::endgroup::"
 
       - name: Fetch outputs
         id: outputs
@@ -123,16 +139,15 @@ jobs:
           fi
 
       - name: Destroy stack
-        # Default destroy=true on push (no inputs); dispatched runs can flip via input.
-        if: ${{ always() && (inputs.destroy == null || inputs.destroy == true) }}
+        # Push runs (no inputs) always destroy; dispatched runs honor inputs.destroy.
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.destroy) }}
         run: |
-          # Idempotent — succeeds even if the stack was already auto-deleted by --on-failure DELETE.
           echo "Deleting $STACK_NAME..."
           aws cloudformation delete-stack --stack-name "$STACK_NAME"
           aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
 
       - name: Flag kept stack
-        if: ${{ always() && inputs.destroy == false }}
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && !inputs.destroy }}
         run: |
           echo "::warning::Stack '$STACK_NAME' was kept (destroy=false). It's still billing."
           echo "::warning::Delete manually: aws cloudformation delete-stack --stack-name $STACK_NAME --region $AWS_REGION"
