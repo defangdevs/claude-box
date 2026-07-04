@@ -74,10 +74,10 @@ Let's Encrypt cert against `<eip>.sslip.io`.
 | eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
 | eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
 
-At launch pick your **default VPC + a default subnet** from the dropdowns (any
-AZ works), set a `WebPassword` (16+ URL-safe chars — the URL includes it as a
-path token since browsers don't reliably attach Basic Auth to WebSocket
-upgrades), and go. The stack Outputs show
+Set a `WebPassword` (16+ URL-safe chars — the URL includes it as a path token
+since browsers don't reliably attach Basic Auth to WebSocket upgrades), pick
+an instance size, launch. The template creates its own IPv6-enabled VPC/subnet
+so nothing on the account has to be pre-configured. The stack Outputs show
 `https://<v6-or-v4>.sslip.io/<token>/` — open, complete the one-time Claude
 sign-in, done.
 

@@ -16,20 +16,6 @@ Description: >
   Source: https://github.com/defangdevs/claude-box
 
 Parameters:
-  SubnetId:
-    Type: AWS::EC2::Subnet::Id
-    Description: >-
-      A subnet in your **default VPC** (any AZ works). The AWS console will
-      show you a dropdown - pick any subnet whose "Default subnet" column
-      says Yes. Required even in IPv6-only mode so we can attach an explicit
-      NetworkInterface and read the assigned IPv6 back into the CFN Output.
-
-  VpcId:
-    Type: AWS::EC2::VPC::Id
-    Description: >-
-      The VPC that contains the subnet above. Console shows a dropdown -
-      pick your **default VPC** (marked "Default: Yes").
-
   InstanceType:
     Type: String
     Default: t3.small
@@ -103,11 +89,75 @@ Mappings:
   # END AMI MAP
 
 Resources:
+  # Self-contained VPC + IPv6 subnet + IGW + routes. Older AWS default VPCs
+  # never got IPv6, so we can't rely on the account's default networking
+  # when the template's whole point is to be IPv6-first.
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  VpcIpv6:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref Vpc
+      AmazonProvidedIpv6CidrBlock: true
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  Subnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: VpcIpv6
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 10.42.1.0/24
+      Ipv6CidrBlock: !Select
+        - 0
+        - !Cidr [!Select [0, !GetAtt Vpc.Ipv6CidrBlocks], 1, 64]
+      AssignIpv6AddressOnCreation: true
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  RouteV4:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  RouteV6:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationIpv6CidrBlock: ::/0
+      GatewayId: !Ref Igw
+
+  SubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref Subnet
+
   SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: 'claude-box: 443 (web terminal) + 22 (SSH), v4 + v6'
-      VpcId: !Ref VpcId
+      VpcId: !Ref Vpc
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 443
@@ -134,7 +184,7 @@ Resources:
   NetworkInterface:
     Type: AWS::EC2::NetworkInterface
     Properties:
-      SubnetId: !Ref SubnetId
+      SubnetId: !Ref Subnet
       Ipv6AddressCount: 1
       GroupSet:
         - !GetAtt SecurityGroup.GroupId
