@@ -175,7 +175,10 @@ Role permissions needed: `s3:CreateBucket`, `s3:PutPublicAccessBlock`,
 `s3:PutBucketPolicy`, `s3:PutObject`, and `cloudformation:ValidateTemplate`.
 The E2E deploy-test workflow additionally needs `cloudformation:CreateStack`,
 `cloudformation:DeleteStack`, `cloudformation:DescribeStacks`, and the EC2
-create/delete permissions used by the template.
+create/delete permissions used by the template - including
+`ec2:CreateLaunchTemplate` / `ec2:DeleteLaunchTemplate` (Spot options) and
+`ec2:DescribeSpotInstanceRequests` / `ec2:CancelSpotInstanceRequests` (so
+teardown can cancel the persistent Spot request before deleting the stack).
 
 The GitHub environment listed in `AWS_ENVIRONMENT` must exist — create it
 via `gh api --method PUT repos/<owner>/<repo>/environments/<name>` or the

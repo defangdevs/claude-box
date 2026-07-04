@@ -72,14 +72,15 @@ jobs:
         id: create
         run: |
           # GH Actions runners are IPv4-only, so this test forces PublicIpv4=true
-          # even though the template's default is IPv6-only. UseSpot=false keeps
-          # the smoke test deterministic (no dependence on Spot capacity).
+          # even though the template's default is IPv6-only. UseSpot=true on
+          # purpose: Spot (launch template + persistent request + cancel-on-
+          # teardown) is the trickier path, so that's what we want covered.
           aws cloudformation create-stack \
             --stack-name "$STACK_NAME" \
             --template-body "file://aws/template.yaml" \
             --parameters \
               "ParameterKey=PublicIpv4,ParameterValue=true" \
-              "ParameterKey=UseSpot,ParameterValue=false" \
+              "ParameterKey=UseSpot,ParameterValue=true" \
               "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
               "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't3.small' }}" \
             --on-failure DO_NOTHING \
@@ -178,6 +179,23 @@ jobs:
         # Push runs (no inputs) always destroy; dispatched runs honor inputs.destroy.
         if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.destroy) }}
         run: |
+          # Persistent Spot requests re-open when the instance is terminated and
+          # can relaunch, orphaning a request and snagging stack deletion. Cancel
+          # the request first (this does NOT terminate the instance; delete-stack
+          # does). Best-effort so on-demand runs / missing instances don't fail.
+          iid=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`InstanceId`].OutputValue | [0]' \
+            --output text 2>/dev/null || true)
+          if [ -n "$iid" ] && [ "$iid" != "None" ]; then
+            sirs=$(aws ec2 describe-spot-instance-requests \
+              --filters "Name=instance-id,Values=$iid" \
+              --query 'SpotInstanceRequests[].SpotInstanceRequestId' \
+              --output text 2>/dev/null || true)
+            if [ -n "$sirs" ]; then
+              echo "Cancelling Spot request(s) for $iid: $sirs"
+              aws ec2 cancel-spot-instance-requests --spot-instance-request-ids $sirs || true
+            fi
+          fi
           echo "Deleting $STACK_NAME..."
           aws cloudformation delete-stack --stack-name "$STACK_NAME"
           aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
