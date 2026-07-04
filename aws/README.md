@@ -40,19 +40,41 @@ at `s3://defang-claude-box/template.yaml`. `.github/workflows/publish-template.y
 handles the upload on every push to `master` via GitHub OIDC (no static AWS
 keys).
 
-### Prerequisites
+### Prerequisites (forking this repo)
 
-The workflow is self-bootstrapping — it upserts the bucket, its public-access
-configuration, and the `s3:GetObject` policy on `template.yaml` every run. All
-it needs is:
+The workflow is self-bootstrapping — it upserts the bucket, its
+public-access configuration, and the `s3:GetObject` policy on
+`template.yaml` every run. It reads all deploy config from **repo-level
+Actions variables** (Settings > Secrets and variables > Actions >
+Variables). None are secrets; they're just fork-specific.
 
-- A GitHub environment named `defang-claude-box` (or any `defang-*` name) so
-  the trust policy on `arn:aws:iam::180162796851:role/defang-cd-CIRole` fires.
-- The role having `s3:CreateBucket`, `s3:PutPublicAccessBlock`,
-  `s3:PutBucketPolicy`, and `s3:PutObject` on the target bucket ARN.
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `AWS_ROLE_ARN` | yes | IAM role assumed via OIDC. Trust policy must allow the GitHub environment named in `AWS_ENVIRONMENT`. |
+| `AWS_BUCKET` | yes | S3 bucket name to publish `template.yaml` into. Global namespace. |
+| `AWS_ENVIRONMENT` | no | GitHub Actions environment name. Defaults to `defang-claude-box` (must be repo-scoped since env-scoped is a chicken-and-egg). Set to any name your role's trust policy accepts. |
+| `AWS_REGION` | no | Region for the bucket + AWS API calls. Defaults to `us-east-1`. |
 
-Verify with a `workflow_dispatch` run, then:
+Role permissions needed: `s3:CreateBucket`, `s3:PutPublicAccessBlock`,
+`s3:PutBucketPolicy`, `s3:PutObject`, and `cloudformation:ValidateTemplate`.
+The E2E deploy-test workflow additionally needs `cloudformation:CreateStack`,
+`cloudformation:DeleteStack`, `cloudformation:DescribeStacks`, and the EC2
+create/delete permissions used by the template.
+
+The GitHub environment listed in `AWS_ENVIRONMENT` must exist — create it
+via `gh api --method PUT repos/<owner>/<repo>/environments/<name>` or the
+repo settings UI. No secrets attached; it's just the deployment gate.
+
+Verify with a `workflow_dispatch` run of `Publish CFN template to S3`, then:
 
 ```bash
-curl -I https://defang-claude-box.s3.amazonaws.com/template.yaml
+curl -I "https://${AWS_BUCKET}.s3.amazonaws.com/template.yaml"
 ```
+
+## End-to-end deploy test
+
+`.github/workflows/deploy-test.yml` (manual trigger) creates a real
+CloudFormation stack, waits for the browser URL to return the expected
+`401` Basic-Auth challenge, then deletes the stack. Use it as smoke test
+after changing the template. Toggle `destroy: false` on the dispatch
+inputs to keep the stack up for hands-on debugging.
