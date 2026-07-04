@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>claude-box &mdash; Claude Code agent sandboxes for NixOS</title>
+<meta name="description" content="Reproducible, multi-user Claude Code agent sandboxes for NixOS. 1-click AWS launch, bare-metal Nix module, or VM image.">
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #9198a1;
+    --accent: #d97757;
+    --accent-hi: #e8a087;
+    --code-bg: #1c2128;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent-hi); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 20px; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
+  code { background: var(--code-bg); padding: 2px 6px; border-radius: 5px; font-size: 0.9em; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; overflow-x: auto; font-size: 0.86em; line-height: 1.5;
+  }
+  pre code { background: none; padding: 0; }
+
+  header.hero {
+    border-bottom: 1px solid var(--border);
+    background: radial-gradient(1200px 400px at 50% -150px, rgba(217,119,87,0.16), transparent);
+    padding: 84px 0 64px;
+    text-align: center;
+  }
+  .logo {
+    display: inline-flex; align-items: center; gap: 12px;
+    font-size: 40px; font-weight: 800; letter-spacing: -0.02em;
+  }
+  .logo .box {
+    width: 40px; height: 40px; border-radius: 9px;
+    background: linear-gradient(135deg, var(--accent), #b95a3c);
+    display: inline-flex; align-items: center; justify-content: center;
+    font-size: 22px;
+  }
+  .tagline { color: var(--muted); font-size: 19px; max-width: 620px; margin: 18px auto 0; }
+  .cta { margin-top: 32px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-block; padding: 11px 22px; border-radius: 9px;
+    font-weight: 600; font-size: 15px; border: 1px solid var(--border);
+  }
+  .btn.primary { background: var(--accent); color: #1a0f0a; border-color: var(--accent); }
+  .btn.primary:hover { background: var(--accent-hi); text-decoration: none; }
+  .btn.ghost { background: var(--panel); color: var(--text); }
+  .btn.ghost:hover { border-color: var(--muted); text-decoration: none; }
+
+  section { padding: 52px 0; border-bottom: 1px solid var(--border); }
+  h2 { font-size: 26px; margin: 0 0 8px; letter-spacing: -0.01em; }
+  h2 + .sub { color: var(--muted); margin: 0 0 26px; }
+
+  .features { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  .feature {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px;
+  }
+  .feature h3 { margin: 0 0 6px; font-size: 16px; }
+  .feature p { margin: 0; color: var(--muted); font-size: 14.5px; }
+
+  .regions { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .region {
+    display: flex; align-items: center; justify-content: space-between;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .region .name { font-weight: 600; }
+  .region .code { color: var(--muted); font-size: 13px; }
+  .region .launch {
+    background: var(--accent); color: #1a0f0a; font-weight: 600;
+    padding: 7px 14px; border-radius: 8px; font-size: 14px; white-space: nowrap;
+  }
+  .region .launch:hover { background: var(--accent-hi); text-decoration: none; }
+
+  .note {
+    background: var(--code-bg); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: 8px;
+    padding: 14px 16px; color: var(--muted); font-size: 14.5px; margin-top: 22px;
+  }
+  .note strong { color: var(--text); }
+
+  footer { padding: 40px 0 60px; text-align: center; color: var(--muted); font-size: 14px; }
+
+  @media (max-width: 640px) {
+    .features, .regions { grid-template-columns: 1fr; }
+    header.hero { padding: 60px 0 44px; }
+    .logo { font-size: 32px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="logo"><span class="box">&#9635;</span> claude-box</div>
+    <p class="tagline">Reproducible, multi-user <a href="https://claude.com/claude-code">Claude Code</a> agent sandboxes for NixOS &mdash; on bare metal, as a VM image, or one click on AWS.</p>
+    <div class="cta">
+      <a class="btn primary" href="#launch">Launch on AWS</a>
+      <a class="btn ghost" href="https://github.com/defangdevs/claude-box">View on GitHub</a>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>What it is</h2>
+    <p class="sub">Each agent is an unprivileged user running Claude Code in a persistent tmux session, defined once in declarative config.</p>
+    <div class="features">
+      <div class="feature">
+        <h3>Unprivileged by default</h3>
+        <p>Agents run as ordinary users. The only elevated power is a tight, explicit passwordless-<code>sudo</code> allowlist you control.</p>
+      </div>
+      <div class="feature">
+        <h3>Browser terminal</h3>
+        <p>Caddy + ttyd serve the tmux session over HTTPS with an auto-issued TLS cert. Open a URL, you're in.</p>
+      </div>
+      <div class="feature">
+        <h3>Secret-safe token injection</h3>
+        <p>Custom tokens (e.g. <code>GH_TOKEN</code>) arrive via drop-in <code>EnvironmentFile</code>s that never enter the world-readable Nix store.</p>
+      </div>
+      <div class="feature">
+        <h3>Cheap by design</h3>
+        <p>IPv6-only by default to skip AWS's ~$3.60/mo public-IPv4 charge, with an opt-in Spot toggle for ~70&ndash;90% off compute.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="launch">
+  <div class="wrap">
+    <h2>1-click AWS launch</h2>
+    <p class="sub">Provisions one EC2 instance (NixOS 25.11) with the module and browser terminal already wired up. It builds its own IPv6-enabled VPC, so nothing on your account needs pre-configuring.</p>
+    <div class="regions">
+      <div class="region">
+        <div><div class="name">N. Virginia</div><div class="code">us-east-1</div></div>
+        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml">Launch &rarr;</a>
+      </div>
+      <div class="region">
+        <div><div class="name">Oregon</div><div class="code">us-west-2</div></div>
+        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml">Launch &rarr;</a>
+      </div>
+      <div class="region">
+        <div><div class="name">Frankfurt</div><div class="code">eu-central-1</div></div>
+        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml">Launch &rarr;</a>
+      </div>
+      <div class="region">
+        <div><div class="name">Ireland</div><div class="code">eu-west-1</div></div>
+        <a class="launch" href="https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml">Launch &rarr;</a>
+      </div>
+    </div>
+    <div class="note">
+      Set a <strong>WebPassword</strong> (16+ URL-safe chars &mdash; it becomes a path token in the URL, since browsers don't reliably attach Basic Auth to WebSocket upgrades), pick a size, and launch. First load takes ~2&ndash;3 min while the box provisions and Caddy issues a cert. The stack Outputs show <code>https://&lt;addr&gt;.sslip.io/&lt;token&gt;/</code> &mdash; open it, finish the one-time Claude sign-in, done.
+    </div>
+    <div class="note">
+      <strong>IPv6-only by default.</strong> Works if your client has IPv6 (most consumer ISPs in NA/EU). On a network without it, set <code>PublicIpv4: true</code> at launch to allocate an Elastic IP (adds ~$3.60/mo, works everywhere).
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Other ways to run</h2>
+    <p class="sub">The AWS template just imports the same NixOS module you'd use anywhere.</p>
+    <h3>Bare metal / existing NixOS host</h3>
+    <pre><code>{
+  imports = [ inputs.claude-box.nixosModules.claude-box ];
+
+  services.claude-box = {
+    enable = true;
+    users = {
+      alice = { };
+      bob   = { remoteControlName = "bob-box"; };
+    };
+    # The ONLY elevated powers the agents get -- keep it tight.
+    sudoAllowlist = [ "/run/current-system/sw/bin/systemctl reload caddy.service" ];
+    extraPackages = with pkgs; [ git ripgrep jq ];
+  };
+}</code></pre>
+    <h3 style="margin-top:26px">VM image</h3>
+    <pre><code>nix build github:defangdevs/claude-box#vm   # -&gt; qcow2 disk image</code></pre>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <a href="https://github.com/defangdevs/claude-box">github.com/defangdevs/claude-box</a>
+    &nbsp;&middot;&nbsp; MIT-licensed &nbsp;&middot;&nbsp; built with <a href="https://claude.com/claude-code">Claude Code</a>
+  </div>
+</footer>
+
+</body>
+</html>
