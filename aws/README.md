@@ -7,17 +7,118 @@ EC2 with a browser terminal (Caddy + ttyd).
 
 ## What the template does
 
-- Allocates an Elastic IP and derives an `<eip>.sslip.io` hostname (no DNS
-  edits required — `sslip.io` returns whatever IP you encode in the label).
+- Provisions its own VPC (10.42.0.0/16) with an Amazon-provided IPv6 CIDR,
+  a single public subnet with a /64 IPv6 range, IGW + routes for v4 and
+  v6, and a NAT64 route (`64:ff9b::/96 → IGW`) so IPv6-only instances can
+  still reach IPv4-only upstreams like github.com. Also enables `Dns64` on
+  the subnet.
 - Launches one EC2 instance from the latest NixOS 25.11 AMI for the region.
 - Uses EC2 user-data as a NixOS configuration: imports the pinned
   `claude-box` module + adds Caddy (TLS-ALPN-01 only) + a `ttyd` systemd
   service that binds to `127.0.0.1:7681` and attaches to `agent`'s tmux
   session (`tmux -L claude-box -t main`).
+- **URL path-token auth** (not HTTP Basic Auth). ttyd runs `-b /<token>/`,
+  Caddy 404s anything without the prefix. See "Design decisions" below.
+- The hostname `<addr>.sslip.io` is derived at CFN time via `Fn::Split ':'
+  + Fn::Join '-'` on the NetworkInterface's PrimaryIpv6Address (IPv6 mode)
+  or the EIP address (IPv4 mode). Consecutive `::` becomes an empty split
+  element that re-joins as `--` — matches sslip.io's encoding exactly.
 - Requires IMDSv2 (`HttpTokens: required`); the plaintext `WebPassword` in
   user-data is only readable from the instance itself.
 - Disables `amazon-init` after the first successful apply so local edits to
   `/etc/nixos/configuration.nix` survive reboots.
+
+## Design decisions & gotchas
+
+### Why URL path-token instead of HTTP Basic Auth
+
+The obvious "username + password prompt" model (ttyd `-c user:pass`, or
+Caddy `basic_auth`) breaks the terminal in every browser: **Chrome,
+Firefox, and Safari all refuse to attach cached Basic Auth credentials
+to the WebSocket `Upgrade` request**. The HTML loads fine; the WS
+handshake gets rejected with 401; the terminal shows "disconnected."
+Confirmed via [Bugzilla 1229443](https://bugzilla.mozilla.org/show_bug.cgi?id=1229443),
+[Chromium 40193544](https://issues.chromium.org/issues/40193544), and
+[ttyd #1437](https://github.com/tsl0922/ttyd/issues/1437).
+
+Fix: **the `WebPassword` parameter is the URL path** — `https://<host>/<token>/`.
+Same shared-secret model, works uniformly in every browser because
+there's no HTTP auth on the WS at all. The trade-off is that the token
+travels in the URL (visible in browser history, `Referer` headers, CFN
+Outputs); treat it like a pre-shared key.
+
+### Why `sslip.io` and not the EC2 public DNS
+
+Every EC2 instance gets an `ec2-<ip>.compute-1.amazonaws.com` hostname
+for free, but **Let's Encrypt hard-refuses to issue certs under
+`*.compute.amazonaws.com`** by policy — see [LE community post #12692](https://community.letsencrypt.org/t/policy-forbids-issuing-for-name-on-amazon-ec2-domain/12692).
+So we need any other name that resolves to our public IP.
+
+`sslip.io` returns whatever IP is encoded in the label — no DNS setup,
+no signup, no dep. Third-party service risk: if they disappear, existing
+certs keep serving but new stacks can't ACME. Threat model: they only
+provide DNS, so they can't MITM active sessions (TLS cert is ours);
+worst case is DoS of new issuance or user redirection to a decoy site
+that immediately fails cert validation.
+
+### CloudFormation quick-create requires an S3 template URL
+
+`templateURL` in the `/stacks/quickcreate` URL **must be an S3 URL** —
+GitHub Pages or `raw.githubusercontent.com` are rejected with
+"TemplateURL must be a supported URL." That's why the publish-template
+workflow syncs to S3, and the README's Launch Stack links point at
+`https://<bucket>.s3.amazonaws.com/template.yaml`.
+
+### Why the template creates its own VPC
+
+Older AWS accounts' default VPCs never had IPv6 CIDR blocks
+retroactively added. Making the template self-provisioning (VPC + IPv6
+CIDR + IGW + subnet with `EnableDns64` + NAT64 route) means:
+- No "please select a subnet from the dropdown" step at launch (truer
+  1-click).
+- Works in any account regardless of default-VPC state.
+- IPv6 default is actually reachable outbound (via DNS64/NAT64 on the
+  IGW, which AWS enabled in Nov 2023).
+
+All the extra resources are free (VPC, subnet, route table, IGW, EIP-
+while-attached historical wisdom no longer applies — see the IPv4 note
+below).
+
+### IPv6-first by cost, IPv4 opt-in by connectivity
+
+Since **Feb 2024, AWS charges $0.005/hr for every public IPv4 address**
+regardless of attach state (EIP or ephemeral, running or stopped
+instance) — ~$3.60/mo per address. IPv6 is free. So the template
+defaults to `PublicIpv4: false` (IPv6-only, ~$0/mo for the address).
+Users whose clients don't have IPv6 (corporate nets, coffee-shop WiFi)
+set `PublicIpv4: true` at launch to allocate an EIP.
+
+### Race condition: EIP association vs boot
+
+In our custom subnet, `MapPublicIpOnLaunch` is false, so the instance
+has **no public IPv4 until `EIPAssoc` completes**. Without that,
+amazon-init's `fetchTarball` from github.com (IPv4-only host) fails on
+first boot and Caddy never comes up. Fix: `DependsOn: EIPAssoc` on the
+Instance. CFN handles this correctly even when the referenced resource
+has a Condition that's false (skips the wait); cfn-lint's E3005 is
+over-eager here and is suppressed on that resource.
+
+### CFN can't `GetAtt` an Instance's IPv6
+
+Long-standing gap ([issue #916](https://github.com/aws-cloudformation/cloudformation-coverage-roadmap/issues/916)):
+`AWS::EC2::Instance` exposes `PublicIp`, `PublicDnsName`, etc. but no
+IPv6 attribute. Work-around used here: create an explicit
+`AWS::EC2::NetworkInterface` (which does return `PrimaryIpv6Address`)
+and attach it to the instance via `NetworkInterfaces:
+[NetworkInterfaceId: !Ref NetworkInterface]`.
+
+### cfn-lint gap: SG per-rule descriptions
+
+`SecurityGroupIngress` rule descriptions have a stricter regex than
+`GroupDescription` — Unicode punctuation like `—` (U+2014 em-dash) is
+rejected by EC2's API but cfn-lint only checks the group description.
+The template avoids em-dashes anywhere that becomes a rule description
+to sidestep this.
 
 ## Refreshing the AMI map
 
