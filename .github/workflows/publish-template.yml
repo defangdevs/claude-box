@@ -42,6 +42,40 @@ jobs:
       - name: Validate template with CloudFormation
         run: aws cloudformation validate-template --template-body "file://aws/template.yaml"
 
+      - name: Upsert bucket + public-read policy on template.yaml
+        run: |
+          if aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Bucket $BUCKET already exists."
+          else
+            echo "Creating bucket $BUCKET in $AWS_REGION..."
+            # us-east-1 rejects LocationConstraint; other regions require it.
+            if [ "$AWS_REGION" = "us-east-1" ]; then
+              aws s3api create-bucket --bucket "$BUCKET"
+            else
+              aws s3api create-bucket --bucket "$BUCKET" --region "$AWS_REGION" \
+                --create-bucket-configuration "LocationConstraint=$AWS_REGION"
+            fi
+          fi
+
+          # Idempotent — always re-applied so drift can't leave the bucket private.
+          aws s3api put-public-access-block --bucket "$BUCKET" \
+            --public-access-block-configuration \
+              'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false'
+
+          aws s3api put-bucket-policy --bucket "$BUCKET" --policy "$(cat <<POLICY
+          {
+            "Version": "2012-10-17",
+            "Statement": [{
+              "Sid": "PublicReadTemplate",
+              "Effect": "Allow",
+              "Principal": "*",
+              "Action": "s3:GetObject",
+              "Resource": "arn:aws:s3:::${BUCKET}/${OBJECT_KEY}"
+            }]
+          }
+          POLICY
+          )"
+
       - name: Upload to S3
         run: |
           aws s3 cp aws/template.yaml "s3://${BUCKET}/${OBJECT_KEY}" \

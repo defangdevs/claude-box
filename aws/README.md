@@ -40,41 +40,19 @@ at `s3://defang-claude-box/template.yaml`. `.github/workflows/publish-template.y
 handles the upload on every push to `master` via GitHub OIDC (no static AWS
 keys).
 
-### One-time maintainer setup
+### Prerequisites
 
-1. **Create the S3 bucket** (any account with the CI role):
-   ```bash
-   aws s3api create-bucket --bucket defang-claude-box --region us-east-1
-   ```
+The workflow is self-bootstrapping — it upserts the bucket, its public-access
+configuration, and the `s3:GetObject` policy on `template.yaml` every run. All
+it needs is:
 
-2. **Relax block-public-access so the CFN quickcreate console can fetch the
-   template** — `s3:GetObject` needs to be publicly allowed for the one
-   `template.yaml` key:
-   ```bash
-   aws s3api put-public-access-block \
-     --bucket defang-claude-box \
-     --public-access-block-configuration \
-       "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=false,RestrictPublicBuckets=false"
+- A GitHub environment named `defang-claude-box` (or any `defang-*` name) so
+  the trust policy on `arn:aws:iam::180162796851:role/defang-cd-CIRole` fires.
+- The role having `s3:CreateBucket`, `s3:PutPublicAccessBlock`,
+  `s3:PutBucketPolicy`, and `s3:PutObject` on the target bucket ARN.
 
-   aws s3api put-bucket-policy --bucket defang-claude-box --policy '{
-     "Version": "2012-10-17",
-     "Statement": [{
-       "Sid": "PublicReadTemplate",
-       "Effect": "Allow",
-       "Principal": "*",
-       "Action": "s3:GetObject",
-       "Resource": "arn:aws:s3:::defang-claude-box/template.yaml"
-     }]
-   }'
-   ```
+Verify with a `workflow_dispatch` run, then:
 
-3. **Create the `defang-claude-box` GitHub environment** in the repo settings
-   — its name must start with `defang-` to satisfy the trust policy on
-   `arn:aws:iam::180162796851:role/defang-cd-CIRole`. No environment secrets
-   needed; the workflow assumes the role via OIDC.
-
-4. **Verify** by triggering the workflow manually (`workflow_dispatch`) and
-   confirming the object landed:
-   ```bash
-   curl -I https://defang-claude-box.s3.amazonaws.com/template.yaml
-   ```
+```bash
+curl -I https://defang-claude-box.s3.amazonaws.com/template.yaml
+```
