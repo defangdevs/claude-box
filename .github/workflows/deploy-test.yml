@@ -37,8 +37,8 @@ concurrency:
 jobs:
   deploy-test:
     runs-on: ubuntu-latest
-    # Fork? Override with a repo-scoped var AWS_ENVIRONMENT, or edit the fallback.
-    environment: ${{ vars.AWS_ENVIRONMENT || 'defang-claude-box' }}
+    # Fork? Override with a repo-scoped var CLAUDE_BOX_ENVIRONMENT, or edit the fallback.
+    environment: ${{ vars.CLAUDE_BOX_ENVIRONMENT || 'defang-claude-box' }}
     timeout-minutes: 30
     env:
       AWS_REGION: ${{ inputs.region || 'us-east-1' }}

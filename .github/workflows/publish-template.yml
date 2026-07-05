@@ -22,18 +22,18 @@ jobs:
     # Fork this repo? Configure these under Settings > Secrets and variables >
     # Actions > Variables (repo-level, not secrets — none of these are sensitive).
     # See aws/README.md.
-    # Fork? Override with a repo-scoped var AWS_ENVIRONMENT, or edit the fallback.
-    environment: ${{ vars.AWS_ENVIRONMENT || 'defang-claude-box' }}
+    # Fork? Override with a repo-scoped var CLAUDE_BOX_ENVIRONMENT, or edit the fallback.
+    environment: ${{ vars.CLAUDE_BOX_ENVIRONMENT || 'defang-claude-box' }}
     env:
       AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
-      BUCKET: ${{ vars.AWS_BUCKET }}
+      BUCKET: ${{ vars.CLAUDE_BOX_BUCKET }}
       OBJECT_KEY: template.yaml
       ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
     steps:
       - name: Sanity-check required variables
         run: |
           missing=()
-          [ -n "$BUCKET" ]   || missing+=("AWS_BUCKET")
+          [ -n "$BUCKET" ]   || missing+=("CLAUDE_BOX_BUCKET")
           [ -n "$ROLE_ARN" ] || missing+=("AWS_ROLE_ARN")
           if [ ${#missing[@]} -gt 0 ]; then
             echo "::error::Missing repo variable(s): ${missing[*]}. Set under Settings > Actions > Variables. See aws/README.md."

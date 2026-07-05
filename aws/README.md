@@ -166,9 +166,9 @@ Variables). None are secrets; they're just fork-specific.
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `AWS_ROLE_ARN` | yes | IAM role assumed via OIDC. Trust policy must allow the GitHub environment named in `AWS_ENVIRONMENT`. |
-| `AWS_BUCKET` | yes | S3 bucket name to publish `template.yaml` into. Global namespace. |
-| `AWS_ENVIRONMENT` | no | GitHub Actions environment name. Defaults to `defang-claude-box` (must be repo-scoped since env-scoped is a chicken-and-egg). Set to any name your role's trust policy accepts. |
+| `AWS_ROLE_ARN` | yes | IAM role assumed via OIDC. Trust policy must allow the GitHub environment named in `CLAUDE_BOX_ENVIRONMENT`. |
+| `CLAUDE_BOX_BUCKET` | yes | S3 bucket name to publish `template.yaml` into. Global namespace. |
+| `CLAUDE_BOX_ENVIRONMENT` | no | GitHub Actions environment name. Defaults to `defang-claude-box` (must be repo-scoped since env-scoped is a chicken-and-egg). Set to any name your role's trust policy accepts. |
 | `AWS_REGION` | no | Region for the bucket + AWS API calls. Defaults to `us-east-1`. |
 
 Role permissions needed: `s3:CreateBucket`, `s3:PutPublicAccessBlock`,
@@ -180,14 +180,14 @@ create/delete permissions used by the template - including
 `ec2:DescribeSpotInstanceRequests` / `ec2:CancelSpotInstanceRequests` (so
 teardown can cancel the persistent Spot request before deleting the stack).
 
-The GitHub environment listed in `AWS_ENVIRONMENT` must exist — create it
+The GitHub environment listed in `CLAUDE_BOX_ENVIRONMENT` must exist — create it
 via `gh api --method PUT repos/<owner>/<repo>/environments/<name>` or the
 repo settings UI. No secrets attached; it's just the deployment gate.
 
 Verify with a `workflow_dispatch` run of `Publish CFN template to S3`, then:
 
 ```bash
-curl -I "https://${AWS_BUCKET}.s3.amazonaws.com/template.yaml"
+curl -I "https://${CLAUDE_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
 ```
 
 ## End-to-end deploy test
