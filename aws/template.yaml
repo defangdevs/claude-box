@@ -121,12 +121,12 @@ Parameters:
 
   ClaudeBoxRev:
     Type: String
-    Default: beb8d317a0ad0c61cbb90ec80f680eea51e5657d
+    Default: 68d4b94ab85fbbd6b90a36cf5613a5559d22e869
     Description: Git rev of defangdevs/claude-box (the module to install).
 
   ClaudeBoxSha256:
     Type: String
-    Default: 0nsi906jhs8l5ghfmk63s6f0v5wycdc373f7p95l3scdgm4hy93a
+    Default: 07ki5hxdrqs38w47vfyvy4x0va9kyylkqiir6zm86imsw8gyq2p4
     Description: >-
       Nix base-32 sha256 of the module tarball at ClaudeBoxRev. Regenerate via
       `nix-prefetch-url --unpack https://github.com/defangdevs/claude-box/archive/<REV>.tar.gz`.
