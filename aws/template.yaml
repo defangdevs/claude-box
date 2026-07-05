@@ -26,7 +26,7 @@ Metadata:
           - ClaudeBoxSha256
     ParameterLabels:
       WebPassword:
-        default: Web terminal token (goes in the URL)
+        default: Web terminal token (blank = auto-generated)
       SessionName:
         default: Remote Control session name (blank = agent@host)
       InstanceType:
@@ -93,14 +93,15 @@ Parameters:
   WebPassword:
     Type: String
     NoEcho: true
-    MinLength: 16
+    Default: ''
     MaxLength: 64
-    AllowedPattern: ^[A-Za-z0-9._~-]{16,64}$
+    AllowedPattern: ^$|^[A-Za-z0-9._~-]{16,64}$
     Description: >-
-      Shared secret for the browser terminal. Embedded into the URL as a path
-      token (browsers do not reliably attach Basic Auth to WebSocket upgrades,
-      so we go path-token instead of a username/password prompt).
-      16-64 URL-safe chars: [A-Za-z0-9._~-].
+      Shared secret embedded in the URL as a path token (browsers do not
+      reliably attach Basic Auth to WebSocket upgrades, so we use a path token
+      instead of a username/password prompt). Leave blank to auto-generate one
+      from the stack's unique id - the full URL (token included) is shown in the
+      stack Outputs. If you set your own: 16-64 URL-safe chars [A-Za-z0-9._~-].
 
   SessionName:
     Type: String
@@ -136,6 +137,7 @@ Conditions:
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
   UseSpotCond: !Equals [!Ref UseSpot, 'true']
   HasSessionName: !Not [!Equals [!Ref SessionName, '']]
+  HasWebPassword: !Not [!Equals [!Ref WebPassword, '']]
 
 Mappings:
   # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py - do not edit by hand)
@@ -336,7 +338,7 @@ Resources:
                   sha256 = "${ClaudeBoxSha256}";
                 };
                 hostname = "${WebHostname}";
-                webPassword = "${WebPassword}";
+                webPassword = "${WebPasswordEff}";
               in {
                 imports = [
                   "${!modulesPath}/virtualisation/amazon-image.nix"
@@ -400,21 +402,34 @@ Resources:
                 - HasSessionName
                 - !Sub "\n                    remoteControlName = \"${SessionName}\";"
                 - ''
+              # User-supplied token, or the stack's UUID when left blank. The
+              # UUID is 122 random bits and only visible to principals with
+              # cloudformation:DescribeStacks - the same trust boundary as the
+              # token-in-URL itself.
+              WebPasswordEff: !If
+                - HasWebPassword
+                - !Ref WebPassword
+                - !Select [2, !Split ['/', !Ref 'AWS::StackId']]
 
 Outputs:
   WebURL:
     Description: >-
-      Browser terminal. First load takes ~2-3 minutes while the instance
-      provisions and Caddy issues an ACME cert. The URL includes your
-      WebPassword as a path segment - keep it private.
-    Value: !If
-      - UseIpv4
-      - !Sub "https://${EIP}.sslip.io/${WebPassword}/"
-      - !Sub
-        - "https://${IpDashed}.sslip.io/${WebPassword}/"
-        - IpDashed: !Join
-            - '-'
-            - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
+      Browser terminal (also drivable from the Claude apps via Remote Control).
+      First load takes ~2-3 minutes while the instance provisions and Caddy
+      issues an ACME cert. The URL includes the WebPassword token - keep it
+      private.
+    Value: !Sub
+      - "https://${Host}.sslip.io/${Pw}/"
+      - Host: !If
+          - UseIpv4
+          - !Ref EIP
+          - !Join
+              - '-'
+              - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
+        Pw: !If
+          - HasWebPassword
+          - !Ref WebPassword
+          - !Select [2, !Split ['/', !Ref 'AWS::StackId']]
 
   PublicAddress:
     Description: Elastic IP (IPv4 mode) or primary IPv6 (IPv6 mode).

@@ -166,7 +166,7 @@
       </div>
     </div>
     <div class="note">
-      Set a <strong>WebPassword</strong> (16+ URL-safe chars &mdash; it becomes a path token in the URL, since browsers don't reliably attach Basic Auth to WebSocket upgrades), pick a size, and launch. First load takes ~2&ndash;3 min while the box provisions and Caddy issues a cert. The stack Outputs show <code>https://&lt;addr&gt;.sslip.io/&lt;token&gt;/</code> &mdash; open it, finish the one-time Claude sign-in, done.
+      Each Launch link is pre-filled with a fresh random <strong>WebPassword</strong> &mdash; the path token in your URL (browsers don't reliably attach Basic Auth to WebSocket upgrades, so we use a path token). Keep it or set your own on the form; leave it blank and the stack derives one from its own id. Pick a size and launch. First load takes ~2&ndash;3 min while the box provisions and Caddy issues a cert. The stack Outputs show <code>https://&lt;addr&gt;.sslip.io/&lt;token&gt;/</code> &mdash; open it, finish the one-time Claude sign-in, done.
     </div>
     <div class="note">
       <strong>IPv6-only by default.</strong> Works if your client has IPv6 (most consumer ISPs in NA/EU). On a network without it, set <code>PublicIpv4: true</code> at launch to allocate an Elastic IP (adds ~$3.60/mo, works everywhere).
@@ -204,6 +204,27 @@
     &nbsp;&middot;&nbsp; MIT-licensed &nbsp;&middot;&nbsp; built with <a href="https://claude.com/claude-code">Claude Code</a>
   </div>
 </footer>
+
+<script>
+  // Pre-fill each Launch link with a fresh random WebPassword so users don't
+  // have to invent one. The CFN quickcreate form reads param_<Name>; the user
+  // can still edit it (or clear it, letting the template derive one).
+  (function () {
+    function token() {
+      const b = crypto.getRandomValues(new Uint8Array(24));
+      return Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
+    }
+    function apply(a) {
+      const base = a.dataset.base || (a.dataset.base = a.getAttribute('href'));
+      a.setAttribute('href', base + '&param_WebPassword=' + token());
+    }
+    document.querySelectorAll('a.launch').forEach(function (a) {
+      apply(a);
+      // Fresh token each time the user actually launches (covers new-tab too).
+      a.addEventListener('pointerdown', function () { apply(a); });
+    });
+  })();
+</script>
 
 </body>
 </html>
