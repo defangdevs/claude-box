@@ -121,23 +121,23 @@
 <section>
   <div class="wrap">
     <h2>What it is</h2>
-    <p class="sub">Each agent is an unprivileged user running Claude Code in a persistent tmux session, defined once in declarative config.</p>
+    <p class="sub">A ready-to-use Claude Code agent you open right in your browser. Set it up once with a single click; it keeps running on its own.</p>
     <div class="features">
       <div class="feature">
-        <h3>Unprivileged by default</h3>
-        <p>Agents run as ordinary users. The only elevated power is a tight, explicit passwordless-<code>sudo</code> allowlist you control.</p>
+        <h3>Locked down by default</h3>
+        <p>Each agent runs in its own restricted account and can't touch the rest of the machine &mdash; it only gets the specific extra powers you choose to grant.</p>
       </div>
       <div class="feature">
-        <h3>Browser terminal</h3>
-        <p>Caddy + ttyd serve the tmux session over HTTPS with an auto-issued TLS cert. Open a URL, you're in.</p>
+        <h3>Works in your browser</h3>
+        <p>A full terminal, right in your browser over a secure connection. Open your link and you're in &mdash; nothing to install.</p>
       </div>
       <div class="feature">
-        <h3>Secret-safe token injection</h3>
-        <p>Custom tokens (e.g. <code>GH_TOKEN</code>) arrive via drop-in <code>EnvironmentFile</code>s that never enter the world-readable Nix store.</p>
+        <h3>Keeps your keys safe</h3>
+        <p>Any API keys or tokens you add stay private &mdash; kept out of shared settings and never baked into saved images.</p>
       </div>
       <div class="feature">
-        <h3>Cheap by design</h3>
-        <p>IPv6-only by default to skip AWS's ~$3.60/mo public-IPv4 charge, with an opt-in Spot toggle for ~70&ndash;90% off compute.</p>
+        <h3>Low cost</h3>
+        <p>Runs lean and skips an optional AWS network fee by default, so a small box typically costs only a few dollars a month. Shut it down anytime to stop charges.</p>
       </div>
     </div>
   </div>
@@ -146,7 +146,7 @@
 <section id="launch">
   <div class="wrap">
     <h2>1-click AWS launch</h2>
-    <p class="sub">Provisions one EC2 instance (NixOS 25.11) with the module and browser terminal already wired up. It builds its own IPv6-enabled VPC, so nothing on your account needs pre-configuring.</p>
+    <p class="sub">Sets up one ready-to-go box in your own AWS account with the browser terminal already running. It creates everything it needs, so there's nothing to configure beforehand &mdash; just pick a region and go.</p>
     <div class="regions">
       <div class="region">
         <div><div class="name">N. Virginia</div><div class="code">us-east-1</div></div>
@@ -166,10 +166,10 @@
       </div>
     </div>
     <div class="note">
-      Each Launch link is pre-filled with a fresh random <strong>WebPassword</strong> &mdash; the path token in your URL (browsers don't reliably attach Basic Auth to WebSocket upgrades, so we use a path token). Keep it or set your own on the form; leave it blank and the stack derives one from its own id. Pick a size and launch. First load takes ~2&ndash;3 min while the box provisions and Caddy issues a cert. The stack Outputs show <code>https://&lt;addr&gt;.sslip.io/&lt;token&gt;/</code> &mdash; open it, finish the one-time Claude sign-in, done.
+      <strong>You don't need to make up a password.</strong> Every Launch button already has a random one filled in for you. Keep it, type your own, or clear it to have one generated automatically. Pick a size and launch. The box takes about 2&ndash;3 minutes to start. When it's ready, your private link (with the password already built in) appears under <strong>Outputs</strong> in the AWS console &mdash; open it, finish the one-time Claude sign-in, and you're in.
     </div>
     <div class="note">
-      <strong>IPv6-only by default.</strong> Works if your client has IPv6 (most consumer ISPs in NA/EU). On a network without it, set <code>PublicIpv4: true</code> at launch to allocate an Elastic IP (adds ~$3.60/mo, works everywhere).
+      <strong>If your link won't open:</strong> the box uses a modern, free type of internet address that most home connections support, but some office and public Wi-Fi networks can't reach it. If your link never loads, launch again and set <code>PublicIpv4</code> to <code>true</code> &mdash; that adds an address every network can reach, for about $3.60/month.
     </div>
   </div>
 </section>
