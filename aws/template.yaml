@@ -155,16 +155,16 @@ Conditions:
   HasWebPassword: !Not [!Equals [!Ref WebPassword, '']]
 
 Mappings:
-  # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py - do not edit by hand)
+  # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
   RegionMap:
     us-east-1:
-      AMI: ami-0afa19b238bdf9da0
+      AMI: ami-0ed5f0aab536e0ee2
     us-west-2:
-      AMI: ami-0521ba8e76c2094b9
+      AMI: ami-0e78db03e0a4e1eb0
     eu-central-1:
-      AMI: ami-00ae5c892b1a9cb23
+      AMI: ami-01be8b1976c890db4
     eu-west-1:
-      AMI: ami-0a7e28f614241d0af
+      AMI: ami-0db2fcbe936c18ad4
   # END AMI MAP
 
 Resources:
