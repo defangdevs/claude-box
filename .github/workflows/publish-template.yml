@@ -47,18 +47,6 @@ jobs:
           pip install --quiet cfn-lint
           cfn-lint aws/template.yaml
 
-      # DEBUG: dump OIDC token claims so we can see what STS actually receives.
-      # Revert once the AssumeRoleWithWebIdentity failure is diagnosed.
-      - name: Debug OIDC token claims
-        run: |
-          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
-          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "no token"; exit 1; }
-          PAYLOAD=$(echo "$TOKEN" | cut -d. -f2)
-          # base64url-pad, translate to standard base64, decode, pretty-print.
-          L=$((${#PAYLOAD} % 4)); [ $L -ne 0 ] && PAYLOAD="$PAYLOAD$(printf '=%.0s' $(seq 1 $((4-L))))"
-          echo "$PAYLOAD" | tr '_-' '/+' | base64 -d | jq .
-
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
