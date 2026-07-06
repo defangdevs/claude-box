@@ -74,13 +74,22 @@ let
       );
     in
     pkgs.writeShellScript "claude-box-${name}-start" ''
-      set -eu
+      set -u
       # Detached tmux session so a human can `tmux -L claude-box attach -t main`.
-      # `; exec bash` keeps the pane alive (login/OAuth prompt, or restart) if
-      # claude exits, instead of tearing the session down.
-      exec ${pkgs.tmux}/bin/tmux -L claude-box new-session -d -s main \
+      # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero claude exit;
+      # clean exits let the session die so systemd's Restart=always brings up
+      # a fresh claude. (Was `; exec bash`, which pinned the session forever.)
+      ${pkgs.tmux}/bin/tmux -L claude-box new-session -d -s main \
         -c ${lib.escapeShellArg u.workingDirectory} \
-        ${lib.escapeShellArg (claudeCmd + "; exec ${pkgs.bashInteractive}/bin/bash")}
+        ${lib.escapeShellArg (claudeCmd + " || exec ${pkgs.bashInteractive}/bin/bash")}
+      # Block ExecStart until the session actually goes away — a clean claude
+      # exit, the user typing `exit` in the post-mortem bash, someone
+      # `tmux kill-session`ing us, or ExecStop killing it. Type=exec + this
+      # supervising tail lets Restart=always distinguish "session died on its
+      # own" (restart) from "systemctl stop" (don't restart).
+      while ${pkgs.tmux}/bin/tmux -L claude-box has-session -t main 2>/dev/null; do
+        sleep 2
+      done
     '';
 in
 {
@@ -174,10 +183,13 @@ in
         environment = { HOME = "/home/${name}"; } // u.environment;
         serviceConfig = {
           User = name;
-          # tmux daemonizes and returns; keep the unit "active" and let ExecStop
-          # tear the session down. Auto-login/OAuth happens on first `tmux attach`.
-          Type = "oneshot";
-          RemainAfterExit = true;
+          # ExecStart's mkStart supervises the tmux session and stays live for
+          # as long as the session is alive, so systemd can distinguish clean
+          # session termination (Restart=always kicks in → fresh claude) from
+          # explicit `systemctl stop` (which systemd never restarts through).
+          Type = "exec";
+          Restart = "always";
+          RestartSec = "2s";
           ExecStart = mkStart name u;
           ExecStop = "${pkgs.tmux}/bin/tmux -L claude-box kill-session -t main";
           # Custom tokens (GH_TOKEN, etc.) land here. The '-' makes the per-user
