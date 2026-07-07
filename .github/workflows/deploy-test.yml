@@ -39,8 +39,10 @@ jobs:
     runs-on: ubuntu-latest
     # Two legs run in PARALLEL:
     #  - ipv4-full: GH runners are IPv4-only, so this is the only leg that can
-    #    actually reach the box; it forces PublicIpv4=true (+ Spot, the trickier
-    #    path) and runs the full connectivity smoke tests.
+    #    actually reach the box; it forces PublicIpv4=true and runs the full
+    #    connectivity smoke tests. On-demand (UseSpot=false): a Spot reclaim
+    #    mid-test reads as a black-holed EIP, indistinguishable from a real
+    #    provisioning bug (two back-to-back runs on 2026-07-07).
     #  - ipv6-outputs: exercises the DEFAULT IPv6-only path. The runner can't
     #    connect over IPv6, so this leg only asserts the stack reaches
     #    CREATE_COMPLETE and its outputs populate. That still catches template
@@ -52,7 +54,7 @@ jobs:
         include:
           - leg: ipv4-full
             public_ipv4: "true"
-            use_spot: "true"
+            use_spot: "false"
           - leg: ipv6-outputs
             public_ipv4: "false"
             use_spot: "false"
