@@ -95,6 +95,21 @@ sudo -u alice tmux -L claude-box attach -t main
 Credentials live in that user's `~/.claude` — per-user runtime state, never
 baked into the config.
 
+**Two quirks to know about first-time login in the browser terminal:**
+
+- **Don't resize the browser window** between running `claude auth login` and
+  clicking the OAuth URL. The URL is ~500 chars and visually wraps across
+  terminal rows; pre-resize xterm.js tracks the wrap as one soft-wrapped
+  line and the URL stays clickable, but on resize it re-lays-out the buffer
+  and the URL becomes several hard-wrapped fragments — unclickable and
+  broken if copied. If you resize by accident, reload the tab and re-run
+  `claude auth login`. Tracked upstream in
+  [anthropics/claude-code#72628](https://github.com/anthropics/claude-code/issues/72628).
+- **Pasting the auth code gives no visible feedback** — claude-code hides
+  the code input like a password. Paste it, press Enter, and it should
+  print `Login successful.`. If you're not sure the paste landed, that's
+  by design; just Enter.
+
 ## VM image
 
 Build from the same config:
