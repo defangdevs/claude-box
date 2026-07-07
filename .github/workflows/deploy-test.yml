@@ -20,7 +20,7 @@ on:
       instance_type:
         description: EC2 instance type
         type: string
-        default: t3.small
+        default: t4g.small
       destroy:
         description: Delete the stack at the end (uncheck to keep it up for debugging)
         type: boolean
@@ -96,7 +96,7 @@ jobs:
               "ParameterKey=PublicIpv4,ParameterValue=${{ matrix.public_ipv4 }}" \
               "ParameterKey=UseSpot,ParameterValue=${{ matrix.use_spot }}" \
               "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
-              "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't3.small' }}" \
+              "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small' }}" \
             --on-failure DO_NOTHING \
             --tags "Key=Purpose,Value=claude-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
           echo "::notice::Waiting for stack ${STACK_NAME} to reach CREATE_COMPLETE (up to 30 min)..."
