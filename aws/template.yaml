@@ -126,7 +126,7 @@ Parameters:
 
   ClaudeBoxRev:
     Type: String
-    Default: 8d220c5d08bf0f410b68200a4b642dc19bfab438
+    Default: a14063ca6911de1ef594b68b752e79c4304e8de0
     Description: >-
       Git rev of defangdevs/claude-box. The module (a single .nix file) is
       fetched from raw.githubusercontent.com at this rev - that host is
@@ -135,7 +135,7 @@ Parameters:
 
   ClaudeBoxSha256:
     Type: String
-    Default: 1d9fjcf4wvyglbnlvki94ifslj8rkimkfw54h7375gahpv8qb8kq
+    Default: 1zxa3mlljq2zhxgq2g6v9lx3vpqg3s9ajzd2ilhcdxf7cqgwn3bx
     Description: >-
       Nix base-32 sha256 of modules/claude-box.nix at ClaudeBoxRev. Regenerate via
       `nix-prefetch-url https://raw.githubusercontent.com/defangdevs/claude-box/<REV>/modules/claude-box.nix`
