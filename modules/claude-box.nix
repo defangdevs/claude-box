@@ -231,6 +231,13 @@ in
           Type = "exec";
           Restart = "always";
           RestartSec = "2s";
+          # Upstream claude-code bug: the client persists only channelsEnabled
+          # to ~/.claude/remote-settings.json, losing the org's channel-plugin
+          # allowlist; the next launch trusts the stale cache and silently
+          # drops every channel notification ("Channel notifications skipped"
+          # in the MCP debug log). Clearing the cache before each start forces
+          # a full policy fetch. Harmless otherwise — it's a cache file.
+          ExecStartPre = "${pkgs.coreutils}/bin/rm -f /home/${name}/.claude/remote-settings.json";
           ExecStart = mkStart name u;
           ExecStop = "${pkgs.tmux}/bin/tmux -L claude-box kill-session -t main";
           # Holds the tmux control socket (see TMUX_TMPDIR above). 0700 so only
