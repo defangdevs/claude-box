@@ -8,7 +8,6 @@ Metadata:
         Parameters:
           - Agent
           - WebPassword
-          - SessionName
       - Label:
           default: Compute and cost
         Parameters:
@@ -26,8 +25,6 @@ Metadata:
         default: Web terminal password (blank = auto-generated)
       Agent:
         default: Agent CLI
-      SessionName:
-        default: Claude Remote Control session name (blank = agent@host)
       InstanceType:
         default: EC2 instance type
       UseSpot:
@@ -111,17 +108,6 @@ Parameters:
       upgrade can authenticate without putting the secret in the URL. Use 16-64
       chars from [A-Za-z0-9._~-].
 
-  SessionName:
-    Type: String
-    Default: ''
-    MaxLength: 64
-    AllowedPattern: ^[A-Za-z0-9._@+-]{0,64}$
-    Description: >-
-      Optional. Name shown for this box's Claude Remote Control session in the
-      Claude apps, so you can tell boxes apart. Applies only when Agent=claude.
-      Leave blank to auto-name it agent@<host>. Must be shell-safe:
-      [A-Za-z0-9._@+-], no spaces.
-
   AllowCidr:
     Type: String
     Default: 0.0.0.0/0
@@ -156,7 +142,6 @@ Parameters:
 Conditions:
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
   UseSpotCond: !Equals [!Ref UseSpot, 'true']
-  HasSessionName: !Not [!Equals [!Ref SessionName, '']]
 
 Mappings:
   # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
@@ -383,7 +368,8 @@ Resources:
                   enable = true;
                   agent = "${Agent}";
                   users.agent = {
-                    environment = { TERM = "xterm-256color"; };${SessionNameLine}
+                    environment = { TERM = "xterm-256color"; };
+                    remoteControlName = "${StackName}";
                     web.passwordHashFile = "/var/lib/claude-box-web/password-hash";
                   };
                   web = {
@@ -428,12 +414,7 @@ Resources:
                   - IpDashed: !Join
                       - '-'
                       - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
-              # Blank when SessionName is unset, so the module falls back to its
-              # own default (agent@<host>). Leading newline keeps Nix layout tidy.
-              SessionNameLine: !If
-                - HasSessionName
-                - !Sub "\n                    remoteControlName = \"${SessionName}\";"
-                - ''
+              StackName: !Ref AWS::StackName
 
 Outputs:
   WebURL:

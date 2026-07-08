@@ -40,6 +40,9 @@ Choose `Agent` (`claude` or `codex`), set a `WebPassword` (16+ chars from
 IPv6-enabled VPC/subnet so nothing on the account has to be pre-configured. The
 stack Outputs show `https://agent@<v6-or-v4>.sslip.io/agent/` - open it, enter your
 `WebPassword` when prompted, complete the selected agent's one-time sign-in, done.
+The CloudFormation stack name is also used as the Claude Remote Control session
+name; rename the stack before launch if you want a friendlier label in the
+Claude apps.
 
 **Cost note (Feb-2024 AWS IPv4 pricing).** The default is **IPv6-only** to
 avoid the ~$3.60/mo public-IPv4 charge that AWS bills for *every* public IPv4,

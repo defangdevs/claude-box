@@ -28,6 +28,9 @@ choose Claude Code or Codex.
 - The stack output URL includes the non-secret username as
   `https://agent@<host>.sslip.io/agent/` so browsers can go straight to the
   password prompt without putting the password in the URL.
+- The CloudFormation stack name becomes the Claude Remote Control session name.
+  Rename the stack before launch if you want a friendlier label in the Claude
+  apps; post-deploy, this can still be changed in the NixOS config.
 - The hostname `<addr>.sslip.io` is derived at CFN time via `Fn::Split ':'
   + Fn::Join '-'` on the NetworkInterface's PrimaryIpv6Address (IPv6 mode)
   or the EIP address (IPv4 mode). Consecutive `::` becomes an empty split
