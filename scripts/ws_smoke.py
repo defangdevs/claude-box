@@ -9,11 +9,15 @@ opens the ttyd WebSocket, performs the ttyd handshake, reads the terminal
 output the session produces on attach, and fails if it looks empty or shows a
 tmux "no sessions" / "no server" error.
 
-Usage: ws_smoke.py <web_url>     # web_url = https://<host>/<token>/
+Usage: ws_smoke.py <web_url> [web_password]
 """
+import base64
 import json
 import sys
 import time
+from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 
 from websocket import create_connection, ABNF
 
@@ -26,14 +30,37 @@ FAILURE_MARKERS = ("no sessions", "no server running", "error connecting")
 READ_SECONDS = 12
 
 
-def main() -> int:
-    web_url = sys.argv[1].rstrip("/") + "/"
-    ws_url = web_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1) + "ws"
+def strip_userinfo(url: str) -> str:
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if parts.port is not None:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
 
-    conn = create_connection(ws_url, subprotocols=["tty"], timeout=15)
-    # First message is ttyd's init: auth token (empty — we authenticate via the
-    # URL path) plus the initial window size. A generous width avoids the tmux
-    # status line wrapping into noise.
+
+def auth_cookie(web_url: str, password: Optional[str]) -> Optional[str]:
+    if not password:
+        return None
+
+    auth = base64.b64encode(f"agent:{password}".encode()).decode()
+    req = Request(web_url, headers={"Authorization": f"Basic {auth}"})
+    with urlopen(req, timeout=20) as res:
+        cookies = res.headers.get_all("Set-Cookie", [])
+
+    pairs = [cookie.split(";", 1)[0] for cookie in cookies]
+    return "; ".join(pair for pair in pairs if pair)
+
+
+def main() -> int:
+    web_url = strip_userinfo(sys.argv[1]).rstrip("/") + "/"
+    ws_url = web_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1) + "ws"
+    cookie = auth_cookie(web_url, sys.argv[2] if len(sys.argv) > 2 else None)
+
+    headers = [f"Cookie: {cookie}"] if cookie else None
+    conn = create_connection(ws_url, subprotocols=["tty"], timeout=15, header=headers)
+    # First message is ttyd's init: auth token (empty - Caddy authenticates via
+    # Basic-auth bootstrap + cookie) plus the initial window size. A generous
+    # width avoids the tmux status line wrapping into noise.
     conn.send(json.dumps({"AuthToken": "", "columns": 220, "rows": 50}))
 
     collected = bytearray()

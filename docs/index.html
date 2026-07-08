@@ -174,7 +174,7 @@
       <strong>We didn't detect IPv6 on your network</strong> &mdash; the Launch buttons above have been adjusted to allocate a public IPv4 (~$3.60/month) so the box will be reachable from here. If you know you do have IPv6 (or don't mind trying without), uncheck <code>PublicIpv4</code> on the CloudFormation form before launching.
     </div>
     <div class="note">
-      <strong>You don't need to make up a password.</strong> Every Launch button already has a random one filled in for you. Keep it, type your own, or clear it to have one generated automatically. Choose Claude Code or Codex, pick a size, and launch. The box takes about 2&ndash;3 minutes to start. When it's ready, your private link (with the password already built in) appears under <strong>Outputs</strong> in the AWS console &mdash; open it, finish the selected agent's one-time sign-in, and you're in.
+      <strong>You don't need to make up a password.</strong> Every Launch button already has a random one filled in for you. Keep it, type your own, or clear it to have one generated automatically. Choose Claude Code or Codex, pick a size, and launch. The box takes about 2&ndash;3 minutes to start. When it's ready, your browser link appears under <strong>Outputs</strong> in the AWS console &mdash; open it, enter the password from the deployment form, finish the selected agent's one-time sign-in, and you're in.
     </div>
     <div class="note">
       <strong>Modern internet address by default.</strong> The box uses a free, IPv6 address that most home connections support, but some office and public Wi-Fi networks can't reach it. We check your browser on this page &mdash; if we can't reach the IPv6 internet from here, the Launch button above will automatically switch to IPv4 (~$3.60/month) so the box will actually be reachable.
@@ -201,19 +201,19 @@
 <script>
   // Pre-fill each Launch link with a fresh random WebPassword so users don't
   // have to invent one. The CFN quickcreate form reads param_<Name>; the user
-  // can still edit it (or clear it, letting the template derive one).
+  // can still edit it before deployment.
   (function () {
-    function token() {
+    function password() {
       const b = crypto.getRandomValues(new Uint8Array(24));
       return Array.from(b, x => x.toString(16).padStart(2, '0')).join('');
     }
     function apply(a) {
       const base = a.dataset.base || (a.dataset.base = a.getAttribute('href'));
-      a.setAttribute('href', base + '&param_WebPassword=' + token());
+      a.setAttribute('href', base + '&param_WebPassword=' + password());
     }
     document.querySelectorAll('a.launch').forEach(function (a) {
       apply(a);
-      // Fresh token each time the user actually launches (covers new-tab too).
+      // Fresh password each time the user actually launches (covers new-tab too).
       a.addEventListener('pointerdown', function () { apply(a); });
     });
   })();
@@ -243,7 +243,7 @@
       a.dataset.base = base;
       // Refresh href so right-click / open-in-new-tab picks up the flag;
       // the existing pointerdown handler will re-derive with a fresh password
-      // token when the user actually clicks.
+      // when the user actually clicks.
       a.setAttribute('href', base);
     });
     const note = document.getElementById('no-ipv6-note');

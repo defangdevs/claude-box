@@ -19,20 +19,40 @@ choose Claude Code or Codex.
   that binds to `127.0.0.1:7681` and attaches to `agent`'s tmux session
   (`TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box -t main` - the socket
   lives under `/run` because the agent runs with `PrivateTmp`).
-- **URL path-token auth** (not HTTP Basic Auth). ttyd runs `-b /<token>/`,
-  Caddy 404s anything without the prefix. See "Design decisions" below.
+- **Basic-auth-to-cookie web auth**. Caddy prompts for username `agent` and the
+  `WebPassword`, sets an `HttpOnly; Secure; SameSite=Strict` cookie, then lets
+  browser WebSocket upgrades authenticate with that cookie. ttyd still binds
+  only to localhost.
+- The stack output URL includes the non-secret username as
+  `https://agent@<host>.sslip.io/` so browsers can go straight to the password
+  prompt without putting the password in the URL.
 - The hostname `<addr>.sslip.io` is derived at CFN time via `Fn::Split ':'
   + Fn::Join '-'` on the NetworkInterface's PrimaryIpv6Address (IPv6 mode)
   or the EIP address (IPv4 mode). Consecutive `::` becomes an empty split
   element that re-joins as `--` - matches sslip.io's encoding exactly.
-- Requires IMDSv2 (`HttpTokens: required`); the plaintext `WebPassword` in
-  user-data is only readable from the instance itself.
+- Requires IMDSv2 (`HttpTokens: required`).
 - Disables `amazon-init` after the first successful apply so local edits to
   `/etc/nixos/configuration.nix` survive reboots.
 
+### WebPassword storage
+
+`WebPassword` is marked `NoEcho` and is not emitted in stack Outputs. It still
+exists as plaintext in the substituted EC2 user-data, and the current
+implementation interpolates it into first-boot Nix/systemd material so Caddy can
+derive its Basic Auth hash. Treat principals that can read instance user-data or
+the instance's local system configuration as inside the web terminal trust
+boundary.
+
+Caddy does not compare the plaintext password at request time. On boot,
+`claude-web-auth-secrets.service` runs `caddy hash-password`, writes only
+`WEB_PASSWORD_HASH` plus a random cookie secret to `/run/claude-box-web/env`
+(`0600`), and Caddy reads that environment file. The cookie secret is generated
+on the instance and stored separately at
+`/var/lib/claude-box-web/cookie-secret` (`0700` parent directory).
+
 ## Design decisions & gotchas
 
-### Why URL path-token instead of HTTP Basic Auth
+### Why Basic Auth mints a cookie
 
 The obvious "username + password prompt" model (ttyd `-c user:pass`, or
 Caddy `basic_auth`) breaks the terminal in every browser: **Chrome,
@@ -43,11 +63,12 @@ Confirmed via [Bugzilla 1229443](https://bugzilla.mozilla.org/show_bug.cgi?id=12
 [Chromium 40193544](https://issues.chromium.org/issues/40193544), and
 [ttyd #1437](https://github.com/tsl0922/ttyd/issues/1437).
 
-Fix: **the `WebPassword` parameter is the URL path** - `https://<host>/<token>/`.
-Same shared-secret model, works uniformly in every browser because
-there's no HTTP auth on the WS at all. The trade-off is that the token
-travels in the URL (visible in browser history, `Referer` headers, CFN
-Outputs); treat it like a pre-shared key.
+Fix: Caddy uses Basic Auth only for the initial page load, then sets a
+host-scoped `__Host-agent_box_auth` cookie. Later ttyd WebSocket requests carry
+that cookie, not an `Authorization` header, so the terminal works without
+putting the secret in browser history, `Referer` headers, or CloudFormation
+Outputs. The password is still a shared secret: anyone with enough AWS access to
+read EC2 user-data should be treated as inside the deployment's trust boundary.
 
 ### Why `sslip.io` and not the EC2 public DNS
 
@@ -205,8 +226,9 @@ legs in parallel:
 
 - **ipv4-full** - forces `PublicIpv4=true` (+ Spot); GitHub runners are
   IPv4-only, so this is the only leg that can actually reach the box. It runs
-  the full connectivity smoke tests (token URL serves ttyd over HTTPS, a
-  wrong-token path returns 404, the WebSocket upgrade returns 101).
+  the full connectivity smoke tests (the root URL serves ttyd over HTTPS after
+  Basic auth, unauthenticated requests get 401, the WebSocket upgrade returns
+  101 with the auth cookie).
 - **ipv6-outputs** - exercises the DEFAULT IPv6-only path. The runner can't
   connect over IPv6, so it asserts the stack reaches `CREATE_COMPLETE` and its
   outputs are populated (catches blank `PrimaryIpv6Address` bugs).

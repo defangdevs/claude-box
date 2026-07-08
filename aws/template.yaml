@@ -1,9 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
 
-# W2010: WebPassword is NoEcho but appears in the WebURL output. That is by
-# design - the whole point of the output is to give the user the URL, and the
-# token is part of the URL. Anyone with cloudformation:DescribeStacks on this
-# stack can see it; treat that as the same trust boundary as the shared secret.
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
@@ -27,7 +23,7 @@ Metadata:
           - ClaudeBoxSha256
     ParameterLabels:
       WebPassword:
-        default: Web terminal token (blank = auto-generated)
+        default: Web terminal password (blank = auto-generated)
       Agent:
         default: Agent CLI
       SessionName:
@@ -44,11 +40,6 @@ Metadata:
         default: claude-box git rev
       ClaudeBoxSha256:
         default: claude-box module sha256
-  cfn-lint:
-    config:
-      ignore_checks:
-        - W2010
-
 Description: >
   claude-box - 1-click NixOS host running a coding agent inside a persistent
   tmux session. Choose Claude Code or Codex at deployment time. Reach it through
@@ -111,15 +102,14 @@ Parameters:
   WebPassword:
     Type: String
     NoEcho: true
-    Default: ''
+    MinLength: 16
     MaxLength: 64
-    AllowedPattern: ^$|^[A-Za-z0-9._~-]{16,64}$
+    AllowedPattern: ^[A-Za-z0-9._~-]{16,64}$
     Description: >-
-      Shared secret embedded in the URL as a path token (browsers do not
-      reliably attach Basic Auth to WebSocket upgrades, so we use a path token
-      instead of a username/password prompt). Leave blank to auto-generate one
-      from the stack's unique id - the full URL (token included) is shown in the
-      stack Outputs. If you set your own: 16-64 URL-safe chars [A-Za-z0-9._~-].
+      Shared secret for the browser terminal. Log in with username "agent" and
+      this password; Caddy then sets an HttpOnly Secure cookie so the WebSocket
+      upgrade can authenticate without putting the secret in the URL. Use 16-64
+      chars from [A-Za-z0-9._~-].
 
   SessionName:
     Type: String
@@ -161,7 +151,6 @@ Conditions:
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
   UseSpotCond: !Equals [!Ref UseSpot, 'true']
   HasSessionName: !Not [!Equals [!Ref SessionName, '']]
-  HasWebPassword: !Not [!Equals [!Ref WebPassword, '']]
 
 Mappings:
   # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
@@ -377,7 +366,7 @@ Resources:
                   sha256 = "${ClaudeBoxSha256}";
                 };
                 hostname = "${WebHostname}";
-                webPassword = "${WebPasswordEff}";
+                webPassword = "${WebPassword}";
               in {
                 imports = [
                   "${!modulesPath}/virtualisation/amazon-image.nix"
@@ -394,6 +383,44 @@ Resources:
 
                 networking.firewall.allowedTCPPorts = [ 443 ];
 
+                systemd.tmpfiles.rules = [
+                  "d /var/lib/claude-box-web 0700 root root - -"
+                  "d /run/claude-box-web 0700 root root - -"
+                ];
+
+                systemd.services.claude-web-auth-secrets = {
+                  description = "Prepare browser terminal auth secrets";
+                  before = [ "caddy.service" ];
+                  requiredBy = [ "caddy.service" ];
+                  serviceConfig = {
+                    Type = "oneshot";
+                  };
+                  path = [ pkgs.caddy pkgs.coreutils pkgs.openssl ];
+                  script = ''
+                    umask 077
+                    install -d -m 0700 /var/lib/claude-box-web /run/claude-box-web
+                    if [ ! -s /var/lib/claude-box-web/cookie-secret ]; then
+                      openssl rand -hex 32 > /var/lib/claude-box-web/cookie-secret
+                    fi
+
+                    password_hash="$(caddy hash-password --plaintext ${!lib.escapeShellArg webPassword})"
+                    cookie_secret="$(cat /var/lib/claude-box-web/cookie-secret)"
+                    tmp="$(mktemp /run/claude-box-web/env.XXXXXX)"
+                    {
+                      printf 'WEB_PASSWORD_HASH=%s\n' "$password_hash"
+                      printf 'WEB_COOKIE_SECRET=%s\n' "$cookie_secret"
+                    } > "$tmp"
+                    chmod 0600 "$tmp"
+                    mv "$tmp" /run/claude-box-web/env
+                  '';
+                };
+
+                systemd.services.caddy = {
+                  after = [ "claude-web-auth-secrets.service" ];
+                  requires = [ "claude-web-auth-secrets.service" ];
+                  serviceConfig.EnvironmentFile = "/run/claude-box-web/env";
+                };
+
                 services.caddy = {
                   enable = true;
                   virtualHosts."${!hostname}" = {
@@ -403,11 +430,23 @@ Resources:
                           disable_http_challenge
                         }
                       }
-                      @authed path /${!webPassword}/*
-                      handle @authed {
+                      header {
+                        Cache-Control "no-store"
+                        X-Content-Type-Options "nosniff"
+                      }
+                      @hasAuthCookie header_regexp Cookie "(^|; )__Host-agent_box_auth={$WEB_COOKIE_SECRET}(;|$)"
+                      handle @hasAuthCookie {
                         reverse_proxy 127.0.0.1:7681
                       }
-                      respond 404
+                      handle {
+                        route {
+                          basic_auth {
+                            agent {$WEB_PASSWORD_HASH}
+                          }
+                          header >Set-Cookie "__Host-agent_box_auth={$WEB_COOKIE_SECRET}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+                          reverse_proxy 127.0.0.1:7681
+                        }
+                      }
                     '';
                   };
                 };
@@ -425,7 +464,7 @@ Resources:
                     User = "agent";
                     Restart = "always";
                     RestartSec = "5s";
-                    ExecStart = "${!pkgs.ttyd}/bin/ttyd --writable -p 7681 -i 127.0.0.1 -b /${!webPassword}/ -t titleFixed=${Agent}-box ${!pkgs.tmux}/bin/tmux -L agent-box attach -t main";
+                    ExecStart = "${!pkgs.ttyd}/bin/ttyd --writable -p 7681 -i 127.0.0.1 -t titleFixed=${Agent}-box ${!pkgs.tmux}/bin/tmux -L agent-box attach -t main";
                   };
                 };
 
@@ -446,14 +485,6 @@ Resources:
                 - HasSessionName
                 - !Sub "\n                    remoteControlName = \"${SessionName}\";"
                 - ''
-              # User-supplied token, or the stack's UUID when left blank. The
-              # UUID is 122 random bits and only visible to principals with
-              # cloudformation:DescribeStacks - the same trust boundary as the
-              # token-in-URL itself.
-              WebPasswordEff: !If
-                - HasWebPassword
-                - !Ref WebPassword
-                - !Select [2, !Split ['/', !Ref 'AWS::StackId']]
 
 Outputs:
   WebURL:
@@ -461,20 +492,16 @@ Outputs:
       Browser terminal for the selected agent. Claude Code deployments are also
       drivable from the Claude apps via Remote Control.
       First load takes ~2-3 minutes while the instance provisions and Caddy
-      issues an ACME cert. The URL includes the WebPassword token - keep it
-      private.
+      issues an ACME cert. The URL includes the non-secret username; enter the
+      WebPassword chosen at deployment time when prompted.
     Value: !Sub
-      - "https://${Host}.sslip.io/${Pw}/"
+      - "https://agent@${Host}.sslip.io/"
       - Host: !If
           - UseIpv4
           - !Ref EIP
           - !Join
               - '-'
               - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
-        Pw: !If
-          - HasWebPassword
-          - !Ref WebPassword
-          - !Select [2, !Split ['/', !Ref 'AWS::StackId']]
 
   PublicAddress:
     Description: Elastic IP (IPv4 mode) or primary IPv6 (IPv6 mode).
