@@ -101,14 +101,16 @@ baked into the config.
 
 **Two quirks to know about first-time login in the browser terminal:**
 
-- **Don't resize the browser window** between running `claude auth login` and
-  clicking the OAuth URL. The URL is ~500 chars and visually wraps across
-  terminal rows; pre-resize xterm.js tracks the wrap as one soft-wrapped
-  line and the URL stays clickable, but on resize it re-lays-out the buffer
-  and the URL becomes several hard-wrapped fragments — unclickable and
-  broken if copied. If you resize by accident, reload the tab and re-run
-  `claude auth login`. Tracked upstream in
-  [anthropics/claude-code#72628](https://github.com/anthropics/claude-code/issues/72628).
+- **The login URL may not be clickable at narrow browser widths.** The URL
+  claude-code prints is ~400 chars; if your browser terminal is narrower
+  than that, xterm.js wraps it across multiple rows and its link detector
+  truncates the match somewhere in the middle. Fix is merged upstream in
+  [xtermjs/xterm.js PR 6017](https://github.com/xtermjs/xterm.js/pull/6017)
+  but not yet in a tagged xterm.js release, so it hasn't reached nixpkgs'
+  ttyd. Until it lands: widen the browser window or zoom out (Cmd/Ctrl `-`)
+  before running `claude auth login` so the URL fits on one row; then click
+  it. Resizing after emission can make it worse (a related fix is in
+  [xtermjs/xterm.js PR 5810](https://github.com/xtermjs/xterm.js/pull/5810)).
 - **Pasting the auth code gives no visible feedback** — claude-code hides
   the code input like a password. Paste it, press Enter, and it should
   print `Login successful.`. If you're not sure the paste landed, that's
