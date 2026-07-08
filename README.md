@@ -1,19 +1,30 @@
 # claude-box
 
-Reproducible, multi-user [Claude Code](https://claude.com/claude-code) agent
-sandboxes — one click on AWS, on bare metal, or as a VM image, from one
-declarative config. (Built on NixOS.)
+Reproducible, multi-user coding-agent sandboxes - one click on AWS, on bare
+metal, or as a VM image, from one declarative config. (Built on NixOS.)
 
-Each agent is an **unprivileged user** running Claude Code inside a persistent
-`tmux` session with `--dangerously-skip-permissions --remote-control`. The only
-elevated power an agent gets is a tight, explicit passwordless-`sudo`
-allowlist. Custom tokens (e.g. `GH_TOKEN`) are injected via drop-in
-`EnvironmentFile`s that never enter the world-readable Nix store.
+Each agent is an **unprivileged user** running a supported agent CLI inside a
+persistent `tmux` session. The only elevated power an agent gets is a tight,
+explicit passwordless-`sudo` allowlist. Custom tokens (e.g. `GH_TOKEN`) are
+injected via drop-in `EnvironmentFile`s that never enter the world-readable Nix
+store.
+
+Supported agents:
+
+| Agent | Package | Autonomy flag used by `skipPermissions = true` | Notes |
+| --- | --- | --- | --- |
+| Claude Code | `pkgs.claude-code` | `--dangerously-skip-permissions` | Supports Claude Remote Control. |
+| Codex | `pkgs.codex` | `--dangerously-bypass-approvals-and-sandbox` | Browser terminal access; Codex app-server/remote wiring is future work. |
+
+**Name note.** `claude-box` still works as the module and service namespace for
+compatibility, but the repo has outgrown that name. A better name would be
+`agent-box`: short, literal, and broad enough for Claude Code, Codex, and future
+terminal-native agents.
 
 ## 1-click AWS launch
 
 Provisions one EC2 instance (NixOS 25.11) with the module + a browser terminal
-(Caddy → ttyd) already wired up. First load takes ~2–3 minutes while the AMI
+(Caddy -> ttyd) already wired up. First load takes ~2-3 minutes while the AMI
 provisions, `nixos-rebuild switch` applies the config, and Caddy issues a
 Let's Encrypt cert against `<eip>.sslip.io`.
 
@@ -24,12 +35,12 @@ Let's Encrypt cert against `<eip>.sslip.io`.
 | eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
 | eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
 
-Set a `WebPassword` (16+ URL-safe chars — the URL includes it as a path token
-since browsers don't reliably attach Basic Auth to WebSocket upgrades), pick
-an instance size, launch. The template creates its own IPv6-enabled VPC/subnet
-so nothing on the account has to be pre-configured. The stack Outputs show
-`https://<v6-or-v4>.sslip.io/<token>/` — open, complete the one-time Claude
-sign-in, done.
+Choose `Agent` (`claude` or `codex`), set a `WebPassword` (16+ URL-safe chars -
+the URL includes it as a path token since browsers don't reliably attach Basic
+Auth to WebSocket upgrades), pick an instance size, launch. The template creates
+its own IPv6-enabled VPC/subnet so nothing on the account has to be
+pre-configured. The stack Outputs show `https://<v6-or-v4>.sslip.io/<token>/` -
+open it, complete the selected agent's one-time sign-in, done.
 
 **Cost note (Feb-2024 AWS IPv4 pricing).** The default is **IPv6-only** to
 avoid the ~$3.60/mo public-IPv4 charge that AWS bills for *every* public IPv4,
@@ -43,13 +54,13 @@ the Elastic IP while attached (~$3.60/mo if you keep it up). Terminate the
 stack to stop billing.
 
 Template source: [`aws/template.yaml`](./aws/template.yaml).
-See [`aws/README.md`](./aws/README.md) for the region → AMI refresh workflow
+See [`aws/README.md`](./aws/README.md) for the region -> AMI refresh workflow
 and the S3-hosting setup.
 
 ## Why
 
-Turns a hand-tuned, single-user, bare-metal Claude setup into something others
-can stand up identically — either as per-person accounts on a shared host or as
+Turns a hand-tuned, single-user, bare-metal agent setup into something others
+can stand up identically - either as per-person accounts on a shared host or as
 disposable, snapshot-able KVM guests.
 
 ## Quick start (bare metal, multiple users)
@@ -72,12 +83,14 @@ Add the flake as an input and import the module:
 
   services.claude-box = {
     enable = true;
+    agent = "claude"; # or "codex"
     users = {
       alice = { };
       bob   = { remoteControlName = "bob-box"; };
+      coder = { agent = "codex"; };
       ci    = { skipPermissions = false; };   # keep approval prompts on
     };
-    # The ONLY elevated powers the agents get — keep it tight.
+    # The ONLY elevated powers the agents get - keep it tight.
     sudoAllowlist = [ "/run/current-system/sw/bin/systemctl reload caddy.service" ];
     extraPackages = with pkgs; [ git ripgrep jq ];
   };
@@ -87,19 +100,19 @@ Add the flake as an input and import the module:
 Then `sudo nixos-rebuild switch`. Each user gets a `claude-box-<name>.service`.
 
 **First login (per user):** attach to the session and complete the one-time
-Claude sign-in:
+agent sign-in:
 
 ```bash
-sudo -u alice env TMUX_TMPDIR=/run/claude-box-alice tmux -L claude-box attach -t main
+sudo -u alice env TMUX_TMPDIR=/run/agent-box-alice tmux -L agent-box attach -t main
 ```
 
 `TMUX_TMPDIR` is required: the agent service runs with `PrivateTmp`, so its
-tmux control socket lives under `/run/claude-box-<user>` rather than `/tmp`.
+tmux control socket lives under `/run/agent-box-<user>` rather than `/tmp`.
 
-Credentials live in that user's `~/.claude` — per-user runtime state, never
-baked into the config.
+Credentials live in that user's home directory (`~/.claude` for Claude Code,
+`~/.codex` for Codex) - per-user runtime state, never baked into the config.
 
-**Two quirks to know about first-time login in the browser terminal:**
+**Claude Code quirks to know about first-time login in the browser terminal:**
 
 - **Don't resize the browser window** between running `claude auth login` and
   clicking the OAuth URL. The URL is ~500 chars and visually wraps across
@@ -150,13 +163,15 @@ All under `services.claude-box`:
 | Option | Default | Description |
 | --- | --- | --- |
 | `enable` | `false` | Turn the module on. |
-| `package` | `pkgs.claude-code` | Claude Code package to run. |
-| `users.<name>.skipPermissions` | `true` | Pass `--dangerously-skip-permissions`. |
-| `users.<name>.remoteControl` | `true` | Pass `--remote-control`. |
-| `users.<name>.remoteControlName` | `<name>@<host>` | Remote Control session name (null → `<user>@<fqdnOrHostName>`, so you can tell boxes apart in the apps). |
+| `agent` | `"claude"` | Default agent CLI: `"claude"` or `"codex"`. |
+| `package` | selected agent default | Override package to run for every agent user. |
+| `users.<name>.agent` | `null` | Per-user override; null uses `services.claude-box.agent`. |
+| `users.<name>.skipPermissions` | `true` | Pass the selected agent's autonomy flag. |
+| `users.<name>.remoteControl` | `true` | Pass Claude's `--remote-control` when `agent = "claude"`; ignored for Codex. |
+| `users.<name>.remoteControlName` | `<name>@<host>` | Claude Remote Control session name (null -> `<user>@<fqdnOrHostName>`, so you can tell boxes apart in the apps). Ignored for Codex. |
 | `users.<name>.workingDirectory` | `/home/<name>` | Agent startup directory. |
 | `users.<name>.extraGroups` | `[]` | Extra groups for the user. |
-| `users.<name>.extraArgs` | `[]` | Extra args appended to `claude`. |
+| `users.<name>.extraArgs` | `[]` | Extra args appended to the selected agent CLI. |
 | `users.<name>.environmentFiles` | `[]` | Extra `EnvironmentFile` paths for this agent. |
 | `users.<name>.environment` | `{}` | Extra (non-secret) env vars for this agent's service. |
 | `sudoAllowlist` | `[]` | Passwordless sudo commands granted to every agent. |
@@ -170,15 +185,14 @@ All under `services.claude-box`:
 The module treats each agent as an untrusted process running inside its own
 unprivileged user account, on a machine the operator already treats as a
 sandbox host (VM, throwaway EC2 box, etc.). The OS layer is what contains a
-compromised agent — Claude Code's in-tool approval prompts are *deliberately
-off* by default (`skipPermissions = true`), so nothing in claude-code itself
-gates arbitrary command execution as the agent user.
+compromised agent - the agent CLI's in-tool approval prompts are *deliberately*
+off by default (`skipPermissions = true`), so nothing in the agent itself gates
+arbitrary command execution as the agent user.
 
 **What the module gives you:**
 
-- **Unprivileged agent user.** Not root. Claude Code itself refuses to run
-  `--dangerously-skip-permissions` as root, so this is enforced from two
-  sides.
+- **Unprivileged agent user.** Not root. Agent autonomy is intentionally scoped
+  to that user.
 - **Systemd hardening on every agent service:** `PrivateTmp`,
   `PrivateDevices` (keeps pty, blocks `/dev/mem` and friends),
   `ProtectSystem=strict` (root filesystem read-only, only `/home/<name>`
@@ -186,10 +200,10 @@ gates arbitrary command execution as the agent user.
   `ControlGroups/Clock`, `RestrictSUIDSGID`, `RestrictRealtime`,
   `LockPersonality`. `NoNewPrivileges=true` is applied automatically when
   `sudoAllowlist` is empty; a non-empty allowlist keeps NNP off (sudo is
-  setuid and needs the euid transition) — a deliberate trade of a bit of
+  setuid and needs the euid transition) - a deliberate trade of a bit of
   containment for scoped elevation.
 - **Tight sudo:** whatever's in `sudoAllowlist` is the entire root-capable
-  surface. `NOPASSWD` only — no `SETENV`, no blanket sudo, no ALL.
+  surface. `NOPASSWD` only - no `SETENV`, no blanket sudo, no ALL.
 - **Root-scoped secrets dir:** `/etc/claude-box` is `0700 root:root`.
   Systemd reads the per-agent `<user>.env` files as root before dropping
   into the agent's UID, so the agent process itself never traverses the
@@ -198,17 +212,17 @@ gates arbitrary command execution as the agent user.
 
 **Deliberate defaults that stay ON:**
 
-- `skipPermissions = true` — a headless agent runner with per-tool
+- `skipPermissions = true` - a headless agent runner with per-tool
   approval prompts and no human to answer them is useless. Flip to
   `false` per-user if you actually have a human at the terminal.
-- `remoteControl = true` — this is the "drive it from your phone"
-  feature. Flip to `false` per-user if you don't want the session
-  reachable from the Claude apps.
+- `remoteControl = true` - for Claude Code, this is the "drive it from your
+  phone" feature. Flip to `false` per-user if you don't want the session
+  reachable from the Claude apps. Codex ignores this option.
 
 **Tradeoffs the module can't fully paper over:**
 
 - **Persistent `/home/<name>` across sessions.** SSH keys, git creds,
-  dotfiles, session state — anything the agent writes accumulates.
+  dotfiles, session state - anything the agent writes accumulates.
   Treat each agent home as untrusted; back up or wipe with intent.
 - **Secrets as env vars.** Anything in `<user>.env` becomes an env
   var in the agent's process and its children. Env vars can leak via
@@ -216,16 +230,21 @@ gates arbitrary command execution as the agent user.
   Systemd's `LoadCredential=` (files under `$CREDENTIALS_DIRECTORY`)
   is a possible future improvement if the tools running under the
   agent actually read from there.
-- **`--dangerously-skip-permissions`** grants full autonomy inside
-  claude-code. Prefer the VM target for anything you'd not lose
-  sleep over an attacker doing as the agent user — a KVM guest is a
+- **Agent autonomy flags** grant full autonomy inside the agent CLI. Prefer the
+  VM target for anything you'd not lose sleep over an attacker doing as the
+  agent user - a KVM guest is a
   much stronger blast-radius boundary than a container.
 
 ## Notes
 
-- `claude-code` is unfree; the module allows just that package (overridable).
+- `claude-code` is unfree; the module allows just the supported agent packages
+  (overridable).
 - The qcow2 image uses the native nixpkgs image API (`system.build.images`,
-  upstreamed in NixOS 25.05) — no extra flake inputs.
+  upstreamed in NixOS 25.05) - no extra flake inputs.
+- Future work: switching the agent on a running instance should likely be a
+  small NixOS config change (`services.claude-box.agent = ...`) plus
+  `nixos-rebuild switch` and a service restart, but the UX still needs a tidy
+  operator command because credentials and live tmux state are agent-specific.
 
 ## Docs
 
@@ -234,5 +253,5 @@ Maintainer and continuity notes live in the
 
 ## License
 
-MIT — see [LICENSE](./LICENSE). Note this license covers the flake/module only;
-Claude Code itself ships under Anthropic's own terms.
+MIT - see [LICENSE](./LICENSE). Note this license covers the flake/module only;
+agent CLIs ship under their own terms.

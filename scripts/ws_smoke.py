@@ -64,7 +64,7 @@ def main() -> int:
             print(text[:2000])
             return 1
 
-    # A live session (claude's UI or a shell + tmux status line) always paints
+    # A live session (agent UI or a shell + tmux status line) always paints
     # something on attach. Near-empty output means the terminal is dead.
     if len(text.strip()) < 16:
         print(f"::error::Terminal produced almost no output ({len(text.strip())} bytes) — session not alive.")

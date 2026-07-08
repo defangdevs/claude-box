@@ -1,29 +1,30 @@
 # AWS deployment (`aws/`)
 
 CloudFormation template that provisions a single-agent claude-box host on
-EC2 with a browser terminal (Caddy + ttyd).
+EC2 with a browser terminal (Caddy + ttyd). The deployment form lets the user
+choose Claude Code or Codex.
 
-- `template.yaml` — the template. Source of truth; anything else is derived.
+- `template.yaml` - the template. Source of truth; anything else is derived.
 
 ## What the template does
 
 - Provisions its own VPC (10.42.0.0/16) with an Amazon-provided IPv6 CIDR,
   a single public subnet with a /64 IPv6 range, IGW + routes for v4 and
-  v6, and a NAT64 route (`64:ff9b::/96 → IGW`) so IPv6-only instances can
-  still reach IPv4-only upstreams like github.com. Also enables `Dns64` on
-  the subnet.
+  v6. First-boot dependencies are fetched from dual-stack hosts, so the
+  IPv6-only default does not require NAT64/DNS64.
 - Launches one EC2 instance from the latest NixOS 25.11 AMI for the region.
 - Uses EC2 user-data as a NixOS configuration: imports the pinned
-  `claude-box` module + adds Caddy (TLS-ALPN-01 only) + a `ttyd` systemd
-  service that binds to `127.0.0.1:7681` and attaches to `agent`'s tmux
-  session (`TMUX_TMPDIR=/run/claude-box-agent tmux -L claude-box -t main` —
-  the socket lives under `/run` because the agent runs with `PrivateTmp`).
+  `claude-box` module, sets `services.claude-box.agent` from the `Agent`
+  parameter, adds Caddy (TLS-ALPN-01 only), and adds a `ttyd` systemd service
+  that binds to `127.0.0.1:7681` and attaches to `agent`'s tmux session
+  (`TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box -t main` - the socket
+  lives under `/run` because the agent runs with `PrivateTmp`).
 - **URL path-token auth** (not HTTP Basic Auth). ttyd runs `-b /<token>/`,
   Caddy 404s anything without the prefix. See "Design decisions" below.
 - The hostname `<addr>.sslip.io` is derived at CFN time via `Fn::Split ':'
   + Fn::Join '-'` on the NetworkInterface's PrimaryIpv6Address (IPv6 mode)
   or the EIP address (IPv4 mode). Consecutive `::` becomes an empty split
-  element that re-joins as `--` — matches sslip.io's encoding exactly.
+  element that re-joins as `--` - matches sslip.io's encoding exactly.
 - Requires IMDSv2 (`HttpTokens: required`); the plaintext `WebPassword` in
   user-data is only readable from the instance itself.
 - Disables `amazon-init` after the first successful apply so local edits to
@@ -42,7 +43,7 @@ Confirmed via [Bugzilla 1229443](https://bugzilla.mozilla.org/show_bug.cgi?id=12
 [Chromium 40193544](https://issues.chromium.org/issues/40193544), and
 [ttyd #1437](https://github.com/tsl0922/ttyd/issues/1437).
 
-Fix: **the `WebPassword` parameter is the URL path** — `https://<host>/<token>/`.
+Fix: **the `WebPassword` parameter is the URL path** - `https://<host>/<token>/`.
 Same shared-secret model, works uniformly in every browser because
 there's no HTTP auth on the WS at all. The trade-off is that the token
 travels in the URL (visible in browser history, `Referer` headers, CFN
@@ -52,10 +53,10 @@ Outputs); treat it like a pre-shared key.
 
 Every EC2 instance gets an `ec2-<ip>.compute-1.amazonaws.com` hostname
 for free, but **Let's Encrypt hard-refuses to issue certs under
-`*.compute.amazonaws.com`** by policy — see [LE community post #12692](https://community.letsencrypt.org/t/policy-forbids-issuing-for-name-on-amazon-ec2-domain/12692).
+`*.compute.amazonaws.com`** by policy - see [LE community post #12692](https://community.letsencrypt.org/t/policy-forbids-issuing-for-name-on-amazon-ec2-domain/12692).
 So we need any other name that resolves to our public IP.
 
-`sslip.io` returns whatever IP is encoded in the label — no DNS setup,
+`sslip.io` returns whatever IP is encoded in the label - no DNS setup,
 no signup, no dep. Third-party service risk: if they disappear, existing
 certs keep serving but new stacks can't ACME. Threat model: they only
 provide DNS, so they can't MITM active sessions (TLS cert is ours);
@@ -64,7 +65,7 @@ that immediately fails cert validation.
 
 ### CloudFormation quick-create requires an S3 template URL
 
-`templateURL` in the `/stacks/quickcreate` URL **must be an S3 URL** —
+`templateURL` in the `/stacks/quickcreate` URL **must be an S3 URL** -
 GitHub Pages or `raw.githubusercontent.com` are rejected with
 "TemplateURL must be a supported URL." That's why the publish-template
 workflow syncs to S3, and the README's Launch Stack links point at
@@ -74,22 +75,22 @@ workflow syncs to S3, and the README's Launch Stack links point at
 
 Older AWS accounts' default VPCs never had IPv6 CIDR blocks
 retroactively added. Making the template self-provisioning (VPC + IPv6
-CIDR + IGW + subnet with `EnableDns64` + NAT64 route) means:
+CIDR + IGW + IPv6 subnet) means:
 - No "please select a subnet from the dropdown" step at launch (truer
   1-click).
 - Works in any account regardless of default-VPC state.
-- IPv6 default is actually reachable outbound (via DNS64/NAT64 on the
-  IGW, which AWS enabled in Nov 2023).
+- IPv6 default is reachable outbound to the dual-stack hosts required for
+  first boot, without paying for NAT Gateway infrastructure.
 
 All the extra resources are free (VPC, subnet, route table, IGW, EIP-
-while-attached historical wisdom no longer applies — see the IPv4 note
+while-attached historical wisdom no longer applies - see the IPv4 note
 below).
 
 ### IPv6-first by cost, IPv4 opt-in by connectivity
 
 Since **Feb 2024, AWS charges $0.005/hr for every public IPv4 address**
 regardless of attach state (EIP or ephemeral, running or stopped
-instance) — ~$3.60/mo per address. IPv6 is free. So the template
+instance) - ~$3.60/mo per address. IPv6 is free. So the template
 defaults to `PublicIpv4: false` (IPv6-only, ~$0/mo for the address).
 Users whose clients don't have IPv6 (corporate nets, coffee-shop WiFi)
 set `PublicIpv4: true` at launch to allocate an EIP.
@@ -131,7 +132,8 @@ and attach it to the instance via `NetworkInterfaces:
 ### cfn-lint gap: SG per-rule descriptions
 
 `SecurityGroupIngress` rule descriptions have a stricter regex than
-`GroupDescription` — Unicode punctuation like `—` (U+2014 em-dash) is
+`GroupDescription` - Unicode punctuation like `-` (U+002D hyphen) is safe, but
+Unicode punctuation like an em dash is
 rejected by EC2's API but cfn-lint only checks the group description.
 The template avoids em-dashes anywhere that becomes a rule description
 to sidestep this.
@@ -159,11 +161,11 @@ keys).
 
 ### Prerequisites (forking this repo)
 
-The workflow is self-bootstrapping — it upserts the bucket, its
+The workflow is self-bootstrapping - it upserts the bucket, its
 public-access configuration, and an `s3:GetObject` policy scoped to
 `template.yaml` (the only object in the bucket) every run. The module itself
-is fetched by the box direct from `raw.githubusercontent.com` at first boot
-— that host is dual-stack, so an IPv6-only box needs no NAT64. It reads all
+is fetched by the box direct from `raw.githubusercontent.com` at first boot;
+that host is dual-stack, so an IPv6-only box needs no NAT64. It reads all
 deploy config from **repo-level Actions variables** (Settings > Secrets and
 variables > Actions > Variables). None are secrets; they're just fork-specific.
 
@@ -179,13 +181,13 @@ Role permissions needed: `s3:CreateBucket`, `s3:PutPublicAccessBlock`,
 The E2E deploy-test workflow uses the same role but doesn't touch S3; it
 needs `cloudformation:CreateStack`, `cloudformation:DeleteStack`,
 `cloudformation:DescribeStacks`, `ec2:GetConsoleOutput` (to assert amazon-init
-provisioned the box — this is how the IPv6-only leg verifies success without
+provisioned the box - this is how the IPv6-only leg verifies success without
 connecting), and the EC2 create/delete permissions used by the template -
 including `ec2:CreateLaunchTemplate` / `ec2:DeleteLaunchTemplate` (Spot options)
 and `ec2:DescribeSpotInstanceRequests` / `ec2:CancelSpotInstanceRequests` (so
 teardown can cancel the persistent Spot request before deleting the stack).
 
-The GitHub environment listed in `CLAUDE_BOX_ENVIRONMENT` must exist — create it
+The GitHub environment listed in `CLAUDE_BOX_ENVIRONMENT` must exist - create it
 via `gh api --method PUT repos/<owner>/<repo>/environments/<name>` or the
 repo settings UI. No secrets attached; it's just the deployment gate.
 
@@ -201,16 +203,16 @@ curl -I "https://${CLAUDE_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
 creates real CloudFormation stacks and deletes them at the end. It runs two
 legs in parallel:
 
-- **ipv4-full** — forces `PublicIpv4=true` (+ Spot); GitHub runners are
+- **ipv4-full** - forces `PublicIpv4=true` (+ Spot); GitHub runners are
   IPv4-only, so this is the only leg that can actually reach the box. It runs
   the full connectivity smoke tests (token URL serves ttyd over HTTPS, a
   wrong-token path returns 404, the WebSocket upgrade returns 101).
-- **ipv6-outputs** — exercises the DEFAULT IPv6-only path. The runner can't
+- **ipv6-outputs** - exercises the DEFAULT IPv6-only path. The runner can't
   connect over IPv6, so it asserts the stack reaches `CREATE_COMPLETE` and its
   outputs are populated (catches blank `PrimaryIpv6Address` bugs).
 
 Both legs then assert, from the **serial console** (`ec2:GetConsoleOutput`),
-that `amazon-init` finished — i.e. the box actually provisioned from user-data.
+that `amazon-init` finished - i.e. the box actually provisioned from user-data.
 `CREATE_COMPLETE` fires before amazon-init runs, so this is the only signal
 that the IPv6-only module fetch + `nixos-rebuild` succeeded. Toggle
 `destroy: false` on the dispatch inputs to keep a stack up for debugging.
