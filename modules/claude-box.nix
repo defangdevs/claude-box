@@ -210,7 +210,11 @@ in
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
         # System services get a minimal PATH; give the agent an explicit toolset.
-        path = [ cfg.package pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ] ++ cfg.extraPackages;
+        # The user's nix-profile bin goes first so `nix profile add` tools are
+        # visible without a rebuild. It must be in the unit's PATH (not just a
+        # BASH_ENV hook): claude-code snapshots its startup PATH and re-exports
+        # it in every tool shell, clobbering anything BASH_ENV prepended.
+        path = [ "/home/${name}/.nix-profile/bin" cfg.package pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ] ++ cfg.extraPackages;
         # TMUX_TMPDIR puts the control socket under the /run RuntimeDirectory
         # below instead of /tmp. PrivateTmp (in serviceConfig) gives this unit a
         # PRIVATE /tmp, so a socket there would be invisible to the separate
