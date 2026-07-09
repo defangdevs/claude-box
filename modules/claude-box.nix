@@ -5,6 +5,13 @@ let
   supportedAgents = [ "claude" "codex" ];
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
+
+  # Reload command is granted when web is enabled so the agent can add a
+  # virtual host and reload without root — pooled with the user-supplied
+  # sudoAllowlist so NoNewPrivileges + sudo rules see the same list.
+  caddyReloadCmd = "/run/current-system/sw/bin/systemctl reload caddy.service";
+  effectiveSudoAllowlist =
+    cfg.sudoAllowlist ++ lib.optional cfg.web.enable caddyReloadCmd;
   agentPackage = agent:
     if cfg.package != null then cfg.package
     else if agent == "claude" then pkgs.claude-code
@@ -216,9 +223,51 @@ in
       default = true;
       description = "Create tokenDir (root-owned) via tmpfiles so token files can be dropped in.";
     };
+
+    web = {
+      enable = lib.mkEnableOption ''
+        browser terminal (ttyd) fronted by Caddy with basic-auth-to-cookie web
+        auth, plus a hand-editable Caddyfile at /var/lib/caddy/Caddyfile so the
+        agent user can add virtual hosts without a nixos-rebuild
+      '';
+
+      domain = lib.mkOption {
+        type = lib.types.str;
+        example = "1-2-3-4.sslip.io";
+        description = ''
+          Public hostname for the browser terminal. Used to seed
+          /var/lib/caddy/Caddyfile the first time only — subsequent edits are
+          preserved. Set this to whatever DNS name resolves to the host
+          (sslip.io on AWS, a custom domain on bare metal, etc).
+        '';
+      };
+
+      user = lib.mkOption {
+        type = lib.types.str;
+        default = "agent";
+        description = ''
+          Which services.claude-box.users entry the browser terminal attaches
+          to. This user is added to the caddy group (so it can edit
+          /var/lib/caddy/Caddyfile) and granted passwordless sudo for
+          `systemctl reload caddy.service`.
+        '';
+      };
+
+      passwordHashFile = lib.mkOption {
+        type = lib.types.path;
+        example = "/var/lib/claude-box-web/password-hash";
+        description = ''
+          Path to a file containing a bcrypt hash produced by
+          `caddy hash-password`. Read at boot by claude-web-auth-secrets;
+          Caddy sees the hash via the WEB_PASSWORD_HASH env var. Root-owned,
+          0600. Kept out of the Nix store so the plaintext never lands in a
+          world-readable /nix/store path.
+        '';
+      };
+    };
   };
 
-  config = lib.mkIf cfg.enable {
+  config = lib.mkIf cfg.enable (lib.mkMerge [{
     assertions = [{
       assertion = cfg.users != { };
       message = "services.claude-box.enable is true but no users are defined in services.claude-box.users.";
@@ -317,9 +366,10 @@ in
           LockPersonality = true;
           # NoNewPrivileges would break the sudoAllowlist escape hatch (sudo
           # is setuid root; NNP blocks the euid transition). Enable it only
-          # when the allowlist is empty — with a non-empty allowlist we've
+          # when the effective allowlist is empty — with a non-empty allowlist
+          # (from cfg.sudoAllowlist or the web-implied caddy reload) we've
           # traded some containment for scoped elevation as a host choice.
-          NoNewPrivileges = cfg.sudoAllowlist == [ ];
+          NoNewPrivileges = effectiveSudoAllowlist == [ ];
         };
       }
     ) cfg.users;
@@ -335,12 +385,144 @@ in
       "Z ${cfg.tokenDir}/*.env 0600 root root - -"
     ];
 
-    security.sudo.extraRules = lib.mkIf (cfg.sudoAllowlist != [ ]) [{
+    security.sudo.extraRules = lib.mkIf (effectiveSudoAllowlist != [ ]) [{
       users = lib.attrNames cfg.users;
       # NOPASSWD only — no SETENV. SETENV lets the caller alter env vars
       # visible to the sudo'd command, which broadens the surface for no
       # gain given the allowlist is meant to be tight and command-scoped.
-      commands = map (command: { inherit command; options = [ "NOPASSWD" ]; }) cfg.sudoAllowlist;
+      commands = map (command: { inherit command; options = [ "NOPASSWD" ]; }) effectiveSudoAllowlist;
     }];
-  };
+  } (lib.mkIf (cfg.enable && cfg.web.enable) (
+    let
+      webUser = cfg.web.user;
+    in
+    {
+      assertions = [{
+        assertion = cfg.users ? ${webUser};
+        message =
+          "services.claude-box.web.user = \"${webUser}\" but that user "
+          + "isn't defined in services.claude-box.users.";
+      }];
+
+      # The agent edits /var/lib/caddy/Caddyfile directly (see the seed
+      # activation script below) and reloads Caddy via the sudo rule added to
+      # effectiveSudoAllowlist. `caddy` group has RW on the file by default.
+      users.users.${webUser}.extraGroups = [ "caddy" ];
+
+      networking.firewall.allowedTCPPorts = [ 443 ];
+
+      systemd.tmpfiles.rules = [
+        "d /var/lib/claude-box-web 0700 root root - -"
+        "d /run/claude-box-web 0700 root root - -"
+      ];
+
+      # claude-web-auth-secrets reads the (already-hashed) password from
+      # passwordHashFile, mints a persistent cookie secret if absent, and
+      # writes both into /run/claude-box-web/env for Caddy to consume as
+      # environment variables. Runs BEFORE caddy every boot.
+      systemd.services.claude-web-auth-secrets = {
+        description = "Prepare browser terminal auth env for Caddy";
+        before = [ "caddy.service" ];
+        requiredBy = [ "caddy.service" ];
+        path = [ pkgs.coreutils pkgs.openssl ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        script = ''
+          set -euo pipefail
+          umask 077
+          if [ ! -s /var/lib/claude-box-web/cookie-secret ]; then
+            openssl rand -hex 32 > /var/lib/claude-box-web/cookie-secret
+          fi
+          cookie_secret="$(cat /var/lib/claude-box-web/cookie-secret)"
+          password_hash="$(cat ${lib.escapeShellArg (toString cfg.web.passwordHashFile)})"
+          tmp="$(mktemp /run/claude-box-web/env.XXXXXX)"
+          {
+            printf 'WEB_PASSWORD_HASH=%s\n' "$password_hash"
+            printf 'WEB_COOKIE_SECRET=%s\n' "$cookie_secret"
+          } > "$tmp"
+          chmod 0600 "$tmp"
+          mv "$tmp" /run/claude-box-web/env
+        '';
+      };
+
+      services.caddy = {
+        enable = true;
+        # Hand-editable Caddyfile: the module seeds it on first boot but
+        # never overwrites it. Adding a virtual host is `edit + sudo reload`;
+        # no nixos-rebuild needed. The tradeoff vs services.caddy.virtualHosts
+        # is that Nix no longer owns the config — declarative changes to the
+        # file need a nixos-rebuild-plus-hand-edit cycle to land.
+        configFile = "/var/lib/caddy/Caddyfile";
+      };
+
+      systemd.services.caddy.serviceConfig.EnvironmentFile = "/run/claude-box-web/env";
+
+      # First-boot only: drop in a Caddyfile with the ttyd virtual host and a
+      # comment explaining how to add more. If the file already exists (e.g.
+      # a local box with its own hand-crafted blocks), leave it alone.
+      system.activationScripts.claude-box-caddyfile-seed.text = ''
+        if [ ! -s /var/lib/caddy/Caddyfile ]; then
+          install -m 0664 -o caddy -g caddy /dev/null /var/lib/caddy/Caddyfile
+          cat > /var/lib/caddy/Caddyfile <<'CADDYFILE_EOF'
+        # Edit me. Reload with: sudo systemctl reload caddy.service
+        # Add another host by copying the block below and updating the hostname.
+        # New hosts get a Let's Encrypt cert on first request (TLS-ALPN-01).
+
+        (acme_alpn_only) {
+          tls {
+            issuer acme { disable_http_challenge }
+          }
+        }
+
+        ${cfg.web.domain} {
+          import acme_alpn_only
+          header {
+            Cache-Control "no-store"
+            X-Content-Type-Options "nosniff"
+          }
+          @hasAuthCookie header_regexp Cookie "(^|; )__Host-agent_box_auth={$WEB_COOKIE_SECRET}(;|$)"
+          handle @hasAuthCookie {
+            reverse_proxy 127.0.0.1:7681
+          }
+          handle {
+            route {
+              basic_auth {
+                ${webUser} {$WEB_PASSWORD_HASH}
+              }
+              header >Set-Cookie "__Host-agent_box_auth={$WEB_COOKIE_SECRET}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              reverse_proxy 127.0.0.1:7681
+            }
+          }
+        }
+        CADDYFILE_EOF
+        fi
+      '';
+
+      # ttyd — attaches to the web user's tmux session over an internal port.
+      # TMUX_TMPDIR must match the agent unit's RuntimeDirectory (the agent
+      # runs with PrivateTmp, so the socket lives in /run, not /tmp).
+      systemd.services.claude-web-terminal = {
+        description = "Browser terminal (ttyd) attached to ${webUser}'s tmux";
+        after = [ "claude-box-${webUser}.service" "network-online.target" ];
+        wants = [ "network-online.target" ];
+        wantedBy = [ "multi-user.target" ];
+        environment.TMUX_TMPDIR = "/run/${runtimeDirectory webUser}";
+        serviceConfig = {
+          User = webUser;
+          Restart = "always";
+          RestartSec = "5s";
+          ExecStart = lib.concatStringsSep " " [
+            "${pkgs.ttyd}/bin/ttyd"
+            "--writable"
+            "-p" "7681"
+            "-i" "127.0.0.1"
+            "-t" "titleFixed=${cfg.agent}-box"
+            "${pkgs.tmux}/bin/tmux" "-L" tmuxSocketName "attach" "-t" "main"
+          ];
+        };
+      };
+    }
+  ))]);
 }

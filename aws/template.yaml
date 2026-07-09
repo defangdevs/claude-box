@@ -385,94 +385,30 @@ Resources:
                   users.agent = {
                     environment = { TERM = "xterm-256color"; };${SessionNameLine}
                   };
+                  web = {
+                    enable = true;
+                    domain = hostname;
+                    user = "agent";
+                    passwordHashFile = "/var/lib/claude-box-web/password-hash";
+                  };
                 };
 
-                networking.firewall.allowedTCPPorts = [ 443 ];
-
-                systemd.tmpfiles.rules = [
-                  "d /var/lib/claude-box-web 0700 root root - -"
-                  "d /run/claude-box-web 0700 root root - -"
-                ];
-
-                systemd.services.claude-web-auth-secrets = {
-                  description = "Prepare browser terminal auth secrets";
-                  before = [ "caddy.service" ];
-                  requiredBy = [ "caddy.service" ];
-                  serviceConfig = {
-                    Type = "oneshot";
-                  };
-                  path = [ pkgs.caddy pkgs.coreutils pkgs.openssl ];
-                  script = ''
+                # Materialize passwordHashFile from the plaintext CFN parameter
+                # BEFORE any service reads it. Activation scripts run at
+                # nixos-rebuild switch time (first boot from user-data), before
+                # systemd units start — perfect ordering for the module's
+                # claude-web-auth-secrets service, which reads the hash. The
+                # file lives outside /nix/store so the plaintext-derived hash
+                # doesn't end up in a world-readable store path.
+                system.activationScripts.claude-web-password-hash.text = ''
+                  install -d -m 0700 /var/lib/claude-box-web
+                  if [ ! -s /var/lib/claude-box-web/password-hash ]; then
                     umask 077
-                    install -d -m 0700 /var/lib/claude-box-web /run/claude-box-web
-                    if [ ! -s /var/lib/claude-box-web/cookie-secret ]; then
-                      openssl rand -hex 32 > /var/lib/claude-box-web/cookie-secret
-                    fi
-
-                    password_hash="$(caddy hash-password --plaintext ${!lib.escapeShellArg webPassword})"
-                    cookie_secret="$(cat /var/lib/claude-box-web/cookie-secret)"
-                    tmp="$(mktemp /run/claude-box-web/env.XXXXXX)"
-                    {
-                      printf 'WEB_PASSWORD_HASH=%s\n' "$password_hash"
-                      printf 'WEB_COOKIE_SECRET=%s\n' "$cookie_secret"
-                    } > "$tmp"
-                    chmod 0600 "$tmp"
-                    mv "$tmp" /run/claude-box-web/env
-                  '';
-                };
-
-                systemd.services.caddy = {
-                  after = [ "claude-web-auth-secrets.service" ];
-                  requires = [ "claude-web-auth-secrets.service" ];
-                  serviceConfig.EnvironmentFile = "/run/claude-box-web/env";
-                };
-
-                services.caddy = {
-                  enable = true;
-                  virtualHosts."${!hostname}" = {
-                    extraConfig = ''
-                      tls {
-                        issuer acme {
-                          disable_http_challenge
-                        }
-                      }
-                      header {
-                        Cache-Control "no-store"
-                        X-Content-Type-Options "nosniff"
-                      }
-                      @hasAuthCookie header_regexp Cookie "(^|; )__Host-agent_box_auth={$WEB_COOKIE_SECRET}(;|$)"
-                      handle @hasAuthCookie {
-                        reverse_proxy 127.0.0.1:7681
-                      }
-                      handle {
-                        route {
-                          basic_auth {
-                            agent {$WEB_PASSWORD_HASH}
-                          }
-                          header >Set-Cookie "__Host-agent_box_auth={$WEB_COOKIE_SECRET}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-                          reverse_proxy 127.0.0.1:7681
-                        }
-                      }
-                    '';
-                  };
-                };
-
-                systemd.services.claude-web-terminal = {
-                  description = "Browser terminal (ttyd) attached to agent's tmux";
-                  after = [ "claude-box-agent.service" "network-online.target" ];
-                  wants = [ "network-online.target" ];
-                  wantedBy = [ "multi-user.target" ];
-                  # Must match the agent service's TMUX_TMPDIR so `tmux attach`
-                  # finds the control socket. The agent runs with PrivateTmp, so
-                  # the socket lives under /run (not the private /tmp).
-                  environment.TMUX_TMPDIR = "/run/agent-box-agent";
-                  serviceConfig = {
-                    User = "agent";
-                    Restart = "always";
-                    RestartSec = "5s";
-                    ExecStart = "${!pkgs.ttyd}/bin/ttyd --writable -p 7681 -i 127.0.0.1 -t titleFixed=${Agent}-box ${!pkgs.tmux}/bin/tmux -L agent-box attach -t main";
-                  };
-                };
+                    ${!pkgs.caddy}/bin/caddy hash-password --plaintext ${!lib.escapeShellArg webPassword} \
+                      > /var/lib/claude-box-web/password-hash
+                    chmod 0600 /var/lib/claude-box-web/password-hash
+                  fi
+                '';
 
                 # Don't re-apply user-data on every reboot - protects local edits.
                 systemd.services.amazon-init.enable = lib.mkForce false;
