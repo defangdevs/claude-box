@@ -47,6 +47,32 @@ jobs:
           pip install --quiet cfn-lint
           cfn-lint aws/template.yaml
 
+      - name: Inject pinned Rev + Sha256 defaults for the 1-click copy
+        # The source template deliberately ships without Default: values for
+        # ClaudeBoxRev / ClaudeBoxSha256 (see the param's Description) — the
+        # 1-click Launch buttons need them pre-filled, so we inject the current
+        # master commit + its module sha256 as the S3 template's defaults.
+        run: |
+          rev="${{ github.sha }}"
+          sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/claude-box.nix" \
+            | openssl dgst -sha256 -binary | base64)"
+          echo "Rev: $rev"
+          echo "Sha: $sha"
+          awk -v rev="$rev" -v sha="$sha" '
+            /^  ClaudeBoxRev:$/     { rf=1; print; next }
+            rf && /^    Type:/      { print; print "    Default: " rev; rf=0; next }
+            /^  ClaudeBoxSha256:$/  { sf=1; print; next }
+            sf && /^    Type:/      { print; print "    Default: " sha; sf=0; next }
+            { print }
+          ' aws/template.yaml > aws/template.filled.yaml
+          if ! grep -qE "^    Default: $rev$" aws/template.filled.yaml \
+             || ! grep -qE "^    Default: $sha$" aws/template.filled.yaml; then
+            echo "::error::Default injection failed — expected lines not present in filled template."
+            diff aws/template.yaml aws/template.filled.yaml || true
+            exit 1
+          fi
+          cfn-lint aws/template.filled.yaml
+
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -54,7 +80,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Validate template with CloudFormation
-        run: aws cloudformation validate-template --template-body "file://aws/template.yaml"
+        run: aws cloudformation validate-template --template-body "file://aws/template.filled.yaml"
 
       - name: Upsert bucket + public-read policy on template.yaml
         run: |
@@ -96,7 +122,7 @@ jobs:
 
       - name: Upload to S3
         run: |
-          aws s3 cp aws/template.yaml "s3://${BUCKET}/${OBJECT_KEY}" \
+          aws s3 cp aws/template.filled.yaml "s3://${BUCKET}/${OBJECT_KEY}" \
             --content-type "application/x-yaml" \
             --cache-control "no-cache, max-age=0"
           echo "::notice::Published to https://${BUCKET}.s3.amazonaws.com/${OBJECT_KEY}"

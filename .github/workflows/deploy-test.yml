@@ -89,6 +89,20 @@ jobs:
           # 48 hex chars — matches the template's AllowedPattern [A-Za-z0-9._~-]{16,64}.
           echo "value=$(openssl rand -hex 24)" >> "$GITHUB_OUTPUT"
 
+      - name: Compute module pin (ClaudeBoxRev + ClaudeBoxSha256)
+        id: pin
+        # The source template intentionally has no Default: for these — see
+        # publish-template.yml for the same computation on the S3 path. Here
+        # we pin to the commit that triggered this run so deploy-test always
+        # exercises the module content that just landed.
+        run: |
+          rev="${{ github.sha }}"
+          sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/claude-box.nix" \
+            | openssl dgst -sha256 -binary | base64)"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "::notice::Pinned ClaudeBoxRev=$rev ClaudeBoxSha256=$sha"
+
       - name: Create stack
         id: create
         run: |
@@ -101,6 +115,8 @@ jobs:
               "ParameterKey=UseSpot,ParameterValue=${{ matrix.use_spot }}" \
               "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
               "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small' }}" \
+              "ParameterKey=ClaudeBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
+              "ParameterKey=ClaudeBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
             --on-failure DO_NOTHING \
             --tags "Key=Purpose,Value=claude-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
           echo "::notice::Waiting for stack ${STACK_NAME} to reach CREATE_COMPLETE (up to 30 min)..."
