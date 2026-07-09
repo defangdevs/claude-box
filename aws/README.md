@@ -185,7 +185,7 @@ commit if anything changed.
 ## Publishing to S3
 
 CloudFormation's `templateURL` accepts only S3 URLs, so the template lives
-at `s3://defang-claude-box/template.yaml`. `.github/workflows/publish-template.yml`
+at `s3://defang-agent-box/template.yaml`. `.github/workflows/publish-template.yml`
 handles the upload on every push to `master` via GitHub OIDC (no static AWS
 keys).
 
