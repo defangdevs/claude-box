@@ -11,14 +11,16 @@ on:
   workflow_dispatch:
     inputs:
       region:
+        # The test account's SCP only allows us-west-2 — other choices are kept
+        # for forks running against their own account.
         description: Region to deploy into (must be in the template's RegionMap)
         type: choice
         options:
-          - us-east-1
           - us-west-2
+          - us-east-1
           - eu-central-1
           - eu-west-1
-        default: us-east-1
+        default: us-west-2
       instance_type:
         description: EC2 instance type
         type: string
@@ -33,7 +35,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-test-${{ inputs.region || 'us-east-1' }}
+  group: deploy-test-${{ inputs.region || 'us-west-2' }}
   cancel-in-progress: false
 
 jobs:
@@ -64,7 +66,7 @@ jobs:
     environment: ${{ vars.CLAUDE_BOX_ENVIRONMENT || 'defang-claude-box' }}
     timeout-minutes: 30
     env:
-      AWS_REGION: ${{ inputs.region || 'us-east-1' }}
+      AWS_REGION: ${{ inputs.region || 'us-west-2' }}
       ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
       STACK_NAME: claude-box-e2e-${{ matrix.leg }}-${{ github.run_id }}
     steps:
