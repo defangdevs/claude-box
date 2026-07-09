@@ -1,4 +1,4 @@
-# Example: run >1 Claude Code agent on an existing bare-metal NixOS host.
+# Example: run >1 coding agent on an existing bare-metal NixOS host.
 #
 # This is an importable fragment, NOT a standalone system — your host still
 # provides its own boot loader, filesystems, and hardware config. Import it
@@ -9,18 +9,23 @@
 #     ./claude-box/hosts/bare-metal.nix    # or just copy the block below
 #   ];
 #
-# First boot per user: `tmux -L claude-box attach -t main` as that user (or
-# `sudo -u alice ...`) and complete the one-time Claude login. Credentials live
-# in ~/.claude and are per-user runtime state — never baked into this config.
+# First boot per user: `tmux -L agent-box attach -t main` as that user (or
+# `sudo -u alice ...`) and complete the one-time agent login. Credentials live
+# in the agent's home directory and are per-user runtime state — never baked
+# into this config.
 { pkgs, ... }:
 {
   services.claude-box = {
     enable = true;
+    agent = "claude";
 
     users = {
       alice = { };
       bob = {
         remoteControlName = "bob-box";
+      };
+      coder = {
+        agent = "codex";
       };
       # A locked-down worker: no autonomy flag, keeps approval prompts on.
       ci = {

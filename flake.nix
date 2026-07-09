@@ -1,5 +1,5 @@
 {
-  description = "claude-box: reproducible multi-user Claude Code agent hosts (bare-metal NixOS + VM images)";
+  description = "claude-box: reproducible multi-user coding agent hosts (bare-metal NixOS + VM images)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -56,7 +56,7 @@
             ];
           };
           services = multiUser.config.systemd.services;
-          wanted = [ "claude-box-alice" "claude-box-bob" "claude-box-ci" ];
+          wanted = [ "claude-box-alice" "claude-box-bob" "claude-box-coder" "claude-box-ci" ];
           missing = builtins.filter (n: ! builtins.hasAttr n services) wanted;
         in
         {
@@ -67,7 +67,7 @@
             '';
 
           # Full closure build of the VM config — the "is it actually usable"
-          # proof (compiles the system Claude Code agents would run in).
+          # proof (compiles the system agents would run in).
           vm-closure = self.nixosConfigurations.vm.config.system.build.vm;
         };
     };

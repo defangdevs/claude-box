@@ -4,8 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noai,noimageai">
-<title>claude-box &mdash; sandboxed Claude Code agents, one click away</title>
-<meta name="description" content="A private, sandboxed Claude Code agent for you and your team. Launch it in your own AWS account with one click.">
+<title>claude-box &mdash; sandboxed coding agents, one click away</title>
+<meta name="description" content="A private, sandboxed Claude Code or Codex agent for you and your team. Launch it in your own AWS account with one click.">
 <style>
   :root {
     --bg: #0d1117;
@@ -111,7 +111,7 @@
 <header class="hero">
   <div class="wrap">
     <div class="logo"><span class="box">&#9635;</span> claude-box</div>
-    <p class="tagline">A private, sandboxed <a href="https://claude.com/claude-code">Claude Code</a> agent for you and your team &mdash; launch it in your own AWS account with one click.</p>
+    <p class="tagline">A private, sandboxed Claude Code or Codex agent for you and your team &mdash; launch it in your own AWS account with one click.</p>
     <div class="cta">
       <a class="btn primary" href="#launch">Launch on AWS</a>
       <a class="btn ghost" href="https://github.com/defangdevs/claude-box">View on GitHub</a>
@@ -122,7 +122,7 @@
 <section>
   <div class="wrap">
     <h2>What it is</h2>
-    <p class="sub">A ready-to-use Claude Code agent you open right in your browser. Set it up once with a single click; it keeps running on its own.</p>
+    <p class="sub">A ready-to-use coding agent you open right in your browser. Set it up once with a single click; it keeps running on its own.</p>
     <div class="features">
       <div class="feature">
         <h3>Locked down by default</h3>
@@ -131,6 +131,10 @@
       <div class="feature">
         <h3>Works in your browser</h3>
         <p>A full terminal, right in your browser over a secure connection. Open your link and you're in &mdash; nothing to install.</p>
+      </div>
+      <div class="feature">
+        <h3>Choose your agent</h3>
+        <p>Pick Claude Code or Codex when you launch. The same NixOS module, terminal, and sandboxing model support both.</p>
       </div>
       <div class="feature">
         <h3>Keeps your keys safe</h3>
@@ -170,7 +174,7 @@
       <strong>We didn't detect IPv6 on your network</strong> &mdash; the Launch buttons above have been adjusted to allocate a public IPv4 (~$3.60/month) so the box will be reachable from here. If you know you do have IPv6 (or don't mind trying without), uncheck <code>PublicIpv4</code> on the CloudFormation form before launching.
     </div>
     <div class="note">
-      <strong>You don't need to make up a password.</strong> Every Launch button already has a random one filled in for you. Keep it, type your own, or clear it to have one generated automatically. Pick a size and launch. The box takes about 2&ndash;3 minutes to start. When it's ready, your private link (with the password already built in) appears under <strong>Outputs</strong> in the AWS console &mdash; open it, finish the one-time Claude sign-in, and you're in.
+      <strong>You don't need to make up a password.</strong> Every Launch button already has a random one filled in for you. Keep it, type your own, or clear it to have one generated automatically. Choose Claude Code or Codex, pick a size, and launch. The box takes about 2&ndash;3 minutes to start. When it's ready, your private link (with the password already built in) appears under <strong>Outputs</strong> in the AWS console &mdash; open it, finish the selected agent's one-time sign-in, and you're in.
     </div>
     <div class="note">
       <strong>Modern internet address by default.</strong> The box uses a free, IPv6 address that most home connections support, but some office and public Wi-Fi networks can't reach it. We check your browser on this page &mdash; if we can't reach the IPv6 internet from here, the Launch button above will automatically switch to IPv4 (~$3.60/month) so the box will actually be reachable.
@@ -190,7 +194,7 @@
   <div class="wrap">
     <a href="https://github.com/defangdevs/claude-box">github.com/defangdevs/claude-box</a>
     &nbsp;&middot;&nbsp; <a href="https://github.com/defangdevs/claude-box/wiki">Wiki</a>
-    &nbsp;&middot;&nbsp; MIT-licensed &nbsp;&middot;&nbsp; built with <a href="https://claude.com/claude-code">Claude Code</a>
+    &nbsp;&middot;&nbsp; MIT-licensed &nbsp;&middot;&nbsp; supports Claude Code and Codex
   </div>
 </footer>
 
