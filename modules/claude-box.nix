@@ -482,12 +482,10 @@ in
                        border: 1px solid #30363d; border-radius: 10px; background: #161b22;
                        color: #e8a087; font-size: 20px; text-decoration: none; }
               main a:hover { border-color: #e8a087; }
-              main p { color: #9198a1; font-size: 14px; }
             </style>
             <main>
               <h1>Terminals</h1>
-              ${lib.concatMapStringsSep "\n      " (n: ''<a href="/${n}/">${n}</a>'') terminalUsers}
-              <p>Sign in with the terminal's name as the login.</p>
+              ${lib.concatMapStringsSep "\n      " (n: ''<a href="https://${n}@${cfg.web.domain}/${n}/">${n}</a>'') terminalUsers}
             </main>
             PICKER_HTML 200
         }

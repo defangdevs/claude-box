@@ -274,10 +274,10 @@ jobs:
           terminal_url="${url/https:\/\/agent@/https:\/\/}"
           root_url="${terminal_url%agent/}"
           body=$(curl -sS --max-time 10 "$root_url" || true)
-          if echo "$body" | grep -q 'href="/agent/"'; then
-            echo "::notice::Root picker lists the agent terminal."
+          if echo "$body" | grep -q 'href="https://agent@[^"]*/agent/"'; then
+            echo "::notice::Root picker links the agent terminal with the username prefilled."
           else
-            echo "::error::Picker at $root_url doesn't link to /agent/:"
+            echo "::error::Picker at $root_url doesn't link to https://agent@.../agent/:"
             echo "$body" | head -20
             exit 1
           fi
