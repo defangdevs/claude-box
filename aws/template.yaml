@@ -132,20 +132,26 @@ Parameters:
 
   ClaudeBoxRev:
     Type: String
-    Default: master
     Description: >-
-      Git rev or ref of defangdevs/claude-box. The module (a single .nix file)
+      Git commit sha of defangdevs/claude-box. The module (a single .nix file)
       is fetched from raw.githubusercontent.com at this ref - that host is
       dual-stack (IPv6-reachable), so an IPv6-only box needs no NAT64 path.
-      github.com itself is IPv4-only and can't be used directly.
+      github.com itself is IPv4-only and can't be used directly. No Default:
+      here on purpose - Rev + Sha256 are a pinned pair, and `builtins.fetchurl`
+      in user-data hard-fails on any drift, so we can't ship a moving default
+      like "master". The 1-click Launch buttons hit the S3-published copy of
+      this template, into which publish-template.yml injects a Default for
+      both fields at every master push.
 
   ClaudeBoxSha256:
     Type: String
-    Default: sha256-7XKISFFxB3FfMXouRfv0hcBNmtL9KNBX+YB/W9HIa/g=
     Description: >-
-      Nix sha256 of modules/claude-box.nix at ClaudeBoxRev. Regenerate with
-      `nix store prefetch-file https://raw.githubusercontent.com/defangdevs/claude-box/<REV>/modules/claude-box.nix`
-      (no unpack; we fetch the file, not a tarball).
+      Nix sha256 of modules/claude-box.nix at ClaudeBoxRev (SRI form:
+      sha256-<base64>). Must match ClaudeBoxRev's content exactly.
+      Regenerate with `nix store prefetch-file
+      https://raw.githubusercontent.com/defangdevs/claude-box/<REV>/modules/claude-box.nix`
+      (no unpack; we fetch the file, not a tarball). See ClaudeBoxRev for
+      why there is no Default here.
 
 Conditions:
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
