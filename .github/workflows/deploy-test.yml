@@ -5,6 +5,7 @@ on:
     branches: [ master ]
     paths:
       - 'aws/template.yaml'
+      - 'modules/**'
       - 'scripts/ws_smoke.py'
       - '.github/workflows/deploy-test.yml'
   workflow_dispatch:
@@ -177,12 +178,25 @@ jobs:
           ok_re="(Finished|Started).*$unit"
           # nixos-rebuild during amazon-init can take a few minutes; console
           # output on Nitro instances is near-real-time. Poll up to ~12 min.
+          # get-console-output --latest returns the tail 64 KB. On a chatty
+          # boot the actual nix eval/build error can scroll off before we see
+          # the "Failed to start" line — so keep the FIRST snapshot around and
+          # dump both on failure to give diagnosis the biggest possible window.
+          first_out=""
           for i in $(seq 1 48); do
             out=$(aws ec2 get-console-output --instance-id "$iid" --latest \
               --query Output --output text 2>/dev/null || true)
+            if [ -z "$first_out" ] && [ -n "$out" ]; then
+              first_out="$out"
+            fi
             if printf '%s' "$out" | grep -qE "$fail_re"; then
               echo "::error::amazon-init FAILED - box did not provision (module fetch / nixos-rebuild)."
-              printf '%s\n' "$out" | grep -iE 'amazon-init|EC2 userdata|Reconfigure|fetchTarball|error|refused|unreachable|timed out' | tail -30
+              echo "::group::Serial console — LATEST snapshot (contains the fail line + surrounding context)"
+              printf '%s\n' "$out"
+              echo "::endgroup::"
+              echo "::group::Serial console — FIRST snapshot (earliest boot output we captured; likely holds the root-cause nix error)"
+              printf '%s\n' "$first_out"
+              echo "::endgroup::"
               exit 1
             fi
             if printf '%s' "$out" | grep -qE "$ok_re"; then
@@ -192,8 +206,13 @@ jobs:
             echo "[$i/48] provisioning not yet confirmed from console; waiting..."
             sleep 15
           done
-          echo "::error::Timed out waiting for amazon-init to finish (console tail below)."
-          printf '%s\n' "$out" | tail -40
+          echo "::error::Timed out waiting for amazon-init to finish."
+          echo "::group::Serial console — LATEST snapshot"
+          printf '%s\n' "$out"
+          echo "::endgroup::"
+          echo "::group::Serial console — FIRST snapshot"
+          printf '%s\n' "$first_out"
+          echo "::endgroup::"
           exit 1
 
       - name: Smoke test — wait for authenticated terminal URL to serve ttyd HTML
