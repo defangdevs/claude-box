@@ -65,8 +65,8 @@ jobs:
             sf && /^    Type:/      { print; print "    Default: " sha; sf=0; next }
             { print }
           ' aws/template.yaml > aws/template.filled.yaml
-          if ! grep -qE "^    Default: $rev$" aws/template.filled.yaml \
-             || ! grep -qE "^    Default: $sha$" aws/template.filled.yaml; then
+          if ! grep -qxF "    Default: $rev" aws/template.filled.yaml \
+             || ! grep -qxF "    Default: $sha" aws/template.filled.yaml; then
             echo "::error::Default injection failed — expected lines not present in filled template."
             diff aws/template.yaml aws/template.filled.yaml || true
             exit 1
