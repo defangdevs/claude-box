@@ -30,10 +30,10 @@ Let's Encrypt cert against `<eip>.sslip.io`.
 
 | Region | Launch |
 | --- | --- |
-| us-east-1 (N. Virginia) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
-| us-west-2 (Oregon) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
-| eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
-| eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-claude-box.s3.amazonaws.com%2Ftemplate.yaml) |
+| us-east-1 (N. Virginia) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
+| us-west-2 (Oregon) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
+| eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
+| eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=claude-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
 
 Choose `Agent` (`claude` or `codex`), set a `WebPassword` (16+ chars from
 `[A-Za-z0-9._~-]`), pick an instance size, launch. The template creates its own
