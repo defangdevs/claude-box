@@ -267,6 +267,21 @@ jobs:
             exit 1
           fi
 
+      - name: Smoke test — unauthenticated root serves the terminal picker
+        if: matrix.public_ipv4 == 'true'
+        run: |
+          url='${{ steps.outputs.outputs.web_url }}'
+          terminal_url="${url/https:\/\/agent@/https:\/\/}"
+          root_url="${terminal_url%agent/}"
+          body=$(curl -sS --max-time 10 "$root_url" || true)
+          if echo "$body" | grep -q 'href="/agent/"'; then
+            echo "::notice::Root picker lists the agent terminal."
+          else
+            echo "::error::Picker at $root_url doesn't link to /agent/:"
+            echo "$body" | head -20
+            exit 1
+          fi
+
       - name: Smoke test — verify ttyd HTML body
         if: matrix.public_ipv4 == 'true'
         env:

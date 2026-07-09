@@ -15,17 +15,19 @@ choose Claude Code or Codex.
 - Launches one EC2 instance from the latest NixOS 25.11 AMI for the region.
 - Uses EC2 user-data as a NixOS configuration: imports the pinned
   `claude-box` module, sets `services.claude-box.agent` from the `Agent`
-  parameter, adds Caddy (TLS-ALPN-01 only), and adds a `ttyd` systemd service
-  that binds to `127.0.0.1:7681` and attaches to `agent`'s tmux session
-  (`TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box -t main` - the socket
-  lives under `/run` because the agent runs with `PrivateTmp`).
-- **Basic-auth-to-cookie web auth**. Caddy prompts for username `agent` and the
-  `WebPassword`, sets an `HttpOnly; Secure; SameSite=Strict` cookie, then lets
-  browser WebSocket upgrades authenticate with that cookie. ttyd still binds
-  only to localhost.
+  parameter, and enables the module's web terminal (Caddy, TLS-ALPN-01 only,
+  plus a per-user `ttyd` on `127.0.0.1:7681` that attaches to `agent`'s tmux
+  session; `TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box -t main` - the
+  socket lives under `/run` because the agent runs with `PrivateTmp`).
+- **Basic-auth-to-cookie web auth**. The terminal lives at `/agent/`; Caddy
+  prompts for username `agent` (the linux user name selects the terminal) and
+  the `WebPassword`, sets an `HttpOnly; Secure; SameSite=Strict` cookie, then
+  lets browser WebSocket upgrades authenticate with that cookie. ttyd still
+  binds only to localhost. The site root serves an unauthenticated index page
+  listing the configured terminals (just `agent` on this template).
 - The stack output URL includes the non-secret username as
-  `https://agent@<host>.sslip.io/` so browsers can go straight to the password
-  prompt without putting the password in the URL.
+  `https://agent@<host>.sslip.io/agent/` so browsers can go straight to the
+  password prompt without putting the password in the URL.
 - The hostname `<addr>.sslip.io` is derived at CFN time via `Fn::Split ':'
   + Fn::Join '-'` on the NetworkInterface's PrimaryIpv6Address (IPv6 mode)
   or the EIP address (IPv4 mode). Consecutive `::` becomes an empty split
@@ -43,12 +45,15 @@ derive its Basic Auth hash. Treat principals that can read instance user-data or
 the instance's local system configuration as inside the web terminal trust
 boundary.
 
-Caddy does not compare the plaintext password at request time. On boot,
-`claude-web-auth-secrets.service` runs `caddy hash-password`, writes only
-`WEB_PASSWORD_HASH` plus a random cookie secret to `/run/claude-box-web/env`
-(`0600`), and Caddy reads that environment file. The cookie secret is generated
-on the instance and stored separately at
-`/var/lib/claude-box-web/cookie-secret` (`0700` parent directory).
+Caddy does not compare the plaintext password at request time. On first boot an
+activation script runs `caddy hash-password` and stores only the bcrypt hash at
+`/var/lib/claude-box-web/password-hash` (the file the module's
+`users.agent.web.passwordHashFile` points at). On every boot
+`claude-web-auth-secrets.service` writes that hash (`WEB_PASSWORD_HASH_AGENT`)
+plus a random cookie secret (`WEB_COOKIE_SECRET_AGENT`) to
+`/run/claude-box-web/env` (`0600`), and Caddy reads that environment file. The
+cookie secret is generated on the instance and stored separately at
+`/var/lib/claude-box-web/cookie-secret-agent` (`0700` parent directory).
 
 ## Design decisions & gotchas
 
@@ -64,7 +69,8 @@ Confirmed via [Bugzilla 1229443](https://bugzilla.mozilla.org/show_bug.cgi?id=12
 [ttyd #1437](https://github.com/tsl0922/ttyd/issues/1437).
 
 Fix: Caddy uses Basic Auth only for the initial page load, then sets a
-host-scoped `__Host-agent_box_auth` cookie. Later ttyd WebSocket requests carry
+host-scoped `__Host-agent_box_auth_agent` cookie. Later ttyd WebSocket requests
+carry
 that cookie, not an `Authorization` header, so the terminal works without
 putting the secret in browser history, `Referer` headers, or CloudFormation
 Outputs. The password is still a shared secret: anyone with enough AWS access to
@@ -233,9 +239,10 @@ the end. It runs two legs in parallel:
 
 - **ipv4-full** - forces `PublicIpv4=true` (+ Spot); GitHub runners are
   IPv4-only, so this is the only leg that can actually reach the box. It runs
-  the full connectivity smoke tests (the root URL serves ttyd over HTTPS after
-  Basic auth, unauthenticated requests get 401, the WebSocket upgrade returns
-  101 with the auth cookie).
+  the full connectivity smoke tests (`/agent/` serves ttyd over HTTPS after
+  Basic auth, unauthenticated requests get 401, the unauthenticated site root
+  serves the terminal picker, the WebSocket upgrade returns 101 with the auth
+  cookie).
 - **ipv6-outputs** - exercises the DEFAULT IPv6-only path. The runner can't
   connect over IPv6, so it asserts the stack reaches `CREATE_COMPLETE` and its
   outputs are populated (catches blank `PrimaryIpv6Address` bugs).

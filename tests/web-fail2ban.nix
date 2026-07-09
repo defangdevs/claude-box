@@ -17,12 +17,13 @@
     services.claude-box = {
       enable = true;
       agent = "claude";
-      users.agent = { };
+      users.agent = {
+        web.passwordHashFile = "/var/lib/claude-box-web/password-hash";
+      };
       web = {
         enable = true;
         domain = "box.test";
         user = "agent";
-        passwordHashFile = "/var/lib/claude-box-web/password-hash";
       };
     };
     system.stateVersion = "25.05";
@@ -50,7 +51,7 @@
         tls internal
         route {
           basic_auth {
-            agent {$WEB_PASSWORD_HASH}
+            agent {$WEB_PASSWORD_HASH_AGENT}
           }
           respond "ok" 200
         }

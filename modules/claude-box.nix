@@ -130,6 +130,27 @@ let
         example = lib.literalExpression ''{ TERM = "xterm-256color"; }'';
         description = "Extra (non-secret) environment variables for this agent's service. Merged over the default HOME.";
       };
+      web.passwordHashFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        example = "/var/lib/claude-box-web/password-hash-${name}";
+        description = ''
+          Give this user a browser terminal (requires
+          services.claude-box.web.enable). Path to a file containing a bcrypt
+          hash produced by `caddy hash-password`; the terminal is served at
+          https://<web.domain>/${name}/ behind basic auth whose username is
+          this linux user name and whose password is the one behind this
+          hash. Root-owned, 0600, outside the Nix store so the plaintext
+          never lands in a world-readable path. Null (the default) means no
+          browser terminal for this user.
+
+          Each terminal's ttyd gets a localhost port assigned in sorted
+          user-name order starting at 7681. The seeded Caddyfile is written
+          once and then hand-maintained, so if you add or remove web users
+          later, update /var/lib/caddy/Caddyfile yourself — check the
+          assigned ports with `systemctl cat claude-web-terminal-<user>`.
+        '';
+      };
     };
   };
 
@@ -226,9 +247,12 @@ in
 
     web = {
       enable = lib.mkEnableOption ''
-        browser terminal (ttyd) fronted by Caddy with basic-auth-to-cookie web
-        auth, plus a hand-editable Caddyfile at /var/lib/caddy/Caddyfile so the
-        agent user can add virtual hosts without a nixos-rebuild
+        browser terminals (one ttyd per user with web.passwordHashFile set)
+        fronted by Caddy with basic-auth-to-cookie web auth — the basic-auth
+        username is the linux user name, so logging in picks the terminal.
+        An unauthenticated picker page at / lists them. Also seeds a
+        hand-editable Caddyfile at /var/lib/caddy/Caddyfile so the agent
+        user can add virtual hosts without a nixos-rebuild
       '';
 
       domain = lib.mkOption {
@@ -246,22 +270,11 @@ in
         type = lib.types.str;
         default = "agent";
         description = ''
-          Which services.claude-box.users entry the browser terminal attaches
-          to. This user is added to the caddy group (so it can edit
-          /var/lib/caddy/Caddyfile) and granted passwordless sudo for
-          `systemctl reload caddy.service`.
-        '';
-      };
-
-      passwordHashFile = lib.mkOption {
-        type = lib.types.path;
-        example = "/var/lib/claude-box-web/password-hash";
-        description = ''
-          Path to a file containing a bcrypt hash produced by
-          `caddy hash-password`. Read at boot by claude-web-auth-secrets;
-          Caddy sees the hash via the WEB_PASSWORD_HASH env var. Root-owned,
-          0600. Kept out of the Nix store so the plaintext never lands in a
-          world-readable /nix/store path.
+          Which services.claude-box.users entry administers Caddy: it is
+          added to the caddy group (so it can edit /var/lib/caddy/Caddyfile)
+          and granted passwordless sudo for `systemctl reload caddy.service`.
+          Which users get a browser terminal is separate — set
+          users.<name>.web.passwordHashFile per user.
         '';
       };
 
@@ -412,14 +425,158 @@ in
   } (lib.mkIf (cfg.enable && cfg.web.enable) (
     let
       webUser = cfg.web.user;
+      # Users that get a browser terminal, in sorted order (attrNames sorts) —
+      # port assignment below depends on that order being deterministic.
+      terminalUsers = lib.filter (n: cfg.users.${n}.web.passwordHashFile != null) (lib.attrNames cfg.users);
+      portOf = lib.listToAttrs (lib.imap0 (i: n: lib.nameValuePair n (7681 + i)) terminalUsers);
+      hashFileOf = n: toString cfg.users.${n}.web.passwordHashFile;
+      # Per-user env var suffix for the Caddyfile placeholders; linux user
+      # names may contain chars that are invalid in env var names.
+      envName = n: lib.toUpper (lib.stringAsChars (c: if builtins.match "[a-zA-Z0-9]" c != null then c else "_") n);
+
+      # Prefix every non-blank line — Nix indented strings strip the common
+      # leading whitespace, so composed fragments need explicit re-indenting.
+      indent = prefix: text: lib.concatMapStrings
+        (line: if line == "" then "\n" else prefix + line + "\n")
+        (lib.init (lib.splitString "\n" text));
+
+      terminalCaddyBlock = name: ''
+        # ${name}'s terminal. Cookie first — browsers refuse to attach basic
+        # auth credentials to WebSocket upgrades — then basic auth with the
+        # linux user name as the login name.
+        redir /${name} /${name}/
+        handle /${name}/* {
+          @cookie_${name} header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
+          handle @cookie_${name} {
+            reverse_proxy 127.0.0.1:${toString portOf.${name}}
+          }
+          handle {
+            route {
+              basic_auth bcrypt ${name} {
+                ${name} {$WEB_PASSWORD_HASH_${envName name}}
+              }
+              header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              reverse_proxy 127.0.0.1:${toString portOf.${name}}
+            }
+          }
+        }
+      '';
+
+      pickerBlock = ''
+        # Anything else, including /: unauthenticated picker listing this
+        # box's terminals. User names are not secrets; the passwords are.
+        handle {
+          header Content-Type "text/html; charset=utf-8"
+          respond <<PICKER_HTML
+            <!doctype html>
+            <html lang="en">
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <meta name="robots" content="noindex">
+            <title>Terminals — ${cfg.web.domain}</title>
+            <style>
+              body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+                     background: #0d1117; color: #e6edf3; font: 16px/1.6 system-ui, sans-serif; }
+              main { text-align: center; }
+              main a { display: block; margin: 10px 0; padding: 12px 36px;
+                       border: 1px solid #30363d; border-radius: 10px; background: #161b22;
+                       color: #e8a087; font-size: 20px; text-decoration: none; }
+              main a:hover { border-color: #e8a087; }
+              main p { color: #9198a1; font-size: 14px; }
+            </style>
+            <main>
+              <h1>Terminals</h1>
+              ${lib.concatMapStringsSep "\n      " (n: ''<a href="/${n}/">${n}</a>'') terminalUsers}
+              <p>Sign in with the terminal's name as the login.</p>
+            </main>
+            PICKER_HTML 200
+        }
+      '';
+
+      # Rendered seed for /var/lib/caddy/Caddyfile (first boot only, see the
+      # activation script below). Safe in the world-readable store: it holds
+      # {$ENV} placeholders, never secrets.
+      seedCaddyfile = pkgs.writeText "claude-box-caddyfile-seed" (''
+        # Edit me. Reload with: sudo systemctl reload caddy.service
+        # Add another host by copying a block and updating the hostname.
+        # New hosts get a Let's Encrypt cert on first request (TLS-ALPN-01).
+
+        (acme_alpn_only) {
+          tls {
+            issuer acme {
+              disable_http_challenge
+            }
+          }
+        }
+
+        ${cfg.web.domain} {
+          # Access log to the journal — the fail2ban jail counts 401s here.
+          log
+          import acme_alpn_only
+          header {
+            Cache-Control "no-store"
+            X-Content-Type-Options "nosniff"
+          }
+
+      ''
+      + lib.concatMapStringsSep "\n" (name: indent "  " (terminalCaddyBlock name)) terminalUsers
+      + "\n"
+      + indent "  " pickerBlock
+      + "}\n");
+
+      # Reads each terminal user's (already-hashed) password from their
+      # passwordHashFile, mints a persistent per-user cookie secret if
+      # absent, and writes everything into /run/claude-box-web/env for Caddy
+      # to consume as environment variables (WEB_PASSWORD_HASH_<USER> /
+      # WEB_COOKIE_SECRET_<USER>). Runs BEFORE caddy every boot.
+      webAuthSecretsService = {
+        description = "Prepare browser terminal auth env for Caddy";
+        before = [ "caddy.service" ];
+        requiredBy = [ "caddy.service" ];
+        path = [ pkgs.coreutils pkgs.openssl ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        script = ''
+          set -euo pipefail
+          umask 077
+          tmp="$(mktemp /run/claude-box-web/env.XXXXXX)"
+        '' + lib.concatMapStrings (name: ''
+          if [ ! -s /var/lib/claude-box-web/cookie-secret-${name} ]; then
+            openssl rand -hex 32 > /var/lib/claude-box-web/cookie-secret-${name}
+          fi
+          {
+            printf 'WEB_COOKIE_SECRET_${envName name}=%s\n' "$(cat /var/lib/claude-box-web/cookie-secret-${name})"
+            printf 'WEB_PASSWORD_HASH_${envName name}=%s\n' "$(cat ${lib.escapeShellArg (hashFileOf name)})"
+          } >> "$tmp"
+        '') terminalUsers + ''
+          chmod 0600 "$tmp"
+          mv "$tmp" /run/claude-box-web/env
+        '';
+      };
     in
     {
-      assertions = [{
-        assertion = cfg.users ? ${webUser};
-        message =
-          "services.claude-box.web.user = \"${webUser}\" but that user "
-          + "isn't defined in services.claude-box.users.";
-      }];
+      assertions = [
+        {
+          assertion = cfg.users ? ${webUser};
+          message =
+            "services.claude-box.web.user = \"${webUser}\" but that user "
+            + "isn't defined in services.claude-box.users.";
+        }
+        {
+          assertion = terminalUsers != [ ];
+          message =
+            "services.claude-box.web.enable is true but no user has "
+            + "web.passwordHashFile set, so no terminal would be served.";
+        }
+        {
+          assertion = lib.length (lib.unique (map envName terminalUsers)) == lib.length terminalUsers;
+          message =
+            "services.claude-box: web-terminal user names must stay distinct "
+            + "after sanitizing to env-var form ([A-Z0-9_]).";
+        }
+      ];
 
       # The agent edits /var/lib/caddy/Caddyfile directly (see the seed
       # activation script below) and reloads Caddy via the sudo rule added to
@@ -433,37 +590,6 @@ in
         "d /run/claude-box-web 0700 root root - -"
       ];
 
-      # claude-web-auth-secrets reads the (already-hashed) password from
-      # passwordHashFile, mints a persistent cookie secret if absent, and
-      # writes both into /run/claude-box-web/env for Caddy to consume as
-      # environment variables. Runs BEFORE caddy every boot.
-      systemd.services.claude-web-auth-secrets = {
-        description = "Prepare browser terminal auth env for Caddy";
-        before = [ "caddy.service" ];
-        requiredBy = [ "caddy.service" ];
-        path = [ pkgs.coreutils pkgs.openssl ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-        };
-        script = ''
-          set -euo pipefail
-          umask 077
-          if [ ! -s /var/lib/claude-box-web/cookie-secret ]; then
-            openssl rand -hex 32 > /var/lib/claude-box-web/cookie-secret
-          fi
-          cookie_secret="$(cat /var/lib/claude-box-web/cookie-secret)"
-          password_hash="$(cat ${lib.escapeShellArg (toString cfg.web.passwordHashFile)})"
-          tmp="$(mktemp /run/claude-box-web/env.XXXXXX)"
-          {
-            printf 'WEB_PASSWORD_HASH=%s\n' "$password_hash"
-            printf 'WEB_COOKIE_SECRET=%s\n' "$cookie_secret"
-          } > "$tmp"
-          chmod 0600 "$tmp"
-          mv "$tmp" /run/claude-box-web/env
-        '';
-      };
-
       services.caddy = {
         enable = true;
         # Hand-editable Caddyfile: the module seeds it on first boot but
@@ -473,8 +599,6 @@ in
         # file need a nixos-rebuild-plus-hand-edit cycle to land.
         configFile = "/var/lib/caddy/Caddyfile";
       };
-
-      systemd.services.caddy.serviceConfig.EnvironmentFile = "/run/claude-box-web/env";
 
       # Brute-force protection: count 401s on the terminal vhost that carried
       # an Authorization header (Caddy logs it as ["REDACTED"] when present),
@@ -497,9 +621,10 @@ in
         };
       };
 
-      # First-boot only: drop in a Caddyfile with the ttyd virtual host and a
-      # comment explaining how to add more. If the file already exists (e.g.
-      # a local box with its own hand-crafted blocks), leave it alone.
+      # First-boot only: drop in a Caddyfile with the terminal virtual host
+      # (rendered above) and a comment explaining how to add more. If the file
+      # already exists (e.g. a local box with its own hand-crafted blocks),
+      # leave it alone.
       # stringAfter users/groups: unordered snippets sort alphabetically, so a
       # plain .text ran BEFORE the caddy user existed on a fresh box and the
       # chown failed, failing activation. /var/lib/caddy must be created here
@@ -507,69 +632,39 @@ in
       system.activationScripts.claude-box-caddyfile-seed = lib.stringAfter [ "users" "groups" ] ''
         if [ ! -s /var/lib/caddy/Caddyfile ]; then
           install -d -m 0755 -o caddy -g caddy /var/lib/caddy
-          install -m 0664 -o caddy -g caddy /dev/null /var/lib/caddy/Caddyfile
-          cat > /var/lib/caddy/Caddyfile <<'CADDYFILE_EOF'
-        # Edit me. Reload with: sudo systemctl reload caddy.service
-        # Add another host by copying the block below and updating the hostname.
-        # New hosts get a Let's Encrypt cert on first request (TLS-ALPN-01).
-
-        (acme_alpn_only) {
-          tls {
-            issuer acme {
-              disable_http_challenge
-            }
-          }
-        }
-
-        ${cfg.web.domain} {
-          # Access log to the journal — the fail2ban jail counts 401s here.
-          log
-          import acme_alpn_only
-          header {
-            Cache-Control "no-store"
-            X-Content-Type-Options "nosniff"
-          }
-          @hasAuthCookie header_regexp Cookie "(^|; )__Host-agent_box_auth={$WEB_COOKIE_SECRET}(;|$)"
-          handle @hasAuthCookie {
-            reverse_proxy 127.0.0.1:7681
-          }
-          handle {
-            route {
-              basic_auth {
-                ${webUser} {$WEB_PASSWORD_HASH}
-              }
-              header >Set-Cookie "__Host-agent_box_auth={$WEB_COOKIE_SECRET}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-              reverse_proxy 127.0.0.1:7681
-            }
-          }
-        }
-        CADDYFILE_EOF
+          install -m 0664 -o caddy -g caddy ${seedCaddyfile} /var/lib/caddy/Caddyfile
         fi
       '';
 
-      # ttyd — attaches to the web user's tmux session over an internal port.
+      # ttyd per terminal user — attaches to that user's tmux session over an
+      # internal port; --base-path keeps each terminal (and its /ws endpoint)
+      # under /<user>/ so one vhost can serve them all.
       # TMUX_TMPDIR must match the agent unit's RuntimeDirectory (the agent
       # runs with PrivateTmp, so the socket lives in /run, not /tmp).
-      systemd.services.claude-web-terminal = {
-        description = "Browser terminal (ttyd) attached to ${webUser}'s tmux";
-        after = [ "claude-box-${webUser}.service" "network-online.target" ];
+      systemd.services = {
+        claude-web-auth-secrets = webAuthSecretsService;
+        caddy.serviceConfig.EnvironmentFile = "/run/claude-box-web/env";
+      } // lib.listToAttrs (map (name: lib.nameValuePair "claude-web-terminal-${name}" {
+        description = "Browser terminal (ttyd) attached to ${name}'s tmux";
+        after = [ "claude-box-${name}.service" "network-online.target" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
-        environment.TMUX_TMPDIR = "/run/${runtimeDirectory webUser}";
+        environment.TMUX_TMPDIR = "/run/${runtimeDirectory name}";
         serviceConfig = {
-          User = webUser;
+          User = name;
           Restart = "always";
           RestartSec = "5s";
           ExecStart = lib.concatStringsSep " " [
             "${pkgs.ttyd}/bin/ttyd"
             "--writable"
-            "-p" "7681"
+            "-p" (toString portOf.${name})
             "-i" "127.0.0.1"
-            "-t" "titleFixed=${cfg.agent}-box"
+            "-b" "/${name}"
+            "-t" "titleFixed=${name}@${cfg.web.domain}"
             "${pkgs.tmux}/bin/tmux" "-L" tmuxSocketName "attach" "-t" "main"
           ];
         };
-      };
+      }) terminalUsers);
     }
   ))]);
 }

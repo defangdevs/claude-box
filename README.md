@@ -38,7 +38,7 @@ Let's Encrypt cert against `<eip>.sslip.io`.
 Choose `Agent` (`claude` or `codex`), set a `WebPassword` (16+ chars from
 `[A-Za-z0-9._~-]`), pick an instance size, launch. The template creates its own
 IPv6-enabled VPC/subnet so nothing on the account has to be pre-configured. The
-stack Outputs show `https://agent@<v6-or-v4>.sslip.io/` - open it, enter your
+stack Outputs show `https://agent@<v6-or-v4>.sslip.io/agent/` - open it, enter your
 `WebPassword` when prompted, complete the selected agent's one-time sign-in, done.
 
 **Cost note (Feb-2024 AWS IPv4 pricing).** The default is **IPv6-only** to

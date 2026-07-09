@@ -278,7 +278,7 @@ Resources:
   # NetworkInterface: created explicitly so we can Fn::GetAtt.PrimaryIpv6Address.
   # EnablePrimaryIpv6 is REQUIRED for that GetAtt to return a value: without a
   # designated primary IPv6, Ipv6AddressCount still assigns an address but
-  # PrimaryIpv6Address resolves to empty -> "https://agent@.sslip.io/".
+  # PrimaryIpv6Address resolves to empty -> "https://agent@.sslip.io/agent/".
   NetworkInterface:
     Type: AWS::EC2::NetworkInterface
     Properties:
@@ -384,12 +384,12 @@ Resources:
                   agent = "${Agent}";
                   users.agent = {
                     environment = { TERM = "xterm-256color"; };${SessionNameLine}
+                    web.passwordHashFile = "/var/lib/claude-box-web/password-hash";
                   };
                   web = {
                     enable = true;
                     domain = hostname;
                     user = "agent";
-                    passwordHashFile = "/var/lib/claude-box-web/password-hash";
                   };
                 };
 
@@ -441,10 +441,11 @@ Outputs:
       Browser terminal for the selected agent. Claude Code deployments are also
       drivable from the Claude apps via Remote Control.
       First load takes ~2-3 minutes while the instance provisions and Caddy
-      issues an ACME cert. The URL includes the non-secret username; enter the
-      WebPassword chosen at deployment time when prompted.
+      issues an ACME cert. The URL includes the non-secret username (which is
+      also the terminal's path — the site root is an index of terminals);
+      enter the WebPassword chosen at deployment time when prompted.
     Value: !Sub
-      - "https://agent@${Host}.sslip.io/"
+      - "https://agent@${Host}.sslip.io/agent/"
       - Host: !If
           - UseIpv4
           - !Ref EIP
