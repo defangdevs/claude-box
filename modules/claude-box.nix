@@ -264,6 +264,23 @@ in
           world-readable /nix/store path.
         '';
       };
+
+      fail2ban = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Ban IPs that repeatedly fail the browser terminal's basic auth
+          (fail2ban jail watching Caddy's access log in the journal). Only
+          counts requests that actually carried credentials, so the 401 a
+          browser gets before showing the login prompt doesn't score against
+          visitors. Requires the terminal virtual host to have a `log`
+          directive — seeded Caddyfiles include it, but if you manage
+          /var/lib/caddy/Caddyfile by hand, add `log` to the block yourself
+          or the jail never sees failures. Whitelist trusted networks with
+          services.fail2ban.ignoreIP. Also brings fail2ban's default sshd
+          jail along.
+        '';
+      };
     };
   };
 
@@ -459,6 +476,27 @@ in
 
       systemd.services.caddy.serviceConfig.EnvironmentFile = "/run/claude-box-web/env";
 
+      # Brute-force protection: count 401s on the terminal vhost that carried
+      # an Authorization header (Caddy logs it as ["REDACTED"] when present),
+      # i.e. actual wrong-password attempts — a browser's credential-less
+      # first request also 401s but is not counted.
+      services.fail2ban = lib.mkIf cfg.web.fail2ban {
+        enable = true;
+        jails.claude-web-auth = {
+          filter.Definition = {
+            failregex = ''^.*"logger":"http\.log\.access".*"client_ip":"<HOST>".*"Authorization":\["REDACTED"\].*"status":401'';
+            journalmatch = "_SYSTEMD_UNIT=caddy.service";
+          };
+          settings = {
+            backend = "systemd";
+            port = "http,https";
+            maxretry = 5;
+            findtime = "10m";
+            bantime = "1h";
+          };
+        };
+      };
+
       # First-boot only: drop in a Caddyfile with the ttyd virtual host and a
       # comment explaining how to add more. If the file already exists (e.g.
       # a local box with its own hand-crafted blocks), leave it alone.
@@ -484,6 +522,8 @@ in
         }
 
         ${cfg.web.domain} {
+          # Access log to the journal — the fail2ban jail counts 401s here.
+          log
           import acme_alpn_only
           header {
             Cache-Control "no-store"

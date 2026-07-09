@@ -47,3 +47,16 @@ jobs:
       # Full closure build — the real "module is usable" proof.
       - name: Build VM system closure
         run: nix build -L .#checks.x86_64-linux.vm-closure
+
+      # Interactive VM test: brute-forcing the web terminal's basic auth gets
+      # the client banned. ubuntu-latest runners have KVM but /dev/kvm is
+      # root-only by default; open it up so the qemu inside the nix build can
+      # use it (https://github.blog/changelog/2023-02-23-hardware-accelerated-android-virtualization-on-actions-linux-larger-hosted-runners/).
+      - name: Enable KVM for the test driver
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run web fail2ban VM test
+        run: nix build -L .#checks.x86_64-linux.web-fail2ban

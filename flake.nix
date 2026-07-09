@@ -69,6 +69,12 @@
           # Full closure build of the VM config — the "is it actually usable"
           # proof (compiles the system agents would run in).
           vm-closure = self.nixosConfigurations.vm.config.system.build.vm;
+
+          # Interactive VM test: wrong-password basic-auth attempts on the web
+          # terminal get the client IP banned. Needs KVM (or slow TCG); CI
+          # enables /dev/kvm before building this.
+          web-fail2ban = pkgs.testers.runNixOSTest
+            (import ./tests/web-fail2ban.nix { claude-box = self.nixosModules.claude-box; });
         };
     };
 }
