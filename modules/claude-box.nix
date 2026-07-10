@@ -10,8 +10,11 @@ let
   # virtual host and reload without root — pooled with the user-supplied
   # sudoAllowlist so NoNewPrivileges + sudo rules see the same list.
   caddyReloadCmd = "/run/current-system/sw/bin/systemctl reload caddy.service";
+  updateStartCmd = "/run/current-system/sw/bin/systemctl start claude-box-update.service";
   effectiveSudoAllowlist =
-    cfg.sudoAllowlist ++ lib.optional cfg.web.enable caddyReloadCmd;
+    cfg.sudoAllowlist
+    ++ lib.optional cfg.web.enable caddyReloadCmd
+    ++ lib.optional cfg.selfUpdate.enable updateStartCmd;
   agentPackage = agent:
     if cfg.package != null then cfg.package
     else if agent == "claude" then pkgs.claude-code
@@ -296,6 +299,53 @@ in
         '';
       };
     };
+
+    selfUpdate = {
+      enable = lib.mkEnableOption ''
+        an agent-triggerable self-update service. When enabled, every agent
+        user's sudo allowlist gains exactly
+        `systemctl start claude-box-update.service` — a root oneshot that
+        fast-forwards the box to the upstream repo's latest default-branch
+        commit by rewriting `pinFile` and running `nixos-rebuild switch`.
+        The privilege boundary is trigger-only: no arguments, environment or
+        paths cross sudo; the update source and logic are fixed in the unit.
+        NOTE: the rebuild restarts agent services, so running sessions die —
+        agents should save their working context before triggering it.
+        Release signature verification is future work (tracked upstream);
+        until then the updater trusts the pinned GitHub repo as published,
+        hash-pinning only what it fetched
+      '';
+
+      repo = lib.mkOption {
+        type = lib.types.str;
+        default = "defangdevs/claude-box";
+        description = "GitHub owner/repo the update service pulls from.";
+      };
+
+      rev = lib.mkOption {
+        type = lib.types.str;
+        example = "0f96eebfda54d9e7cc90cdda9a5b30f04b95c1df";
+        description = ''
+          Git rev of `repo` this configuration was built from — wire it to
+          the same value that pins the module fetch (see pinFile). Used as
+          the ancestry baseline: the updater refuses any target that is not
+          strictly ahead of this rev, so history rewrites and replays of
+          older (possibly vulnerable) revisions don't apply.
+        '';
+      };
+
+      pinFile = lib.mkOption {
+        type = lib.types.str;
+        default = "/etc/nixos/claude-box-pin.nix";
+        description = ''
+          File the updater atomically rewrites with
+          `{ rev = "..."; sha256 = "..."; }`. The host configuration must
+          import the module at exactly this pin when the file exists (see
+          aws/template.yaml for the reference wiring); otherwise the update
+          rebuilds against a stale module and silently no-ops.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [{
@@ -431,7 +481,74 @@ in
       # gain given the allowlist is meant to be tight and command-scoped.
       commands = map (command: { inherit command; options = [ "NOPASSWD" ]; }) effectiveSudoAllowlist;
     }];
-  } (lib.mkIf (cfg.enable && cfg.web.enable) (
+  } (lib.mkIf cfg.selfUpdate.enable {
+    # Agent-triggerable box update. The agents' only power here is the
+    # allowlisted `sudo systemctl start claude-box-update.service` (see
+    # updateStartCmd) — a trigger with no arguments, so everything below
+    # (source repo, pin file, rebuild) is fixed at build time and immutable
+    # in the store. Verifying releases against an offline signing key is
+    # tracked upstream (defangdevs/claude-box issue 46); until then this
+    # trusts the pinned repo as GitHub serves it.
+    systemd.services.claude-box-update = {
+      description = "Fast-forward claude-box to upstream HEAD and rebuild";
+      # No wantedBy — on-demand only, via the agents' sudo rule (or root).
+      path = [ pkgs.curl pkgs.jq pkgs.openssl pkgs.coreutils pkgs.util-linux ];
+      environment = {
+        REPO = cfg.selfUpdate.repo;
+        CURRENT_REV = cfg.selfUpdate.rev;
+        PIN_FILE = cfg.selfUpdate.pinFile;
+        # nixos-rebuild resolves <nixpkgs> via NIX_PATH, which systemd units
+        # don't inherit; point it at root's channel (the NixOS AMI default).
+        NIX_PATH = "nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:nixos-config=/etc/nixos/configuration.nix";
+      };
+      serviceConfig.Type = "oneshot";
+      script = ''
+        set -euo pipefail
+        api() { curl -fsSL -H 'Accept: application/vnd.github+json' "$1"; }
+
+        target="$(api "https://api.github.com/repos/$REPO/commits/HEAD" | jq -r .sha)"
+        if [ "$target" = "$CURRENT_REV" ]; then
+          echo "already at upstream HEAD ($target)"
+          exit 0
+        fi
+
+        # Fast-forward only: a target that isn't strictly ahead of the
+        # running rev means upstream history was rewritten or an older
+        # (possibly vulnerable) rev is being replayed — refuse both.
+        status="$(api "https://api.github.com/repos/$REPO/compare/$CURRENT_REV...$target" | jq -r .status)"
+        if [ "$status" != "ahead" ]; then
+          echo "refusing update: $target is '$status' of running rev $CURRENT_REV (need fast-forward)" >&2
+          exit 1
+        fi
+
+        module="$(mktemp)"
+        trap 'rm -f "$module"' EXIT
+        curl -fsSL "https://raw.githubusercontent.com/$REPO/$target/modules/claude-box.nix" -o "$module"
+        sha="sha256-$(openssl dgst -sha256 -binary "$module" | base64)"
+
+        if [ -e "$PIN_FILE" ]; then
+          cp "$PIN_FILE" "$PIN_FILE.prev"
+        fi
+        printf '{ rev = "%s"; sha256 = "%s"; }\n' "$target" "$sha" > "$PIN_FILE.tmp"
+        mv "$PIN_FILE.tmp" "$PIN_FILE"
+
+        wall "claude-box: updating to $REPO@$target — agent sessions will restart if their services changed." || true
+        if /run/current-system/sw/bin/nixos-rebuild switch; then
+          wall "claude-box: update to $target applied." || true
+        else
+          # Roll the pin back so the next trigger retries cleanly instead of
+          # believing the failed rev is current.
+          if [ -e "$PIN_FILE.prev" ]; then
+            mv "$PIN_FILE.prev" "$PIN_FILE"
+          else
+            rm -f "$PIN_FILE"
+          fi
+          wall "claude-box: update to $target FAILED — pin rolled back, system unchanged. See: journalctl -u claude-box-update" || true
+          exit 1
+        fi
+      '';
+    };
+  }) (lib.mkIf (cfg.enable && cfg.web.enable) (
     let
       webUser = cfg.web.user;
       # Users that get a browser terminal, in sorted order (attrNames sorts) —

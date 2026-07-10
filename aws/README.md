@@ -76,6 +76,28 @@ The box then has no privileged access path; only choose this if you are
 comfortable tearing the stack down and redeploying to recover from a broken
 first boot.
 
+### Updating a deployed box (agent-triggered)
+
+The launch-time `ClaudeBoxRev`/`ClaudeBoxSha256` parameters pin the module for
+the FIRST boot only. The generated `/etc/nixos/configuration.nix` prefers
+`/etc/nixos/claude-box-pin.nix` when that file exists, and
+`claude-box-update.service` — a root oneshot enabled via the module's
+`selfUpdate` option — owns that file: it resolves upstream master's HEAD,
+verifies it is strictly ahead of the running revision (history rewrites and
+downgrade replays are refused), hash-pins the fetched module, rewrites the pin
+file atomically, and runs `nixos-rebuild switch`. On rebuild failure the pin
+rolls back and the running system is unchanged.
+
+The agent triggers it with `sudo systemctl start claude-box-update.service` —
+the sudoers entry matches that literal command, so no arguments, environment
+or paths cross the privilege boundary; the agent can only say "go". Tell the
+agent to save its working context first: the rebuild restarts changed agent
+services, killing their sessions mid-update.
+
+The updater trusts the pinned GitHub repo as published (TLS + hash-pinning of
+what it fetched). Signature verification against an offline key is tracked in
+[issue 46](https://github.com/defangdevs/claude-box/issues/46).
+
 ### WebPassword storage
 
 `WebPassword` is required (16-64 chars). Even Claude Code stacks that intend to
