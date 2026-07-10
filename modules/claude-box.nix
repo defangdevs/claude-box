@@ -504,8 +504,10 @@ in
       # to keep in the world-readable Nix store because it only holds
       # {$ENV} placeholders, never secrets.
       #
-      # Self-serve extension point: the trailing `import` picks up per-user
-      # snippet files. Each agent user has a caddy-readable directory at
+      # Self-serve extension point: the trailing per-user `import` lines
+      # (one per agent user, since the Caddyfile `import` directive rejects
+      # multi-wildcard globs like `*/*.caddy`) pick up snippet files. Each
+      # agent user has a caddy-readable directory at
       # /var/lib/claude-box-sites/<user>/ symlinked from ~/sites, so the agent
       # can add a virtual host by writing ~/sites/<something>.caddy and
       # running `sudo systemctl reload caddy.service`. No nixos-rebuild
@@ -556,11 +558,13 @@ in
       + indent "  " pickerBlock
       + "}\n\n"
       + ''
-        # Per-user snippet directory. Each agent user's ~/sites/ symlinks here.
-        # Adding a file below and running `sudo systemctl reload caddy.service`
-        # is the whole workflow — no nixos-rebuild required.
-        import /var/lib/claude-box-sites/*/*.caddy
-      '');
+        # Per-user snippet directories. Each agent user's ~/sites/ symlinks
+        # here. Adding a file below and running `sudo systemctl reload
+        # caddy.service` is the whole workflow — no nixos-rebuild required.
+        # One import per user: Caddyfile's `import` directive only accepts a
+        # single `*` per pattern, so we can't collapse this to `*/*.caddy`.
+      ''
+      + lib.concatMapStringsSep "" (name: "import /var/lib/claude-box-sites/${name}/*.caddy\n") (lib.attrNames cfg.users));
 
       # Reads each terminal user's (already-hashed) password from their
       # passwordHashFile, mints a persistent per-user cookie secret if

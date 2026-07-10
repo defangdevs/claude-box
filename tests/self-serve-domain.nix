@@ -44,11 +44,13 @@
       fi
     '';
 
-    # Bare-bones Caddyfile that keeps the module's `import` extension point.
-    # The sandbox has no ACME, so we don't include the module's real terminal
+    # Bare-bones Caddyfile that keeps the module's per-user `import`. The
+    # sandbox has no ACME, so we don't include the module's real terminal
     # vhost here — the self-serve snippet below brings its own `tls internal`.
+    # Caddyfile globs cap at ONE `*`, so this stays per-user (matches the
+    # module).
     services.caddy.configFile = lib.mkForce (pkgs.writeText "Caddyfile" ''
-      import /var/lib/claude-box-sites/*/*.caddy
+      import /var/lib/claude-box-sites/agent/*.caddy
     '');
   };
 
