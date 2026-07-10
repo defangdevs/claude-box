@@ -75,6 +75,12 @@
           # enables /dev/kvm before building this.
           web-fail2ban = pkgs.testers.runNixOSTest
             (import ./tests/web-fail2ban.nix { claude-box = self.nixosModules.claude-box; });
+
+          # Interactive VM test: an agent user drops a snippet into ~/sites/
+          # and reloads caddy via the sudoAllowlist rule; the new vhost
+          # serves without any nixos-rebuild.
+          self-serve-domain = pkgs.testers.runNixOSTest
+            (import ./tests/self-serve-domain.nix { claude-box = self.nixosModules.claude-box; });
         };
     };
 }
