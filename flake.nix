@@ -81,6 +81,13 @@
           # serves without any nixos-rebuild.
           self-serve-domain = pkgs.testers.runNixOSTest
             (import ./tests/self-serve-domain.nix { claude-box = self.nixosModules.claude-box; });
+
+          # Interactive VM test: the per-user settings page (issue #36) adds a
+          # secret through the browser (behind basic auth), writes the
+          # user-owned 0600 env file, lists key names only, and the agent unit
+          # picks the file up as an optional EnvironmentFile — no rebuild.
+          settings-page = pkgs.testers.runNixOSTest
+            (import ./tests/settings-page.nix { claude-box = self.nixosModules.claude-box; });
         };
     };
 }

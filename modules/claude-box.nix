@@ -4,7 +4,18 @@ let
   cfg = config.services.claude-box;
   supportedAgents = [ "claude" "codex" ];
   tmuxSocketName = "agent-box";
+  tmuxSessionName = "main";
   runtimeDirectory = name: "agent-box-${name}";
+  # Port bases for the two per-user localhost daemons. Each is assigned in
+  # sorted user-name order (see terminalUsers below). Kept far apart and
+  # explicit — per this repo's explicit-over-implied-config convention — so
+  # the ttyd list (7681+) and the settings-daemon list (7781+) can never
+  # collide even with dozens of terminal users.
+  ttydPortBase = 7681;
+  settingsPortBase = 7781;
+  # The per-user secrets file the settings page (issue #36) manages. User-
+  # owned, 0600, loaded (optionally) by the agent unit's EnvironmentFile.
+  userEnvFile = name: "/home/${name}/.config/claude-box/env";
 
   # Reload command is granted when web is enabled so the agent can add a
   # virtual host and reload without root — pooled with the user-supplied
@@ -435,8 +446,14 @@ in
           RuntimeDirectoryPreserve = true;
           # Custom tokens (GH_TOKEN, etc.) land here. The '-' makes the per-user
           # file optional so the agent starts even before any token is dropped in.
+          # The self-serve settings page (issue #36) writes the user-owned
+          # ~/.config/claude-box/env; it's listed here (also '-'-optional) so an
+          # end user can add secrets through the browser without a rebuild and
+          # without typing them into the agent chat/terminal. Restarting the
+          # agent (settings-page "Apply") reloads this env.
           EnvironmentFile = cfg.environmentFiles
             ++ [ "-${cfg.tokenDir}/${name}.env" ]
+            ++ [ "-/home/${name}/.config/claude-box/env" ]
             ++ u.environmentFiles;
 
           # Systemd hardening. The OS boundary has to stay meaningful even
@@ -554,8 +571,25 @@ in
       # Users that get a browser terminal, in sorted order (attrNames sorts) —
       # port assignment below depends on that order being deterministic.
       terminalUsers = lib.filter (n: cfg.users.${n}.web.passwordHashFile != null) (lib.attrNames cfg.users);
-      portOf = lib.listToAttrs (lib.imap0 (i: n: lib.nameValuePair n (7681 + i)) terminalUsers);
+      portOf = lib.listToAttrs (lib.imap0 (i: n: lib.nameValuePair n (ttydPortBase + i)) terminalUsers);
+      # Settings daemon gets its own port per terminal user, same sorted
+      # order, on a disjoint base so it never collides with a ttyd port.
+      settingsPortOf = lib.listToAttrs (lib.imap0 (i: n: lib.nameValuePair n (settingsPortBase + i)) terminalUsers);
+      # Public URL base path for a user's settings page (Caddy does not strip
+      # a prefix, so the daemon matches this full path).
+      settingsBaseOf = n: "/${n}/settings";
       hashFileOf = n: toString cfg.users.${n}.web.passwordHashFile;
+      # The settings daemon script (issue #36). Python-3-stdlib only — no
+      # third-party deps — so it stays tiny and auditable. Runs as the agent
+      # user; writes ~/.config/claude-box/env (0600) and restarts the agent by
+      # killing its tmux session. See modules/settings-daemon.py for the full
+      # rationale.
+      settingsDaemon = pkgs.writers.writePython3Bin "claude-box-settings" {
+        # No external libraries; skip flake8 style gate (the script is
+        # formatted for readability, not lint-perfection) but keep syntax
+        # checking that writePython3Bin does by compiling.
+        flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" ];
+      } (builtins.readFile ./settings-daemon.py);
       # Per-user env var suffix for the Caddyfile placeholders; linux user
       # names may contain chars that are invalid in env var names.
       envName = n: lib.toUpper (lib.stringAsChars (c: if builtins.match "[a-zA-Z0-9]" c != null then c else "_") n);
@@ -571,6 +605,25 @@ in
         # auth credentials to WebSocket upgrades — then basic auth with the
         # linux user name as the login name.
         redir /${name} /${name}/
+        # ${name}'s settings page (issue #36). Same auth surface as the
+        # terminal (cookie-or-basic-auth, same user name), just a different
+        # upstream — the settings daemon on its own localhost port. More
+        # specific than /${name}/* below, so Caddy routes it here first.
+        handle /${name}/settings* {
+          @cookie_settings_${name} header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
+          handle @cookie_settings_${name} {
+            reverse_proxy 127.0.0.1:${toString settingsPortOf.${name}}
+          }
+          handle {
+            route {
+              basic_auth bcrypt ${name} {
+                ${name} {$WEB_PASSWORD_HASH_${envName name}}
+              }
+              header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              reverse_proxy 127.0.0.1:${toString settingsPortOf.${name}}
+            }
+          }
+        }
         handle /${name}/* {
           @cookie_${name} header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
           handle @cookie_${name} {
@@ -604,14 +657,18 @@ in
               body { margin: 0; min-height: 100vh; display: grid; place-items: center;
                      background: #0d1117; color: #e6edf3; font: 16px/1.6 system-ui, sans-serif; }
               main { text-align: center; }
-              main a { display: block; margin: 10px 0; padding: 12px 36px;
+              main .row { display: flex; gap: 8px; margin: 10px 0; align-items: stretch; }
+              main a { display: flex; align-items: center; justify-content: center;
+                       padding: 12px 36px;
                        border: 1px solid #30363d; border-radius: 10px; background: #161b22;
                        color: #e8a087; font-size: 20px; text-decoration: none; }
+              main a.term { flex: 1; }
+              main a.gear { padding: 12px 18px; text-decoration: none; }
               main a:hover { border-color: #e8a087; }
             </style>
             <main>
               <h1>Terminals</h1>
-              ${lib.concatMapStringsSep "\n      " (n: ''<a href="https://${n}@${cfg.web.domain}/${n}/">${n}</a>'') terminalUsers}
+              ${lib.concatMapStringsSep "\n      " (n: ''<div class="row"><a class="term" href="https://${n}@${cfg.web.domain}/${n}/">${n}</a><a class="gear" href="https://${n}@${cfg.web.domain}/${n}/settings/" title="${n} settings" aria-label="${n} settings">&#9881;</a></div>'') terminalUsers}
             </main>
             PICKER_HTML 200
         }
@@ -759,7 +816,15 @@ in
         # symlink/file if the target differs from ours (idempotent across
         # renames). Users edit through this link and never touch /var/lib.
         "L+ /home/${name}/sites - - - - /var/lib/claude-box-sites/${name}"
-      ]) (lib.attrNames cfg.users);
+      ]) (lib.attrNames cfg.users)
+      # The settings page's env dir, per terminal user. User-owned 0700 so
+      # only the agent user (and root) can read it; the settings daemon runs
+      # as that user and writes env (0600) inside. Created here so the daemon
+      # and the agent unit's optional EnvironmentFile both have a stable path
+      # even before the user saves any key.
+      ++ lib.map (name:
+        "d /home/${name}/.config/claude-box 0700 ${name} ${name} - -"
+      ) terminalUsers;
 
       services.caddy = {
         enable = true;
@@ -817,6 +882,48 @@ in
             "-t" "titleFixed=${name}@${cfg.web.domain}"
             "${pkgs.tmux}/bin/tmux" "-L" tmuxSocketName "attach" "-t" "main"
           ];
+        };
+      }) terminalUsers)
+      # Settings daemon (issue #36), one per terminal user. Runs AS the agent
+      # user (no root, no privilege boundary): it only writes that user's own
+      # ~/.config/claude-box/env and kills that user's own tmux session. The
+      # agent unit's Restart=always then reloads it with the fresh env.
+      // lib.listToAttrs (map (name: lib.nameValuePair "claude-box-settings-${name}" {
+        description = "Per-user secrets settings page for ${name}";
+        after = [ "network-online.target" ];
+        wants = [ "network-online.target" ];
+        wantedBy = [ "multi-user.target" ];
+        # TMUX_TMPDIR must match the agent unit's RuntimeDirectory so the
+        # daemon can reach the (PrivateTmp) tmux socket to restart the agent.
+        environment = {
+          TMUX_TMPDIR = "/run/${runtimeDirectory name}";
+          CLAUDE_BOX_SETTINGS_USER = name;
+          CLAUDE_BOX_SETTINGS_ENV_FILE = userEnvFile name;
+          CLAUDE_BOX_SETTINGS_BASE = settingsBaseOf name;
+          CLAUDE_BOX_SETTINGS_PORT = toString settingsPortOf.${name};
+          CLAUDE_BOX_TMUX_SOCKET = tmuxSocketName;
+          CLAUDE_BOX_TMUX_SESSION = tmuxSessionName;
+          CLAUDE_BOX_TMUX_TMPDIR = "/run/${runtimeDirectory name}";
+          CLAUDE_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
+        };
+        serviceConfig = {
+          User = name;
+          Restart = "always";
+          RestartSec = "5s";
+          ExecStart = "${settingsDaemon}/bin/claude-box-settings";
+          # Hardening: the daemon needs to write ~/.config/claude-box and run
+          # tmux against the /run socket dir, nothing else.
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/home/${name}" "/run/${runtimeDirectory name}" ];
+          ProtectHome = false;
+          PrivateDevices = true;
+          ProtectKernelTunables = true;
+          ProtectKernelModules = true;
+          ProtectControlGroups = true;
+          RestrictSUIDSGID = true;
+          RestrictRealtime = true;
+          LockPersonality = true;
+          NoNewPrivileges = true;
         };
       }) terminalUsers);
     }
