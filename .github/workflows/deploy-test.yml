@@ -120,6 +120,7 @@ jobs:
               "ParameterKey=ClaudeBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
               "ParameterKey=ClaudeBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
             --on-failure DO_NOTHING \
+            --capabilities CAPABILITY_IAM \
             --tags "Key=Purpose,Value=claude-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
           echo "::notice::Waiting for stack ${STACK_NAME} to reach CREATE_COMPLETE (up to 30 min)..."
           aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
