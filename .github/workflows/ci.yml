@@ -44,6 +44,12 @@ jobs:
       - name: Check multi-user generation
         run: nix build -L .#checks.x86_64-linux.multi-user && cat result
 
+      # Eval-only guard for issue 51: deployed boxes (CFN user-data +
+      # self-update) fetch modules/claude-box.nix as a single file, so any
+      # ./sibling reference breaks first boot. Catch it here, not post-merge.
+      - name: Check module evaluates as a single file
+        run: nix build -L .#checks.x86_64-linux.module-single-file && cat result
+
       # Full closure build — the real "module is usable" proof.
       - name: Build VM system closure
         run: nix build -L .#checks.x86_64-linux.vm-closure
@@ -65,3 +71,9 @@ jobs:
       # writing a snippet to ~/sites/ and reloading caddy — no rebuild.
       - name: Run self-serve domain VM test
         run: nix build -L .#checks.x86_64-linux.self-serve-domain
+
+      # Interactive VM test: the settings page stores a secret through the
+      # browser and the agent unit picks it up (was added in PR 43 but never
+      # wired into CI).
+      - name: Run settings page VM test
+        run: nix build -L .#checks.x86_64-linux.settings-page

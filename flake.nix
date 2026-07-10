@@ -88,6 +88,50 @@
           # picks the file up as an optional EnvironmentFile — no rebuild.
           settings-page = pkgs.testers.runNixOSTest
             (import ./tests/settings-page.nix { claude-box = self.nixosModules.claude-box; });
+
+          # Regression guard (issue #51): deployed boxes fetch
+          # modules/claude-box.nix as a SINGLE file — the CFN user-data and
+          # claude-box-update.service both fetchurl just that path — so the
+          # module must never reference a ./sibling. builtins.path snapshots
+          # the lone file into the store exactly like fetchurl does; forcing
+          # the toplevel drvPath then proves a web-enabled system still
+          # evaluates from the bare file. Eval-only, nothing is built.
+          module-single-file =
+            let
+              moduleAlone = builtins.path {
+                path = ./modules/claude-box.nix;
+                name = "claude-box-module-alone.nix";
+              };
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  moduleAlone
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.claude-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/claude-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "single-file.test";
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "claude-box-module-single-file-ok" {
+              # Forcing drvPath instantiates the full system eval without
+              # building it; the context is discarded so this check itself
+              # stays a trivial build.
+              evaluated = builtins.unsafeDiscardStringContext
+                sys.config.system.build.toplevel.drvPath;
+            } ''
+              printf 'single-file eval OK: %s\n' "$evaluated" > "$out"
+            '';
         };
     };
 }
