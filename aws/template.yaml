@@ -18,6 +18,7 @@ Metadata:
           default: Advanced (rarely needed)
         Parameters:
           - AllowCidr
+          - EnableSsm
           - ClaudeBoxRev
           - ClaudeBoxSha256
     ParameterLabels:
@@ -33,6 +34,8 @@ Metadata:
         default: Allocate a public IPv4 (costs ~$3.60/mo)
       AllowCidr:
         default: IPv4 CIDR allowed to reach 443
+      EnableSsm:
+        default: Enable SSM Session Manager root access
       ClaudeBoxRev:
         default: claude-box git rev
       ClaudeBoxSha256:
@@ -120,6 +123,27 @@ Parameters:
       IPv4 CIDR allowed to reach 443. Default is open. IPv6 ingress is
       always ::/0 - restrict at the SG level after launch if needed.
 
+  EnableSsm:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      true (default): attach an IAM instance profile with
+      AmazonSSMManagedInstanceCore so the deployer can open a root shell via
+      AWS Systems Manager Session Manager (Console -> Systems Manager ->
+      Session Manager, or `aws ssm start-session`). This is the only
+      privileged access path baked in - the template ships no SSH KeyName -
+      so leaving it on means a broken first boot is still debuggable
+      (amazon-init logs are otherwise journal-only and invisible to
+      get-console-output). Because the template then creates IAM resources,
+      the Launch Stack console flow adds a one-checkbox CAPABILITY_IAM
+      acknowledgment. The AMI's amazon-ssm-agent is enabled unconditionally
+      by NixOS's virtualisation/amazon-image.nix; with no instance profile
+      it just fails to register and sits idle, so flipping this to false
+      costs nothing at runtime and skips the IAM prompt at launch time.
+      false: no instance profile, no SSM session access, no CAPABILITY_IAM
+      prompt.
+
   ClaudeBoxRev:
     Type: String
     Description: >-
@@ -146,6 +170,7 @@ Parameters:
 Conditions:
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
   UseSpotCond: !Equals [!Ref UseSpot, 'true']
+  UseSsm: !Equals [!Ref EnableSsm, 'true']
 
 Mappings:
   # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
@@ -296,6 +321,39 @@ Resources:
       NetworkInterfaceId: !Ref NetworkInterface
       AllocationId: !GetAtt EIP.AllocationId
 
+  # SSM Session Manager access. The template ships no SSH KeyName, so this
+  # role is the only privileged path onto the box - critical when a first
+  # boot fails, since amazon-init writes to the journal only and is
+  # invisible to ec2:GetConsoleOutput. AmazonSSMManagedInstanceCore is the
+  # AWS-managed policy documented for Session Manager; it grants only what
+  # the ssm-agent needs (ssm:UpdateInstanceInformation, the messaging /
+  # session channels, and a narrow set of ec2messages/ssmmessages actions).
+  # No S3, no KMS, no CloudWatch Logs - Session Manager output stays on the
+  # instance unless the operator opts in later.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Condition: UseSsm
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: UseSsm
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
   # Carries the persistent-Spot-with-stop options. On a Spot interruption AWS
   # stops (does not terminate) the instance and restarts the SAME instance in
   # the SAME AZ when capacity returns, so root EBS + IPv6 + TLS cert survive.
@@ -331,6 +389,13 @@ Resources:
     Properties:
       InstanceType: !Ref InstanceType
       ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
+      # IamInstanceProfile takes the profile *name* (not ARN); AWS::NoValue
+      # when EnableSsm=false so the whole IAM stack is skipped and the launch
+      # form does not display CAPABILITY_IAM.
+      IamInstanceProfile: !If
+        - UseSsm
+        - !Ref InstanceProfile
+        - !Ref AWS::NoValue
       # Spot options must ride on a launch template - AWS::EC2::Instance has no
       # InstanceMarketOptions of its own. Referenced only when UseSpot=true.
       LaunchTemplate: !If

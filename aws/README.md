@@ -38,6 +38,43 @@ choose Claude Code or Codex.
 - Requires IMDSv2 (`HttpTokens: required`).
 - Disables `amazon-init` after the first successful apply so local edits to
   `/etc/nixos/configuration.nix` survive reboots.
+- Attaches an IAM instance profile with `AmazonSSMManagedInstanceCore` so the
+  deployer has a root path onto the box via SSM Session Manager. See
+  ["Root access via SSM Session Manager"](#root-access-via-ssm-session-manager)
+  below. Opt out with `EnableSsm=false` to skip the IAM resources and the
+  launch console's CAPABILITY_IAM acknowledgment.
+
+### Root access via SSM Session Manager
+
+The template ships no SSH `KeyName`, so on default settings SSM is the only
+privileged path onto the box. This matters most when first boot fails:
+`amazon-init` writes to the systemd journal only, and `ec2:GetConsoleOutput`
+does not capture it — without SSM there is nothing to look at.
+
+The `amazon-ssm-agent` NixOS service is enabled unconditionally by
+`virtualisation/amazon-image.nix` on the AMIs we use, so the only piece the
+template adds is an IAM instance profile carrying the
+`AmazonSSMManagedInstanceCore` managed policy (attached when `EnableSsm=true`,
+the default). Once the instance registers with SSM (usually within a minute
+of `nixos-rebuild switch` completing), open a root shell either from the AWS
+console (Systems Manager -> Session Manager -> Start session -> pick the
+instance -> Start session) or from the CLI:
+
+```bash
+aws ssm start-session --target <InstanceId> --region <region>
+```
+
+`<InstanceId>` is in the stack Outputs. The session lands as the `ssm-user`
+account with passwordless sudo; `sudo -i` gets you a root shell for
+`journalctl -u amazon-init`, `nixos-rebuild switch`, etc. No SSH key, no
+inbound port opened - Session Manager tunnels via the ssm-agent's outbound
+connection to the SSM service.
+
+To skip the IAM resources entirely - and avoid the launch console's
+CAPABILITY_IAM acknowledgment checkbox - set `EnableSsm=false` at launch.
+The box then has no privileged access path; only choose this if you are
+comfortable tearing the stack down and redeploying to recover from a broken
+first boot.
 
 ### WebPassword storage
 
