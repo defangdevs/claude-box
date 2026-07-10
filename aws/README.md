@@ -103,7 +103,7 @@ The box then has no privileged access path; only choose this if you are
 comfortable tearing the stack down and redeploying to recover from a broken
 first boot.
 
-### Updating a deployed box (agent-triggered)
+### Updating a deployed box (user- or agent-triggered)
 
 The launch-time `ClaudeBoxRev`/`ClaudeBoxSha256` parameters pin the module for
 the FIRST boot only. The generated `/etc/nixos/configuration.nix` prefers
@@ -112,14 +112,23 @@ the FIRST boot only. The generated `/etc/nixos/configuration.nix` prefers
 `selfUpdate` option — owns that file: it resolves upstream master's HEAD,
 verifies it is strictly ahead of the running revision (history rewrites and
 downgrade replays are refused), hash-pins the fetched module, rewrites the pin
-file atomically, and runs `nixos-rebuild switch`. On rebuild failure the pin
-rolls back and the running system is unchanged.
+file atomically, and runs `nixos-rebuild switch`. On rebuild failure the pins
+roll back and the running system is unchanged.
 
-The agent triggers it with `sudo systemctl start claude-box-update.service` —
-the sudoers entry matches that literal command, so no arguments, environment
-or paths cross the privilege boundary; the agent can only say "go". Tell the
-agent to save its working context first: the rebuild restarts changed agent
-services, killing their sessions mid-update.
+The same run also advances `/etc/nixos/claude-box-agent-pin.nix` — a second
+pin, holding the latest nixos-unstable channel-release tarball — from which
+only the agent CLI packages (`claude-code`, `codex`) are resolved. The box
+itself stays on its release channel; the fast-moving agent CLIs track
+nixos-unstable, closing most of the version gap to upstream releases without
+giving up reproducibility (the pin is URL + hash, and Hydra has the binaries).
+
+Two triggers, both privilege-checked the same way: the "Update box" button on
+each user's settings page, and the agent running
+`sudo systemctl start claude-box-update.service` in its terminal — the
+sudoers entries match those literal commands, so no arguments, environment
+or paths cross the privilege boundary; the caller can only say "go". Save
+any working context first: the rebuild restarts changed agent services,
+killing their sessions mid-update.
 
 The updater trusts the pinned GitHub repo as published (TLS + hash-pinning of
 what it fetched). Signature verification against an offline key is tracked in

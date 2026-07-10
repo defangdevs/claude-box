@@ -72,14 +72,17 @@ one CAPABILITY_IAM checkbox to the Launch Stack form; opt out with
 [aws/README.md](./aws/README.md#root-access-via-ssm-session-manager) for
 details.
 
-**Updating the box.** Ask the agent in its terminal to run
+**Updating the box.** Click "Update box" on the settings page (the gear icon
+next to your terminal), or ask the agent in its terminal to run
 `sudo systemctl start claude-box-update.service` — a root oneshot (alongside
 the caddy reload, the only sudo the agent holds) that fast-forwards the box
-to this repo's latest master and runs `nixos-rebuild switch`. Have the agent
-save its working context first: the rebuild restarts changed agent services,
-which kills their running sessions. Anything that is not a fast-forward of
-the running revision is refused. Verifying releases against an offline
-signing key is tracked in
+to this repo's latest master, advances the agent-CLI pin to the newest
+nixos-unstable channel release (so `claude` / `codex` stay current even
+though the box itself tracks a stable NixOS release), and runs
+`nixos-rebuild switch`. Have the agent save its working context first: the
+rebuild restarts changed agent services, which kills their running sessions.
+Anything that is not a fast-forward of the running revision is refused.
+Verifying releases against an offline signing key is tracked in
 [issue 46](https://github.com/defangdevs/claude-box/issues/46).
 
 Template source: [`aws/template.yaml`](./aws/template.yaml).

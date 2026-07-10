@@ -40,6 +40,14 @@
         user = "agent";
         fail2ban = false;
       };
+      # Issue 54: the settings page grows an "Update box" button that triggers
+      # claude-box-update.service through the allowlisted sudo rule. The VM has
+      # no network, so the unit itself will fail after activating — the test
+      # only proves the trigger plumbing (button -> daemon -> sudo -> unit).
+      selfUpdate = {
+        enable = true;
+        rev = "0000000000000000000000000000000000000000";
+      };
     };
     system.stateVersion = "25.05";
 
@@ -106,9 +114,11 @@
     sock_curl = "curl -s --max-time 10 --unix-socket /run/claude-box-settings/agent.sock"
 
     # The owning user can talk to its own daemon over the socket...
+    # (grep without -q: -q exits on first match and closes the pipe while
+    # curl is still writing the page -> curl exit 23.)
     machine.succeed(
         f"su -s /bin/sh agent -c '{sock_curl} http://localhost/agent/settings/' "
-        "| grep -q 'Settings for agent'"
+        "| grep 'Settings for agent' >/dev/null"
     )
     # ...another local user gets permission denied — cannot list, write, or
     # restart. (Before the fix, all three worked over 127.0.0.1:7781.)
@@ -131,7 +141,7 @@
     # Authenticated GET renders the page.
     client.succeed(
         f"{curl} -u agent:testpassword https://box.test/agent/settings/ "
-        "| grep -q 'Settings for agent'"
+        "| grep 'Settings for agent' >/dev/null"
     )
 
     # No env file exists yet.
@@ -167,6 +177,28 @@
     machine.succeed(
         "systemctl show claude-box-agent --property=EnvironmentFiles "
         "| grep -q '/home/agent/.config/claude-box/env'"
+    )
+
+    # Issue 54: with selfUpdate enabled the page shows the Update card...
+    assert "Update box" in page, "Update box card should be rendered when selfUpdate is on"
+
+    # ...and POSTing to /update triggers claude-box-update.service through the
+    # daemon's sudo -n systemctl start --no-block. The unit was inactive
+    # before; activating it in this offline VM makes it fail (curl can't reach
+    # GitHub), which is exactly the observable we want: the trigger worked.
+    machine.fail("systemctl is-active --quiet claude-box-update.service")
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "-X POST https://box.test/agent/settings/update | grep -x 303"
+    )
+    machine.wait_until_succeeds(
+        "systemctl is-failed --quiet claude-box-update.service", timeout=60
+    )
+
+    # mallory (not a claude-box user) must not be able to trigger an update.
+    machine.fail(
+        "su -s /bin/sh mallory -c '/run/wrappers/bin/sudo -n "
+        "/run/current-system/sw/bin/systemctl start --no-block claude-box-update.service'"
     )
   '';
 }

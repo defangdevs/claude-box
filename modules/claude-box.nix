@@ -33,14 +33,39 @@ let
   # sudoAllowlist so NoNewPrivileges + sudo rules see the same list.
   caddyReloadCmd = "/run/current-system/sw/bin/systemctl reload caddy.service";
   updateStartCmd = "/run/current-system/sw/bin/systemctl start claude-box-update.service";
+  # --no-block variant for the settings page's Update button: the daemon must
+  # answer the HTTP request before the rebuild (possibly) restarts the daemon
+  # itself. A separate literal because sudoers matches argv exactly.
+  updateStartNoBlockCmd = "/run/current-system/sw/bin/systemctl start --no-block claude-box-update.service";
   effectiveSudoAllowlist =
     cfg.sudoAllowlist
     ++ lib.optional cfg.web.enable caddyReloadCmd
-    ++ lib.optional cfg.selfUpdate.enable updateStartCmd;
+    ++ lib.optionals cfg.selfUpdate.enable [ updateStartCmd updateStartNoBlockCmd ];
+  # Agent CLIs (claude-code, codex) move much faster than any host channel.
+  # When the host wires selfUpdate.agentNixpkgs (from the pin file the update
+  # service maintains — see that option), resolve just the agent packages from
+  # that pinned nixos-unstable snapshot; the rest of the system stays on the
+  # host nixpkgs. Hydra builds unstable, so this is a binary substitution, not
+  # a local compile. Null (fresh box, or wiring absent) falls back to host
+  # pkgs, so eval never breaks.
+  agentPkgs =
+    if cfg.selfUpdate.agentNixpkgs != null then
+      import (builtins.fetchTarball {
+        url = cfg.selfUpdate.agentNixpkgs.url;
+        sha256 = cfg.selfUpdate.agentNixpkgs.sha256;
+      }) {
+        system = pkgs.stdenv.hostPlatform.system;
+        # The host's allowUnfreePredicate does not reach a second nixpkgs
+        # import; allow exactly the bundled agent packages (mirrors the
+        # host-side default set below).
+        config.allowUnfreePredicate = pkg:
+          builtins.elem (lib.getName pkg) [ "claude-code" "codex" ];
+      }
+    else pkgs;
   agentPackage = agent:
     if cfg.package != null then cfg.package
-    else if agent == "claude" then pkgs.claude-code
-    else pkgs.codex;
+    else if agent == "claude" then agentPkgs.claude-code
+    else agentPkgs.codex;
   agentDisplayName = agent:
     if agent == "claude" then "Claude Code"
     else "Codex";
@@ -326,9 +351,13 @@ in
       enable = lib.mkEnableOption ''
         an agent-triggerable self-update service. When enabled, every agent
         user's sudo allowlist gains exactly
-        `systemctl start claude-box-update.service` — a root oneshot that
-        fast-forwards the box to the upstream repo's latest default-branch
-        commit by rewriting `pinFile` and running `nixos-rebuild switch`.
+        `systemctl start claude-box-update.service` (plus its --no-block
+        variant, used by the settings page's Update button) — a root oneshot
+        that fast-forwards the box to the upstream repo's latest
+        default-branch commit by rewriting `pinFile` (and, when agentNixpkgs
+        is wired, advances `agentPinFile` to the latest nixos-unstable
+        channel release so agent CLIs stay fresh) and running
+        `nixos-rebuild switch`.
         The privilege boundary is trigger-only: no arguments, environment or
         paths cross sudo; the update source and logic are fixed in the unit.
         NOTE: the rebuild restarts agent services, so running sessions die —
@@ -365,6 +394,45 @@ in
           import the module at exactly this pin when the file exists (see
           aws/template.yaml for the reference wiring); otherwise the update
           rebuilds against a stale module and silently no-ops.
+        '';
+      };
+
+      agentNixpkgs = lib.mkOption {
+        type = lib.types.nullOr (lib.types.submodule {
+          options = {
+            url = lib.mkOption {
+              type = lib.types.str;
+              example = "https://releases.nixos.org/nixos/unstable/nixos-25.11pre850000.abcdef123456/nixexprs.tar.xz";
+              description = "Channel-release tarball of the nixpkgs snapshot to resolve agent CLIs from.";
+            };
+            sha256 = lib.mkOption {
+              type = lib.types.str;
+              description = "nix-prefetch-url --unpack hash of `url`.";
+            };
+          };
+        });
+        default = null;
+        description = ''
+          A second, faster-moving nixpkgs snapshot (a nixos-unstable
+          channel-release tarball) that only the agent CLI packages
+          (claude-code, codex) are resolved from — the rest of the system
+          stays on the host's own nixpkgs. When null, agent packages come
+          from the module's regular `pkgs`. The update service advances this
+          pin by rewriting `agentPinFile`; the host configuration must import
+          that file when it exists and wire it back into this option (same
+          pathExists dance as pinFile — see aws/template.yaml). Kept as an
+          option rather than a file read inside the module so the module
+          stays pure for flake evaluation.
+        '';
+      };
+
+      agentPinFile = lib.mkOption {
+        type = lib.types.str;
+        default = "/etc/nixos/claude-box-agent-pin.nix";
+        description = ''
+          File the updater atomically rewrites with
+          `{ url = "..."; sha256 = "..."; }` — the latest nixos-unstable
+          channel release, feeding agentNixpkgs on the next eval.
         '';
       };
     };
@@ -520,11 +588,12 @@ in
     systemd.services.claude-box-update = {
       description = "Fast-forward claude-box to upstream HEAD and rebuild";
       # No wantedBy — on-demand only, via the agents' sudo rule (or root).
-      path = [ pkgs.curl pkgs.jq pkgs.openssl pkgs.coreutils pkgs.util-linux ];
+      path = [ pkgs.curl pkgs.jq pkgs.openssl pkgs.coreutils pkgs.util-linux pkgs.nix ];
       environment = {
         REPO = cfg.selfUpdate.repo;
         CURRENT_REV = cfg.selfUpdate.rev;
         PIN_FILE = cfg.selfUpdate.pinFile;
+        AGENT_PIN_FILE = cfg.selfUpdate.agentPinFile;
         # nixos-rebuild resolves <nixpkgs> via NIX_PATH, which systemd units
         # don't inherit; point it at root's channel (the NixOS AMI default).
         NIX_PATH = "nixpkgs=/nix/var/nix/profiles/per-user/root/channels/nixos:nixos-config=/etc/nixos/configuration.nix";
@@ -534,44 +603,84 @@ in
         set -euo pipefail
         api() { curl -fsSL -H 'Accept: application/vnd.github+json' "$1"; }
 
+        # --- what would change? -----------------------------------------
         target="$(api "https://api.github.com/repos/$REPO/commits/HEAD" | jq -r .sha)"
+        update_module=1
         if [ "$target" = "$CURRENT_REV" ]; then
-          echo "already at upstream HEAD ($target)"
+          update_module=0
+        else
+          # Fast-forward only: a target that isn't strictly ahead of the
+          # running rev means upstream history was rewritten or an older
+          # (possibly vulnerable) rev is being replayed — refuse both.
+          status="$(api "https://api.github.com/repos/$REPO/compare/$CURRENT_REV...$target" | jq -r .status)"
+          if [ "$status" != "ahead" ]; then
+            echo "refusing update: $target is '$status' of running rev $CURRENT_REV (need fast-forward)" >&2
+            exit 1
+          fi
+        fi
+
+        # Agent CLI pin: latest nixos-unstable channel release.
+        # channels.nixos.org redirects to the immutable releases.nixos.org
+        # URL — pin that, so the pin file stays reproducible.
+        release="$(curl -fsSLo /dev/null -w '%{url_effective}' https://channels.nixos.org/nixos-unstable)"
+        tarball="''${release%/}/nixexprs.tar.xz"
+        update_agent=1
+        if [ -e "$AGENT_PIN_FILE" ] && grep -qF "$tarball" "$AGENT_PIN_FILE"; then
+          update_agent=0
+        fi
+
+        if [ "$update_module" = 0 ] && [ "$update_agent" = 0 ]; then
+          echo "already current: module at $target, agent nixpkgs at $release"
           exit 0
         fi
 
-        # Fast-forward only: a target that isn't strictly ahead of the
-        # running rev means upstream history was rewritten or an older
-        # (possibly vulnerable) rev is being replayed — refuse both.
-        status="$(api "https://api.github.com/repos/$REPO/compare/$CURRENT_REV...$target" | jq -r .status)"
-        if [ "$status" != "ahead" ]; then
-          echo "refusing update: $target is '$status' of running rev $CURRENT_REV (need fast-forward)" >&2
-          exit 1
+        # --- write the pins (with backups, so failure rolls back exactly
+        # what this run changed) ------------------------------------------
+        if [ "$update_module" = 1 ]; then
+          module="$(mktemp)"
+          trap 'rm -f "$module"' EXIT
+          curl -fsSL "https://raw.githubusercontent.com/$REPO/$target/modules/claude-box.nix" -o "$module"
+          sha="sha256-$(openssl dgst -sha256 -binary "$module" | base64)"
+          if [ -e "$PIN_FILE" ]; then
+            cp "$PIN_FILE" "$PIN_FILE.prev"
+          fi
+          printf '{ rev = "%s"; sha256 = "%s"; }\n' "$target" "$sha" > "$PIN_FILE.tmp"
+          mv "$PIN_FILE.tmp" "$PIN_FILE"
         fi
 
-        module="$(mktemp)"
-        trap 'rm -f "$module"' EXIT
-        curl -fsSL "https://raw.githubusercontent.com/$REPO/$target/modules/claude-box.nix" -o "$module"
-        sha="sha256-$(openssl dgst -sha256 -binary "$module" | base64)"
-
-        if [ -e "$PIN_FILE" ]; then
-          cp "$PIN_FILE" "$PIN_FILE.prev"
+        if [ "$update_agent" = 1 ]; then
+          # nix-prefetch-url --unpack both hashes the tarball and pre-warms
+          # the store path fetchTarball wants, so the rebuild that follows
+          # doesn't download it a second time.
+          agent_sha="$(nix-prefetch-url --unpack "$tarball")"
+          if [ -e "$AGENT_PIN_FILE" ]; then
+            cp "$AGENT_PIN_FILE" "$AGENT_PIN_FILE.prev"
+          fi
+          printf '{ url = "%s"; sha256 = "%s"; }\n' "$tarball" "$agent_sha" > "$AGENT_PIN_FILE.tmp"
+          mv "$AGENT_PIN_FILE.tmp" "$AGENT_PIN_FILE"
         fi
-        printf '{ rev = "%s"; sha256 = "%s"; }\n' "$target" "$sha" > "$PIN_FILE.tmp"
-        mv "$PIN_FILE.tmp" "$PIN_FILE"
 
-        wall "claude-box: updating to $REPO@$target — agent sessions will restart if their services changed." || true
+        wall "claude-box: updating (module: $REPO@$target, agent nixpkgs: $release) — agent sessions will restart if their services changed." || true
         if /run/current-system/sw/bin/nixos-rebuild switch; then
           wall "claude-box: update to $target applied." || true
         else
-          # Roll the pin back so the next trigger retries cleanly instead of
-          # believing the failed rev is current.
-          if [ -e "$PIN_FILE.prev" ]; then
-            mv "$PIN_FILE.prev" "$PIN_FILE"
-          else
-            rm -f "$PIN_FILE"
+          # Roll back exactly the pins this run touched so the next trigger
+          # retries cleanly instead of believing the failed state is current.
+          if [ "$update_module" = 1 ]; then
+            if [ -e "$PIN_FILE.prev" ]; then
+              mv "$PIN_FILE.prev" "$PIN_FILE"
+            else
+              rm -f "$PIN_FILE"
+            fi
           fi
-          wall "claude-box: update to $target FAILED — pin rolled back, system unchanged. See: journalctl -u claude-box-update" || true
+          if [ "$update_agent" = 1 ]; then
+            if [ -e "$AGENT_PIN_FILE.prev" ]; then
+              mv "$AGENT_PIN_FILE.prev" "$AGENT_PIN_FILE"
+            else
+              rm -f "$AGENT_PIN_FILE"
+            fi
+          fi
+          wall "claude-box: update to $target FAILED — pins rolled back, system unchanged. See: journalctl -u claude-box-update" || true
           exit 1
         fi
       '';
@@ -663,6 +772,9 @@ in
         TMUX_SESSION = os.environ.get("CLAUDE_BOX_TMUX_SESSION", "main")
         TMUX_TMPDIR = os.environ.get("CLAUDE_BOX_TMUX_TMPDIR", "")
         TMUX_BIN = os.environ.get("CLAUDE_BOX_TMUX_BIN", "tmux")
+        # Full sudo command line that triggers the box update (issue 54). Empty
+        # when selfUpdate is off, which hides the Update card and 404s the route.
+        UPDATE_CMD = os.environ.get("CLAUDE_BOX_UPDATE_CMD", "")
 
         # Env var names: POSIX-ish. Must start with a letter or underscore and
         # contain only letters, digits, underscores. This is what a shell / systemd
@@ -771,6 +883,23 @@ in
                 sys.stderr.write("restart_agent: %s\n" % exc)
 
 
+        def update_box():
+            """Trigger the box update oneshot via the allowlisted sudo command.
+            --no-block (baked into UPDATE_CMD) means this returns immediately;
+            the rebuild may later restart this very daemon.
+            """
+            try:
+                proc = subprocess.run(
+                    UPDATE_CMD.split(),
+                    check=False,
+                    capture_output=True,
+                )
+                # rc only — never log request bodies or command output wholesale.
+                sys.stderr.write("update_box: trigger rc=%d\n" % proc.returncode)
+            except OSError as exc:
+                sys.stderr.write("update_box: %s\n" % exc)
+
+
         PAGE = """<!doctype html>
         <html lang="en">
         <meta charset="utf-8">
@@ -846,9 +975,22 @@ in
               <button type="submit" class="danger">Restart agent</button>
             </form>
           </div>
+          {update}
         </main>
         </html>
         """
+
+        UPDATE_CARD = """<div class="card">
+            <h2 style="font-size:16px;margin-top:0">Update box</h2>
+            <p class="note">Fetches the latest claude-box release and the newest
+            agent CLI versions, then rebuilds the system. Takes a few minutes.
+            <strong>The agent session restarts if its software changed</strong> —
+            unsaved in-flight work is lost.</p>
+            <form method="post" action="{base}/update"
+                  onsubmit="return confirm('Update the box now? This rebuilds the system and may restart the agent session.');">
+              <button type="submit" class="danger">Update box</button>
+            </form>
+          </div>"""
 
 
         def render_keys(keys):
@@ -874,6 +1016,7 @@ in
                 base=html.escape(BASE),
                 keys=render_keys(read_keys()),
                 message=msg_html,
+                update=UPDATE_CARD.format(base=html.escape(BASE)) if UPDATE_CMD else "",
             )
 
 
@@ -914,6 +1057,8 @@ in
                         "saved": "Key saved. Restart the agent to apply.",
                         "deleted": "Key deleted. Restart the agent to apply.",
                         "restarted": "Agent restart requested.",
+                        "update": "Box update started — the system rebuilds in the "
+                                  "background and this page may briefly go away.",
                     }.get(params["ok"][0], "")
                 self._send_html(render_page(message))
 
@@ -946,6 +1091,9 @@ in
                 elif path == BASE + "/restart":
                     restart_agent()
                     self._redirect("ok=restarted")
+                elif path == BASE + "/update" and UPDATE_CMD:
+                    update_box()
+                    self._redirect("ok=update")
                 else:
                     self._send_html("<h1>404</h1>", status=404)
 
@@ -1317,6 +1465,10 @@ in
           CLAUDE_BOX_TMUX_SESSION = tmuxSessionName;
           CLAUDE_BOX_TMUX_TMPDIR = "/run/${runtimeDirectory name}";
           CLAUDE_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
+        } // lib.optionalAttrs cfg.selfUpdate.enable {
+          # --no-block so the daemon's HTTP response goes out before the
+          # rebuild (possibly) restarts the daemon itself.
+          CLAUDE_BOX_UPDATE_CMD = "/run/wrappers/bin/sudo -n ${updateStartNoBlockCmd}";
         };
         serviceConfig = {
           User = name;
@@ -1335,7 +1487,12 @@ in
           RestrictSUIDSGID = true;
           RestrictRealtime = true;
           LockPersonality = true;
-          NoNewPrivileges = true;
+          # Setuid sudo needs privilege escalation, which NNP vetoes — same
+          # tradeoff the agent unit makes for its sudoAllowlist. The only
+          # extra power gained is the daemon user's own allowlist (the
+          # argument-free update trigger), so relax NNP only when selfUpdate
+          # is on.
+          NoNewPrivileges = !cfg.selfUpdate.enable;
         };
       }) terminalUsers);
 

@@ -456,6 +456,16 @@ Resources:
                   if builtins.pathExists /etc/nixos/claude-box-pin.nix
                   then import /etc/nixos/claude-box-pin.nix
                   else { rev = "${ClaudeBoxRev}"; sha256 = "${ClaudeBoxSha256}"; };
+                # Agent-CLI pin: a nixos-unstable channel-release snapshot that
+                # only the agent packages (claude-code, codex) resolve from.
+                # Absent on first boot (agents ship from the module's own
+                # nixpkgs); claude-box-update.service writes it on the first
+                # update, after which agent CLIs track nixos-unstable instead
+                # of the AMI's release channel.
+                agentPin =
+                  if builtins.pathExists /etc/nixos/claude-box-agent-pin.nix
+                  then import /etc/nixos/claude-box-agent-pin.nix
+                  else null;
                 # raw.githubusercontent.com is dual-stack (has AAAA); github.com
                 # is IPv4-only, so an IPv6-only box would need NAT64 for it.
                 # The module is a single file, so no tarball unpack needed.
@@ -490,6 +500,7 @@ Resources:
                   selfUpdate = {
                     enable = true;
                     rev = pin.rev;
+                    agentNixpkgs = agentPin;
                   };
                 };
 
