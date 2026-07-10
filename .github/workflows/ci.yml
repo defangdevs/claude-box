@@ -60,3 +60,8 @@ jobs:
           sudo udevadm trigger --name-match=kvm
       - name: Run web fail2ban VM test
         run: nix build -L .#checks.x86_64-linux.web-fail2ban
+
+      # Interactive VM test: an agent user adds a virtual host at runtime by
+      # writing a snippet to ~/sites/ and reloading caddy — no rebuild.
+      - name: Run self-serve domain VM test
+        run: nix build -L .#checks.x86_64-linux.self-serve-domain

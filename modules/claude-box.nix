@@ -145,10 +145,10 @@ let
           browser terminal for this user.
 
           Each terminal's ttyd gets a localhost port assigned in sorted
-          user-name order starting at 7681. The seeded Caddyfile is written
-          once and then hand-maintained, so if you add or remove web users
-          later, update /var/lib/caddy/Caddyfile yourself — check the
-          assigned ports with `systemctl cat claude-web-terminal-<user>`.
+          user-name order starting at 7681. The top-level Caddyfile is
+          module-managed, so adding/removing terminal users is a
+          nixos-rebuild away — check the assigned ports with
+          `systemctl cat claude-web-terminal-<user>`.
         '';
       };
     };
@@ -250,9 +250,11 @@ in
         browser terminals (one ttyd per user with web.passwordHashFile set)
         fronted by Caddy with basic-auth-to-cookie web auth — the basic-auth
         username is the linux user name, so logging in picks the terminal.
-        An unauthenticated picker page at / lists them. Also seeds a
-        hand-editable Caddyfile at /var/lib/caddy/Caddyfile so the agent
-        user can add virtual hosts without a nixos-rebuild
+        An unauthenticated picker page at / lists them. The top-level
+        Caddyfile is module-managed (regenerated every rebuild); each agent
+        user's own virtual hosts live in ~/sites/*.caddy (a symlink to
+        /var/lib/claude-box-sites/<user>/, which caddy can read) and land
+        with `sudo systemctl reload caddy.service`
       '';
 
       domain = lib.mkOption {
@@ -286,12 +288,11 @@ in
           (fail2ban jail watching Caddy's access log in the journal). Only
           counts requests that actually carried credentials, so the 401 a
           browser gets before showing the login prompt doesn't score against
-          visitors. Requires the terminal virtual host to have a `log`
-          directive — seeded Caddyfiles include it, but if you manage
-          /var/lib/caddy/Caddyfile by hand, add `log` to the block yourself
-          or the jail never sees failures. Whitelist trusted networks with
-          services.fail2ban.ignoreIP. Also brings fail2ban's default sshd
-          jail along.
+          visitors. The module-managed Caddyfile includes the `log` directive
+          the jail needs; per-user snippet files under ~/sites/ share the
+          same journal stream if they include `log` too. Whitelist trusted
+          networks with services.fail2ban.ignoreIP. Also brings fail2ban's
+          default sshd jail along.
         '';
       };
     };
@@ -344,7 +345,12 @@ in
         # NOTE: `path` entries go through makeBinPath, which appends /bin —
         # so list the profile ROOT, not its bin dir ('.../bin' became the
         # nonexistent '.../bin/bin' and silently dropped nix-profile tools).
-        path = [ "/home/${name}/.nix-profile" agent.package pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ] ++ cfg.extraPackages;
+        # /run/wrappers is added when the agent has any sudo allowlist entries,
+        # so the setuid `sudo` wrapper (which lives at /run/wrappers/bin/sudo,
+        # NOT on the default systemd unit PATH) resolves in agent tool shells.
+        path = [ "/home/${name}/.nix-profile" agent.package pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ]
+          ++ cfg.extraPackages
+          ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers";
         # TMUX_TMPDIR puts the control socket under the /run RuntimeDirectory
         # below instead of /tmp. PrivateTmp (in serviceConfig) gives this unit a
         # PRIVATE /tmp, so a socket there would be invisible to the separate
@@ -494,13 +500,38 @@ in
         }
       '';
 
-      # Rendered seed for /var/lib/caddy/Caddyfile (first boot only, see the
-      # activation script below). Safe in the world-readable store: it holds
+      # Rendered Caddyfile. Module-managed (regenerated every rebuild) — safe
+      # to keep in the world-readable Nix store because it only holds
       # {$ENV} placeholders, never secrets.
-      seedCaddyfile = pkgs.writeText "claude-box-caddyfile-seed" (''
-        # Edit me. Reload with: sudo systemctl reload caddy.service
-        # Add another host by copying a block and updating the hostname.
-        # New hosts get a Let's Encrypt cert on first request (TLS-ALPN-01).
+      #
+      # Self-serve extension point: the trailing `import` picks up per-user
+      # snippet files. Each agent user has a caddy-readable directory at
+      # /var/lib/claude-box-sites/<user>/ symlinked from ~/sites, so the agent
+      # can add a virtual host by writing ~/sites/<something>.caddy and
+      # running `sudo systemctl reload caddy.service`. No nixos-rebuild
+      # needed. Snippets should REVERSE-PROXY to a localhost port rather than
+      # serve files from $HOME — caddy.service runs with ProtectHome=true and
+      # can't read /home. See the comment block at the top of the rendered
+      # file below (agents will read that from the running box).
+      managedCaddyfile = pkgs.writeText "claude-box-caddyfile" (''
+        # This file is module-managed by services.claude-box — edits here get
+        # OVERWRITTEN on the next nixos-rebuild. To add your own virtual host,
+        # drop a *.caddy snippet into ~/sites/ (which is a symlink into
+        # /var/lib/claude-box-sites/<you>/, a caddy-readable location) and
+        # reload with: sudo systemctl reload caddy.service
+        #
+        # Recommended snippet shape — reverse-proxy to a localhost port your
+        # agent runs, NOT `file_server /home/<you>/...`. caddy.service has
+        # ProtectHome=true, so it cannot read files under /home; use file_server
+        # only against a path outside /home (e.g. /var/lib/claude-box-sites/<you>/public):
+        #
+        #     foo.example.com {
+        #       import acme_alpn_only    # Let's Encrypt via TLS-ALPN-01
+        #       reverse_proxy 127.0.0.1:3000
+        #     }
+        #
+        # New hosts get a Let's Encrypt cert on first request as long as DNS
+        # for that hostname points at this box.
 
         (acme_alpn_only) {
           tls {
@@ -523,7 +554,13 @@ in
       + lib.concatMapStringsSep "\n" (name: indent "  " (terminalCaddyBlock name)) terminalUsers
       + "\n"
       + indent "  " pickerBlock
-      + "}\n");
+      + "}\n\n"
+      + ''
+        # Per-user snippet directory. Each agent user's ~/sites/ symlinks here.
+        # Adding a file below and running `sudo systemctl reload caddy.service`
+        # is the whole workflow — no nixos-rebuild required.
+        import /var/lib/claude-box-sites/*/*.caddy
+      '');
 
       # Reads each terminal user's (already-hashed) password from their
       # passwordHashFile, mints a persistent per-user cookie secret if
@@ -579,26 +616,36 @@ in
         }
       ];
 
-      # The agent edits /var/lib/caddy/Caddyfile directly (see the seed
-      # activation script below) and reloads Caddy via the sudo rule added to
-      # effectiveSudoAllowlist. `caddy` group has RW on the file by default.
-      users.users.${webUser}.extraGroups = [ "caddy" ];
+      # The top-level Caddyfile is module-managed (see managedCaddyfile above);
+      # each agent user's own virtual hosts live in per-user snippet files at
+      # /var/lib/claude-box-sites/<user>/*.caddy, symlinked into their $HOME
+      # as ~/sites/. Reload via the sudo rule added to effectiveSudoAllowlist.
 
       networking.firewall.allowedTCPPorts = [ 443 ];
 
       systemd.tmpfiles.rules = [
         "d /var/lib/claude-box-web 0700 root root - -"
         "d /run/claude-box-web 0700 root root - -"
-      ];
+        # Snippet dirs: parent is world-traversable so caddy (primary group
+        # `caddy`) can reach the per-user subdirectories, which are 0750
+        # <user>:caddy — the user writes, caddy reads, other agent users on
+        # the box can't peek. Kept OUTSIDE /var/lib/claude-box-web (0700) so
+        # caddy's `import` can traverse without loosening the secrets dir.
+        "d /var/lib/claude-box-sites 0755 root root - -"
+      ] ++ lib.concatMap (name: [
+        "d /var/lib/claude-box-sites/${name} 0750 ${name} caddy - -"
+        # ~/sites -> the caddy-readable snippet dir. L+ replaces a stale
+        # symlink/file if the target differs from ours (idempotent across
+        # renames). Users edit through this link and never touch /var/lib.
+        "L+ /home/${name}/sites - - - - /var/lib/claude-box-sites/${name}"
+      ]) (lib.attrNames cfg.users);
 
       services.caddy = {
         enable = true;
-        # Hand-editable Caddyfile: the module seeds it on first boot but
-        # never overwrites it. Adding a virtual host is `edit + sudo reload`;
-        # no nixos-rebuild needed. The tradeoff vs services.caddy.virtualHosts
-        # is that Nix no longer owns the config — declarative changes to the
-        # file need a nixos-rebuild-plus-hand-edit cycle to land.
-        configFile = "/var/lib/caddy/Caddyfile";
+        # Module-managed. Store path is world-readable but holds only ENV
+        # placeholders, no secrets. Per-user extensions land via the trailing
+        # `import /var/lib/claude-box-sites/*/*.caddy`.
+        configFile = managedCaddyfile;
       };
 
       # Brute-force protection: count 401s on the terminal vhost that carried
@@ -621,21 +668,6 @@ in
           };
         };
       };
-
-      # First-boot only: drop in a Caddyfile with the terminal virtual host
-      # (rendered above) and a comment explaining how to add more. If the file
-      # already exists (e.g. a local box with its own hand-crafted blocks),
-      # leave it alone.
-      # stringAfter users/groups: unordered snippets sort alphabetically, so a
-      # plain .text ran BEFORE the caddy user existed on a fresh box and the
-      # chown failed, failing activation. /var/lib/caddy must be created here
-      # too — Caddy's StateDirectory= only makes it at first service start.
-      system.activationScripts.claude-box-caddyfile-seed = lib.stringAfter [ "users" "groups" ] ''
-        if [ ! -s /var/lib/caddy/Caddyfile ]; then
-          install -d -m 0755 -o caddy -g caddy /var/lib/caddy
-          install -m 0664 -o caddy -g caddy ${seedCaddyfile} /var/lib/caddy/Caddyfile
-        fi
-      '';
 
       # ttyd per terminal user — attaches to that user's tmux session over an
       # internal port; --base-path keeps each terminal (and its /ws endpoint)

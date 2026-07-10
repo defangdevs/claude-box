@@ -2,10 +2,10 @@
 # terminal's basic auth gets banned at the firewall, while credential-less
 # 401s (what a browser gets before showing the password prompt) don't count.
 #
-# Pass to pkgs.testers.runNixOSTest. Uses a pre-seeded Caddyfile with
-# `tls internal` (no ACME in the sandbox); the module's seed skips existing
-# files. Doesn't exercise ttyd — only caddy + fail2ban — so it stays green
-# even when ttyd is broken in nixpkgs.
+# Pass to pkgs.testers.runNixOSTest. lib.mkForce-overrides
+# services.caddy.configFile with a minimal `tls internal` file (no ACME in
+# the sandbox). Doesn't exercise ttyd — only caddy + fail2ban — so it stays
+# green even when ttyd is broken in nixpkgs.
 { claude-box }:
 {
   name = "claude-box-web-fail2ban";
@@ -41,11 +41,10 @@
       fi
     '';
 
-    # Pre-seed the Caddyfile with tls internal before the module's seed runs
-    # ("aaa..." sorts before "claude-box-caddyfile-seed"; both after users).
-    system.activationScripts.aaa-test-caddyfile = lib.stringAfter [ "users" "groups" ] ''
-      install -d -m 0755 -o caddy -g caddy /var/lib/caddy
-      cat > /var/lib/caddy/Caddyfile <<'EOF'
+    # Swap the module-managed Caddyfile for a minimal `tls internal` one; the
+    # sandbox has no ACME. Same env placeholder the module wires up, so the
+    # claude-web-auth-secrets prep still feeds this vhost.
+    services.caddy.configFile = lib.mkForce (pkgs.writeText "Caddyfile" ''
       box.test {
         log
         tls internal
@@ -56,9 +55,7 @@
           respond "ok" 200
         }
       }
-      EOF
-      chown caddy:caddy /var/lib/caddy/Caddyfile
-    '';
+    '');
   };
 
   nodes.client = { pkgs, ... }: {
