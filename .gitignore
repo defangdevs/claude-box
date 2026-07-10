@@ -1,2 +1,2 @@
-result
-result-*
+__pycache__/
+tests/e2e/test-results/

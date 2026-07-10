@@ -11,7 +11,9 @@
 # Like the other tests, lib.mkForce-swaps the module Caddyfile for a minimal
 # `tls internal` one (no ACME in the sandbox) that keeps the same
 # cookie-or-basic-auth gate and reverse-proxies /agent/settings* to the
-# settings daemon's port (7781, the settings base for the first terminal user).
+# settings daemon's unix socket (issue #49). Also asserts the socket's
+# permission story: 0660 agent:caddy, other local users get EACCES, and
+# nothing listens on TCP anymore.
 { claude-box }:
 {
   name = "claude-box-settings-page";
@@ -20,6 +22,12 @@
   nodes.machine = { pkgs, lib, ... }: {
     imports = [ claude-box ];
     virtualisation.memorySize = 2048;
+    environment.systemPackages = [ pkgs.curl ];
+    # A second, unrelated local user: must NOT be able to reach agent's
+    # settings daemon (issue #49).
+    users.users.mallory = {
+      isNormalUser = true;
+    };
     services.claude-box = {
       enable = true;
       agent = "claude";
@@ -48,7 +56,7 @@
     '';
 
     # Minimal `tls internal` Caddyfile that keeps the settings route's auth
-    # gate but proxies to the settings daemon port (7781). Same env
+    # gate but proxies to the settings daemon's unix socket. Same env
     # placeholder the module wires up, so claude-web-auth-secrets still feeds
     # this vhost.
     services.caddy.configFile = lib.mkForce (pkgs.writeText "Caddyfile" ''
@@ -60,7 +68,7 @@
             basic_auth bcrypt agent {
               agent {$WEB_PASSWORD_HASH_AGENT}
             }
-            reverse_proxy 127.0.0.1:7781
+            reverse_proxy unix//run/claude-box-settings/agent.sock
           }
         }
         handle {
@@ -86,6 +94,33 @@
     # Daemon runs AS the agent user (no root).
     machine.succeed(
         "systemctl show claude-box-settings-agent --property=User | grep -x 'User=agent'"
+    )
+
+    # Issue #49: the daemon listens ONLY on the systemd-owned unix socket —
+    # 0660 agent:caddy, no TCP listener for other local users to reach.
+    machine.succeed(
+        "stat -c '%U %G %a' /run/claude-box-settings/agent.sock | grep -x 'agent caddy 660'"
+    )
+    machine.fail("ss -tln | grep -q ':7781'")
+
+    sock_curl = "curl -s --max-time 10 --unix-socket /run/claude-box-settings/agent.sock"
+
+    # The owning user can talk to its own daemon over the socket...
+    machine.succeed(
+        f"su -s /bin/sh agent -c '{sock_curl} http://localhost/agent/settings/' "
+        "| grep -q 'Settings for agent'"
+    )
+    # ...another local user gets permission denied — cannot list, write, or
+    # restart. (Before the fix, all three worked over 127.0.0.1:7781.)
+    machine.fail(
+        f"su -s /bin/sh mallory -c '{sock_curl} http://localhost/agent/settings/'"
+    )
+    machine.fail(
+        f"su -s /bin/sh mallory -c '{sock_curl} -d key=PWNED -d value=x "
+        "http://localhost/agent/settings/set'"
+    )
+    machine.fail(
+        f"su -s /bin/sh mallory -c '{sock_curl} -X POST http://localhost/agent/settings/restart'"
     )
 
     # Unauthenticated request to the settings path is rejected (401).

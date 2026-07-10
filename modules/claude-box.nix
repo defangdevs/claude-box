@@ -14,13 +14,16 @@ let
   tmuxSocketName = "agent-box";
   tmuxSessionName = "main";
   runtimeDirectory = name: "agent-box-${name}";
-  # Port bases for the two per-user localhost daemons. Each is assigned in
-  # sorted user-name order (see terminalUsers below). Kept far apart and
-  # explicit — per this repo's explicit-over-implied-config convention — so
-  # the ttyd list (7681+) and the settings-daemon list (7781+) can never
-  # collide even with dozens of terminal users.
+  # ttyd port base; ports are assigned in sorted user-name order (see
+  # terminalUsers below).
   ttydPortBase = 7681;
-  settingsPortBase = 7781;
+  # The settings daemon listens on a per-user UNIX socket, not localhost TCP:
+  # a 127.0.0.1 port is reachable by EVERY local user (issue #49 — on a
+  # multi-agent box, codex could rewrite claude's keys and restart claude's
+  # agent). systemd creates each socket 0660 <user>:caddy, so only that user
+  # and the caddy reverse-proxy can connect.
+  settingsSocketDir = "/run/claude-box-settings";
+  settingsSocketOf = name: "${settingsSocketDir}/${name}.sock";
   # The per-user secrets file the settings page (issue #36) manages. User-
   # owned, 0600, loaded (optionally) by the agent unit's EnvironmentFile.
   userEnvFile = name: "/home/${name}/.config/claude-box/env";
@@ -580,9 +583,6 @@ in
       # port assignment below depends on that order being deterministic.
       terminalUsers = lib.filter (n: cfg.users.${n}.web.passwordHashFile != null) (lib.attrNames cfg.users);
       portOf = lib.listToAttrs (lib.imap0 (i: n: lib.nameValuePair n (ttydPortBase + i)) terminalUsers);
-      # Settings daemon gets its own port per terminal user, same sorted
-      # order, on a disjoint base so it never collides with a ttyd port.
-      settingsPortOf = lib.listToAttrs (lib.imap0 (i: n: lib.nameValuePair n (settingsPortBase + i)) terminalUsers);
       # Public URL base path for a user's settings page (Caddy does not strip
       # a prefix, so the daemon matches this full path).
       settingsBaseOf = n: "/${n}/settings";
@@ -628,11 +628,18 @@ in
         # Deliberately Python-3-stdlib only: no third-party imports, so it stays
         # tiny and auditable and needs nothing beyond pkgs.python3.
         #
+        # Listening (issue #49): under the module, systemd socket-activates the
+        # daemon on a pre-bound unix socket (0660 <user>:caddy — only the user and
+        # the caddy reverse-proxy can connect; localhost TCP was reachable by every
+        # local user). Without LISTEN_FDS (dev rigs, e2e runs) it falls back to
+        # binding 127.0.0.1:$CLAUDE_BOX_SETTINGS_PORT itself.
+        #
         # Configuration comes from the environment (set by the systemd unit):
         #   CLAUDE_BOX_SETTINGS_USER      the linux user name (display only)
         #   CLAUDE_BOX_SETTINGS_ENV_FILE  path to the env file to manage
         #   CLAUDE_BOX_SETTINGS_BASE      URL base path, e.g. /alice/settings
-        #   CLAUDE_BOX_SETTINGS_PORT      TCP port to bind on 127.0.0.1
+        #   CLAUDE_BOX_SETTINGS_PORT      dev fallback TCP port on 127.0.0.1
+        #                                 (ignored when socket-activated)
         #   CLAUDE_BOX_TMUX_SOCKET        tmux -L socket name (e.g. agent-box)
         #   CLAUDE_BOX_TMUX_SESSION       tmux session name (e.g. main)
         #   CLAUDE_BOX_TMUX_TMPDIR        TMUX_TMPDIR the agent's socket lives under
@@ -642,6 +649,7 @@ in
         import http.server
         import os
         import re
+        import socket
         import subprocess
         import sys
         import tempfile
@@ -941,6 +949,13 @@ in
                 else:
                     self._send_html("<h1>404</h1>", status=404)
 
+            def address_string(self):
+                # AF_UNIX peers have no (host, port) client_address — the base class
+                # would IndexError on the empty string it gets instead.
+                if isinstance(self.client_address, tuple) and self.client_address:
+                    return super().address_string()
+                return "unix"
+
             def log_message(self, fmt, *args):
                 # Keep the journal quiet-ish; never log form bodies (would leak
                 # secrets). Only method + path + status, which BaseHTTPRequestHandler
@@ -948,9 +963,31 @@ in
                 sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
 
+        # Per the systemd socket-activation protocol, inherited listening sockets
+        # start at fd 3 (after stdin/stdout/stderr).
+        SD_LISTEN_FDS_START = 3
+
+
+        def make_server():
+            if int(os.environ.get("LISTEN_FDS", "0") or "0") >= 1:
+                # Socket-activated (the module's only mode, issue #49): adopt the
+                # unix socket systemd pre-bound with 0660 <user>:caddy permissions.
+                # bind_and_activate=False skips bind/listen; the placeholder address
+                # is never bound.
+                server = http.server.ThreadingHTTPServer(
+                    ("127.0.0.1", 0), Handler, bind_and_activate=False
+                )
+                server.socket = socket.socket(fileno=SD_LISTEN_FDS_START)
+                # server_bind() never ran; set the attributes it would have set.
+                server.server_name = "claude-box-settings"
+                server.server_port = 0
+                return server
+            # Dev fallback for LAN rigs / e2e runs outside the module.
+            return http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+
+
         def main():
-            server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-            server.serve_forever()
+            make_server().serve_forever()
 
 
         if __name__ == "__main__":
@@ -973,12 +1010,13 @@ in
         redir /${name} /${name}/
         # ${name}'s settings page (issue #36). Same auth surface as the
         # terminal (cookie-or-basic-auth, same user name), just a different
-        # upstream — the settings daemon on its own localhost port. More
-        # specific than /${name}/* below, so Caddy routes it here first.
+        # upstream — the settings daemon over its user+caddy-only unix socket
+        # (issue #49). More specific than /${name}/* below, so Caddy routes
+        # it here first.
         handle /${name}/settings* {
           @cookie_settings_${name} header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
           handle @cookie_settings_${name} {
-            reverse_proxy 127.0.0.1:${toString settingsPortOf.${name}}
+            reverse_proxy unix/${settingsSocketOf name}
           }
           handle {
             route {
@@ -986,7 +1024,7 @@ in
                 ${name} {$WEB_PASSWORD_HASH_${envName name}}
               }
               header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
-              reverse_proxy 127.0.0.1:${toString settingsPortOf.${name}}
+              reverse_proxy unix/${settingsSocketOf name}
             }
           }
         }
@@ -1176,6 +1214,11 @@ in
         # the box can't peek. Kept OUTSIDE /var/lib/claude-box-web (0700) so
         # caddy's `import` can traverse without loosening the secrets dir.
         "d /var/lib/claude-box-sites 0755 root root - -"
+        # Settings daemon sockets live here (issue #49). World-traversable is
+        # fine: the per-user socket files themselves are 0660 <user>:caddy
+        # (created by systemd, see systemd.sockets below), and connecting
+        # requires write permission on the socket file.
+        "d ${settingsSocketDir} 0755 root root - -"
       ] ++ lib.concatMap (name: [
         "d /var/lib/claude-box-sites/${name} 0750 ${name} caddy - -"
         # ~/sites -> the caddy-readable snippet dir. L+ replaces a stale
@@ -1254,9 +1297,13 @@ in
       # user (no root, no privilege boundary): it only writes that user's own
       # ~/.config/claude-box/env and kills that user's own tmux session. The
       # agent unit's Restart=always then reloads it with the fresh env.
+      # Listens via socket activation on the systemd-owned unix socket
+      # (issue #49) — the same-named .socket unit below; requires/after kept
+      # explicit per this repo's explicit-over-implied-config convention.
       // lib.listToAttrs (map (name: lib.nameValuePair "claude-box-settings-${name}" {
         description = "Per-user secrets settings page for ${name}";
-        after = [ "network-online.target" ];
+        after = [ "network-online.target" "claude-box-settings-${name}.socket" ];
+        requires = [ "claude-box-settings-${name}.socket" ];
         wants = [ "network-online.target" ];
         wantedBy = [ "multi-user.target" ];
         # TMUX_TMPDIR must match the agent unit's RuntimeDirectory so the
@@ -1266,7 +1313,6 @@ in
           CLAUDE_BOX_SETTINGS_USER = name;
           CLAUDE_BOX_SETTINGS_ENV_FILE = userEnvFile name;
           CLAUDE_BOX_SETTINGS_BASE = settingsBaseOf name;
-          CLAUDE_BOX_SETTINGS_PORT = toString settingsPortOf.${name};
           CLAUDE_BOX_TMUX_SOCKET = tmuxSocketName;
           CLAUDE_BOX_TMUX_SESSION = tmuxSessionName;
           CLAUDE_BOX_TMUX_TMPDIR = "/run/${runtimeDirectory name}";
@@ -1290,6 +1336,23 @@ in
           RestrictRealtime = true;
           LockPersonality = true;
           NoNewPrivileges = true;
+        };
+      }) terminalUsers);
+
+      # The settings daemon's listening sockets (issue #49). systemd (root)
+      # binds each unix socket with exact ownership BEFORE the daemon starts:
+      # 0660 <user>:caddy means only that user and the caddy reverse-proxy
+      # can connect — unlike the previous 127.0.0.1:<port> listener, which
+      # every local user could reach. The daemon adopts the socket through
+      # socket activation (LISTEN_FDS, fd 3).
+      systemd.sockets = lib.listToAttrs (map (name: lib.nameValuePair "claude-box-settings-${name}" {
+        description = "Settings page socket for ${name}";
+        wantedBy = [ "sockets.target" ];
+        socketConfig = {
+          ListenStream = settingsSocketOf name;
+          SocketUser = name;
+          SocketGroup = "caddy";
+          SocketMode = "0660";
         };
       }) terminalUsers);
     }
