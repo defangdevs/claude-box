@@ -418,12 +418,21 @@ Resources:
             - |
               { config, pkgs, lib, modulesPath, ... }:
               let
+                # Module pin. First boot uses the launch-time parameters; after
+                # that, claude-box-update.service (see selfUpdate below) owns
+                # the pin file and rewrites it to fast-forward the box, so the
+                # same configuration.nix keeps working across updates without
+                # being edited.
+                pin =
+                  if builtins.pathExists /etc/nixos/claude-box-pin.nix
+                  then import /etc/nixos/claude-box-pin.nix
+                  else { rev = "${ClaudeBoxRev}"; sha256 = "${ClaudeBoxSha256}"; };
                 # raw.githubusercontent.com is dual-stack (has AAAA); github.com
                 # is IPv4-only, so an IPv6-only box would need NAT64 for it.
                 # The module is a single file, so no tarball unpack needed.
                 claude-box-module = builtins.fetchurl {
-                  url = "https://raw.githubusercontent.com/defangdevs/claude-box/${ClaudeBoxRev}/modules/claude-box.nix";
-                  sha256 = "${ClaudeBoxSha256}";
+                  url = "https://raw.githubusercontent.com/defangdevs/claude-box/${!pin.rev}/modules/claude-box.nix";
+                  sha256 = pin.sha256;
                 };
                 hostname = "${WebHostname}";
                 webPassword = "${WebPassword}";
@@ -445,6 +454,13 @@ Resources:
                     enable = true;
                     domain = hostname;
                     user = "agent";
+                  };
+                  # Lets the agent update the box on request:
+                  #   sudo systemctl start claude-box-update.service
+                  # fast-forwards the pin above to upstream HEAD and rebuilds.
+                  selfUpdate = {
+                    enable = true;
+                    rev = pin.rev;
                   };
                 };
 
