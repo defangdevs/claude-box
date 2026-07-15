@@ -45,8 +45,11 @@
     # Provoke the incident: an unbounded allocator that on a swapless box
     # would livelock the whole VM. tail buffers all of /dev/zero in RAM;
     # transient unit so the hog is not a child of the test's own shell.
+    # Absolute path: transient units get systemd's default PATH
+    # (/usr/bin:/bin), which doesn't exist on NixOS.
     machine.execute(
-        "systemd-run --unit=memhog sh -c 'tail /dev/zero > /dev/null'"
+        "systemd-run --unit=memhog sh -c "
+        "'/run/current-system/sw/bin/tail /dev/zero > /dev/null'"
     )
 
     # earlyoom notices the pressure and SIGTERM/SIGKILLs the hog...
