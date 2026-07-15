@@ -117,7 +117,14 @@ Add the flake as an input and import the module:
     enable = true;
     agent = "claude"; # or "codex"
     users = {
-      alice = { };
+      # One account, several agents: sessions seed on FIRST BOOT only —
+      # afterwards add/remove them at runtime (see "Sessions" below).
+      alice = {
+        sessions = {
+          main   = { };                    # box default agent
+          review = { agent = "codex"; };
+        };
+      };
       bob   = { remoteControlName = "bob-box"; };
       coder = { agent = "codex"; };
       ci    = { skipPermissions = false; };   # keep approval prompts on
@@ -168,6 +175,38 @@ the session on a dialog that Remote Control can't answer.
   print `Login successful.`. If you're not sure the paste landed, that's
   by design; just Enter.
 
+## Sessions (any user can run any agent — no rebuild)
+
+A linux user account and an agent CLI are decoupled: each user runs one or
+more **sessions**, and each session is one agent (Claude Code or Codex) in
+its own tmux session, all supervised by that user's single hardened
+`claude-box-<name>.service`. All supported agent CLIs are installed
+regardless of what any session runs (`installAgents`).
+
+Sessions are **runtime data**. The Nix config above only seeds
+`~/.config/claude-box/sessions.json` on first boot; after that the file is
+authoritative and a rebuild never clobbers runtime changes. Create and
+destroy sessions as the user — no sudo, no `nixos-rebuild`:
+
+```bash
+claude-box-session ls                        # NAME AGENT STATE
+claude-box-session add review --agent codex  # starts within ~2s
+claude-box-session add scratch --cwd ~/proj -- --model opus
+claude-box-session restart review
+claude-box-session rm review                 # delist + kill
+```
+
+The settings page (web setups) has the same controls, and agents can spawn
+sibling sessions themselves (it's just a file edit on their own account —
+handy for "have Codex cross-check this").
+
+Attach locally with `tmux -L agent-box attach -t <session>` (see
+`TMUX_TMPDIR` note above). In the browser, the front page lists every
+session flat — one card per session — and deep-links via
+`https://<domain>/<user>/?arg=<session>`. Killed-on-error sessions keep a
+post-mortem shell open instead of being respawned over; delisted sessions
+stay gone.
+
 ## VM image
 
 Build from the same config:
@@ -206,10 +245,12 @@ All under `services.claude-box`:
 | `enable` | `false` | Turn the module on. |
 | `agent` | `"claude"` | Default agent CLI: `"claude"` or `"codex"`. |
 | `package` | selected agent default | Override package to run for every agent user. |
-| `users.<name>.agent` | `null` | Per-user override; null uses `services.claude-box.agent`. |
+| `installAgents` | all supported | Agent CLIs installed on the box (independent of what sessions run). |
+| `users.<name>.sessions.<s>.*` | `{}` | Seed sessions (first boot only): per session `agent`, `skipPermissions`, `remoteControl`, `remoteControlName`, `workingDirectory`, `extraArgs`. Empty = the legacy per-user options below seed a session named `main`. |
+| `users.<name>.agent` | `null` | Agent for the default `main` session; null uses `services.claude-box.agent`. |
 | `users.<name>.skipPermissions` | `true` | Pass the selected agent's autonomy flag. |
 | `users.<name>.remoteControl` | `true` | Pass Claude's `--remote-control` when `agent = "claude"`; ignored for Codex. |
-| `users.<name>.remoteControlName` | `<name>@<host>` | Claude Remote Control session name (null -> `<user>@<fqdnOrHostName>`, so you can tell boxes apart in the apps). Ignored for Codex. |
+| `users.<name>.remoteControlName` | `<name>@<host>` | Claude Remote Control session name (null -> `<user>@<fqdnOrHostName>` for `main`, `<user>-<session>@<fqdnOrHostName>` for other sessions). Ignored for Codex. |
 | `users.<name>.workingDirectory` | `/home/<name>` | Agent startup directory. |
 | `users.<name>.extraGroups` | `[]` | Extra groups for the user. |
 | `users.<name>.extraArgs` | `[]` | Extra args appended to the selected agent CLI. |

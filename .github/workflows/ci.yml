@@ -83,3 +83,10 @@ jobs:
       # while the box stays responsive.
       - name: Run memory protection VM test
         run: nix build -L .#checks.x86_64-linux.memory-protection
+
+      # Interactive VM test (issue 59): runtime session CRUD — seeded main
+      # session, claude-box-session add/rm as the user with no sudo and no
+      # rebuild, cgroup containment of runtime-created sessions, and the
+      # public names-only sessions.json feeding the flat picker.
+      - name: Run sessions VM test
+        run: nix build -L .#checks.x86_64-linux.sessions

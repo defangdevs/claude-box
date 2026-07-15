@@ -97,6 +97,15 @@
           memory-protection = pkgs.testers.runNixOSTest
             (import ./tests/memory-protection.nix { claude-box = self.nixosModules.claude-box; });
 
+          # Interactive VM test (issue #59): sessions are runtime data — the
+          # seeded "main" session starts, `claude-box-session add/rm` brings a
+          # second agent up and down as the user (no sudo, no rebuild), the
+          # runtime session lives inside the hardened unit's cgroup, and the
+          # settings daemon serves session CRUD plus the public names-only
+          # sessions.json that feeds the flat picker.
+          sessions = pkgs.testers.runNixOSTest
+            (import ./tests/sessions.nix { claude-box = self.nixosModules.claude-box; });
+
           # Regression guard (issue #51): deployed boxes fetch
           # modules/claude-box.nix as a SINGLE file — the CFN user-data and
           # claude-box-update.service both fetchurl just that path — so the

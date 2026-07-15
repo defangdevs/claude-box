@@ -20,7 +20,15 @@
     agent = "claude";
 
     users = {
-      alice = { };
+      # One account, two agents (issue 59): sessions are runtime data seeded
+      # from here on FIRST BOOT only — add/remove more later with
+      # `claude-box-session add/rm` or the settings page, no rebuild needed.
+      alice = {
+        sessions = {
+          main = { };                    # box default agent (claude)
+          review = { agent = "codex"; };
+        };
+      };
       bob = {
         remoteControlName = "bob-box";
       };

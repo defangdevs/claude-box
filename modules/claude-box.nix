@@ -12,7 +12,6 @@ let
   cfg = config.services.claude-box;
   supportedAgents = [ "claude" "codex" ];
   tmuxSocketName = "agent-box";
-  tmuxSessionName = "main";
   runtimeDirectory = name: "agent-box-${name}";
   # ttyd port base; ports are assigned in sorted user-name order (see
   # terminalUsers below).
@@ -66,44 +65,222 @@ let
     if cfg.package != null then cfg.package
     else if agent == "claude" then agentPkgs.claude-code
     else agentPkgs.codex;
-  agentDisplayName = agent:
-    if agent == "claude" then "Claude Code"
-    else "Codex";
-  agentCommand = name: u:
-    let
-      agent = if u.agent != null then u.agent else cfg.agent;
-      package = agentPackage agent;
-      sessionName =
-        if u.remoteControlName != null
-        then u.remoteControlName
-        else "${name}@${config.networking.fqdnOrHostName}";
-      autonomyArgs =
-        if !u.skipPermissions then [ ]
-        else if agent == "claude" then [ "--dangerously-skip-permissions" ]
-        else [ "--dangerously-bypass-approvals-and-sandbox" ];
-      remoteArgs =
-        if agent == "claude" && u.remoteControl
-        then [ "--remote-control" sessionName ]
-        else [ ];
-    in {
-      inherit agent package;
-      displayName = agentDisplayName agent;
-      command = lib.concatStringsSep " " (
-        [ (lib.escapeShellArg (lib.getExe package)) ]
-        ++ (map lib.escapeShellArg autonomyArgs)
-        ++ (map lib.escapeShellArg remoteArgs)
-        ++ (map lib.escapeShellArg u.extraArgs)
-      );
+  installedAgentPackages = map agentPackage cfg.installAgents;
+  # Sessions are RUNTIME data (issue #59): the Nix-declared
+  # users.<name>.sessions (or the legacy per-user agent/… options, which
+  # stand in for a single session named "main") only SEED
+  # ~/.config/claude-box/sessions.json on first boot. Afterwards the file is
+  # authoritative and sessions are created/destroyed WITHOUT a rebuild —
+  # via the claude-box-session CLI or the settings page. The supervisor
+  # (mkStart) reconciles tmux sessions against the file and builds each
+  # agent command at runtime, so per-agent flag logic lives in that script.
+  seedSessions = name: u:
+    if u.sessions != { } then u.sessions
+    else {
+      main = {
+        inherit (u) agent skipPermissions remoteControl remoteControlName extraArgs;
+        inherit (u) workingDirectory;
+      };
     };
+  sessionsSeedFile = name: u:
+    pkgs.writeText "claude-box-${name}-sessions.json" (builtins.toJSON {
+      version = 1;
+      sessions = lib.mapAttrs (sname: s: {
+        agent = if s.agent != null then s.agent else cfg.agent;
+        inherit (s) skipPermissions remoteControl extraArgs;
+        # null → the supervisor derives "<user>@<fqdn>" (main) or
+        # "<user>-<session>@<fqdn>" at start time.
+        remoteControlName = s.remoteControlName;
+        workingDirectory =
+          if s.workingDirectory != null then s.workingDirectory
+          else "/home/${name}";
+      }) (seedSessions name u);
+    });
+  userSessionsFile = name: "/home/${name}/.config/claude-box/sessions.json";
 
-  userOpts = { name, ... }: {
+  # Runtime session CRUD, shipped on every PATH. Runs as the calling agent
+  # user: edits the user-owned sessions.json (the supervisor reconciles
+  # within ~2s) and talks only to the user's own tmux server. No sudo, no
+  # rebuild — the whole point of issue #59.
+  sessionCli = pkgs.writeShellScriptBin "claude-box-session" ''
+    set -eu
+    JQ=${pkgs.jq}/bin/jq
+    FILE="$HOME/.config/claude-box/sessions.json"
+    AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " cfg.installAgents)}
+    DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
+    export TMUX_TMPDIR="''${TMUX_TMPDIR:-/run/agent-box-$USER}"
+
+    t() { ${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} "$@"; }
+    usage() {
+      echo "usage: claude-box-session ls"
+      echo "       claude-box-session add NAME [--agent AGENT] [--cwd DIR] [-- EXTRA_ARGS...]"
+      echo "       claude-box-session rm NAME"
+      echo "       claude-box-session restart NAME"
+      echo "agents: $AGENTS (default: $DEFAULT_AGENT)"
+      echo "Listed sessions are (re)started by the per-user supervisor within ~2s."
+      echo "Attach: tmux -L ${tmuxSocketName} attach -t NAME, or the browser terminal /<user>/?arg=NAME"
+    }
+    valid_name() {
+      case "$1" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
+    }
+    ensure_file() {
+      mkdir -p "$(dirname "$FILE")"
+      [ -s "$FILE" ] || printf '{"version":1,"sessions":{}}\n' > "$FILE"
+    }
+    jq_edit() {
+      # jq_edit JQ_ARGS... — atomically rewrite FILE through jq.
+      tmp="$(mktemp "$FILE.XXXXXX")"
+      if "$JQ" "$@" < "$FILE" > "$tmp"; then
+        mv "$tmp" "$FILE"
+      else
+        rm -f "$tmp"
+        exit 1
+      fi
+    }
+
+    cmd="''${1:-}"; shift || true
+    case "$cmd" in
+      ls)
+        live="$(t list-sessions -F '#S' 2>/dev/null || true)"
+        printf '%-24s %-8s %s\n' NAME AGENT STATE
+        if [ -s "$FILE" ]; then
+          "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?")] | @tsv' "$FILE" \
+          | while IFS="$(printf '\t')" read -r n a; do
+            state=starting
+            printf '%s\n' "$live" | grep -qxF "$n" && state=live
+            printf '%-24s %-8s %s\n' "$n" "$a" "$state"
+          done
+        fi
+        # Live tmux sessions nobody listed (started by hand): show, don't hide.
+        printf '%s\n' "$live" | while IFS= read -r n; do
+          [ -n "$n" ] || continue
+          if [ ! -s "$FILE" ] || ! "$JQ" -e --arg n "$n" '.sessions | has($n)' "$FILE" >/dev/null; then
+            printf '%-24s %-8s %s\n' "$n" '-' 'unmanaged'
+          fi
+        done
+        ;;
+      add)
+        name="''${1:-}"; shift || true
+        valid_name "$name" || { usage >&2; exit 2; }
+        agent="$DEFAULT_AGENT"; cwd=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --agent) agent="''${2:?--agent needs a value}"; shift 2 ;;
+            --cwd) cwd="''${2:?--cwd needs a value}"; shift 2 ;;
+            --) shift; break ;;
+            *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+          esac
+        done
+        case " $AGENTS " in
+          (*" $agent "*) ;;
+          (*) echo "agent '$agent' is not installed (installed: $AGENTS)" >&2; exit 2 ;;
+        esac
+        ensure_file
+        jq_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
+          '.sessions[$n] = {agent: $a, skipPermissions: true, remoteControl: true,
+                            remoteControlName: null,
+                            workingDirectory: (if $c == "" then null else $c end),
+                            extraArgs: $ARGS.positional}' \
+          --args "$@"
+        echo "session '$name' ($agent) added — the supervisor starts it within ~2s"
+        ;;
+      rm)
+        name="''${1:-}"
+        valid_name "$name" || { usage >&2; exit 2; }
+        ensure_file
+        jq_edit --arg n "$name" 'del(.sessions[$n])'
+        t kill-session -t "=$name" 2>/dev/null || true
+        echo "session '$name' removed"
+        ;;
+      restart)
+        name="''${1:-}"
+        valid_name "$name" || { usage >&2; exit 2; }
+        t kill-session -t "=$name"
+        echo "session '$name' killed — the supervisor restarts it within ~2s if still listed"
+        ;;
+      *)
+        usage >&2
+        exit 2
+        ;;
+    esac
+  '';
+
+  # One session = one agent CLI in one tmux session. These options are the
+  # FIRST-BOOT SEED only (see users.<name>.sessions); at runtime the same
+  # fields live as JSON in ~/.config/claude-box/sessions.json.
+  sessionOpts = {
     options = {
       agent = lib.mkOption {
         type = lib.types.nullOr (lib.types.enum supportedAgents);
         default = null;
         description = ''
-          Agent CLI to run for this user. When null, uses
-          services.claude-box.agent.
+          Agent CLI this session runs. When null, uses
+          services.claude-box.agent. Must be listed in
+          services.claude-box.installAgents.
+        '';
+      };
+      skipPermissions = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Pass the agent's autonomy flag (see users.<name>.skipPermissions).";
+      };
+      remoteControl = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Pass --remote-control (claude sessions only; see users.<name>.remoteControl).";
+      };
+      remoteControlName = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Remote Control session name. When null, defaults to
+          "<user>@<fqdnOrHostName>" for the session named "main" and
+          "<user>-<session>@<fqdnOrHostName>" otherwise.
+        '';
+      };
+      workingDirectory = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Directory the session's agent starts in. Null means the user's home.";
+      };
+      extraArgs = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "Extra arguments appended to this session's agent invocation.";
+      };
+    };
+  };
+
+  userOpts = { name, ... }: {
+    options = {
+      sessions = lib.mkOption {
+        type = lib.types.attrsOf (lib.types.submodule sessionOpts);
+        default = { };
+        example = lib.literalExpression ''{ main = { }; review = { agent = "codex"; }; }'';
+        description = ''
+          Seed sessions for this user — each is an agent CLI running in its
+          own tmux session under the user's single supervised service.
+          Session names must match [A-Za-z0-9_-]+.
+
+          Sessions are RUNTIME data: this option is written to
+          ~/.config/claude-box/sessions.json ONLY when that file does not
+          exist yet (first boot). Afterwards the file is authoritative, and
+          sessions are added/removed/restarted without a rebuild via the
+          claude-box-session CLI or the settings page. A later rebuild never
+          clobbers runtime changes.
+
+          When empty (the default), the per-user agent / skipPermissions /
+          remoteControl* / workingDirectory / extraArgs options below seed a
+          single session named "main" — the pre-sessions behaviour.
+        '';
+      };
+      agent = lib.mkOption {
+        type = lib.types.nullOr (lib.types.enum supportedAgents);
+        default = null;
+        description = ''
+          Agent CLI to run for this user's default "main" session. When
+          null, uses services.claude-box.agent. Ignored when
+          users.<name>.sessions is set (set the agent per session there).
         '';
       };
       skipPermissions = lib.mkOption {
@@ -228,9 +405,56 @@ let
     };
   };
 
+  # The per-user SUPERVISOR (issue #59). One hardened unit per user; the tmux
+  # server and every session — including ones added at runtime — are children
+  # of this script, so they all inherit the unit's systemd sandboxing. The
+  # loop is ensure-only: missing listed sessions are (re)created, but the
+  # supervisor never kills. Destroy goes through the CRUD paths
+  # (claude-box-session rm / settings page), which delist AND kill — so a
+  # removed entry stays gone, and an ad-hoc `tmux new` session is left alone.
   mkStart = name: u:
     let
-      agent = agentCommand name u;
+      home = "/home/${name}";
+      fqdn = config.networking.fqdnOrHostName;
+      agentBinCases = lib.concatMapStrings (a:
+        "          ${a}) printf '%s\\n' ${lib.escapeShellArg (lib.getExe (agentPackage a))} ;;\n"
+      ) cfg.installAgents;
+      # AGENTS.md — cross-vendor agent-instructions file (codex, opencode
+      # native; claude-code as CLAUDE.md fallback). Content lives in the Nix
+      # store so no in-shell quoting; $CLAUDE_BOX_URL and other $refs in the
+      # content stay literal for the agent to expand at read time. Seeded
+      # per session in start_session below.
+      agentsMdFile =
+        if u.agentsMd == null then null
+        else pkgs.writeText "claude-box-${name}-agents.md" u.agentsMd;
+    in
+    pkgs.writeShellScript "claude-box-${name}-start" ''
+      set -u
+      JQ=${pkgs.jq}/bin/jq
+      TMUX="${pkgs.tmux}/bin/tmux -L ${tmuxSocketName}"
+      SESSIONS_FILE=${lib.escapeShellArg (userSessionsFile name)}
+
+      # First boot only: seed the Nix-declared sessions. The file is RUNTIME
+      # data afterwards — a rebuild must never clobber sessions the user
+      # added or removed while the box was live.
+      mkdir -p ${home}/.config/claude-box
+      if [ ! -s "$SESSIONS_FILE" ]; then
+        install -m 0600 ${sessionsSeedFile name u} "$SESSIONS_FILE"
+      fi
+
+      seed_json() {
+        # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
+        # if missing. A file jq can't parse is left untouched: the dialog
+        # comes back, but the agent still starts.
+        file=$1; shift
+        [ -s "$file" ] || printf '{}' > "$file"
+        if $JQ "$@" "$file" > "$file.seed-tmp" 2>/dev/null; then
+          mv "$file.seed-tmp" "$file"
+        else
+          rm -f "$file.seed-tmp"
+        fi
+      }
+
       # Pre-accept claude-code's one-time startup dialogs. A fresh home
       # otherwise parks the session on interactive prompts — the folder-trust
       # dialog ("Is this a project you trust?") and, when running with
@@ -243,66 +467,93 @@ let
       # values seeded before first launch survive login/onboarding:
       #   ~/.claude.json          projects.<workdir>.hasTrustDialogAccepted
       #   ~/.claude/settings.json skipDangerousModePermissionPrompt
-      # Runs on every start (idempotent), which also covers upstream's
-      # occasional failure to persist an interactive acceptance
-      # (anthropics/claude-code issue 36403). Codex has no such dialogs.
-      seedClaudeState = ''
-        seed_json() {
-          # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
-          # if missing. A file jq can't parse is left untouched: the dialog
-          # comes back, but the agent still starts.
-          file=$1; shift
-          [ -s "$file" ] || printf '{}' > "$file"
-          if ${pkgs.jq}/bin/jq "$@" "$file" > "$file.seed-tmp" 2>/dev/null; then
-            mv "$file.seed-tmp" "$file"
-          else
-            rm -f "$file.seed-tmp"
-          fi
-        }
-        mkdir -p /home/${name}/.claude
-        seed_json /home/${name}/.claude.json --arg wd ${lib.escapeShellArg u.workingDirectory} \
+      # Runs before every claude session start (idempotent), which also
+      # covers upstream's occasional failure to persist an interactive
+      # acceptance (anthropics/claude-code issue 36403). Codex has no such
+      # dialogs. $1 = working directory, $2 = skipPermissions (true/false).
+      seed_claude_state() {
+        mkdir -p ${home}/.claude
+        seed_json ${home}/.claude.json --arg wd "$1" \
           '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})'
-        ${lib.optionalString u.skipPermissions ''
-          seed_json /home/${name}/.claude/settings.json \
+        if [ "$2" = true ]; then
+          seed_json ${home}/.claude/settings.json \
             '.skipDangerousModePermissionPrompt = true'
-        ''}
-      '';
-      # AGENTS.md — cross-vendor agent-instructions file (codex, opencode
-      # native; claude-code as CLAUDE.md fallback). Only seed if absent so
-      # the agent's own edits or a repo checkout in workingDirectory never
-      # get clobbered. Content lives in the Nix store so no in-shell
-      # quoting; $CLAUDE_BOX_URL and other $refs in the content stay
-      # literal for the agent to expand at read time.
-      agentsMdFile =
-        if u.agentsMd == null then null
-        else pkgs.writeText "claude-box-${name}-agents.md" u.agentsMd;
-      seedAgentsMd = lib.optionalString (agentsMdFile != null) ''
-        if [ ! -e ${lib.escapeShellArg "${u.workingDirectory}/AGENTS.md"} ]; then
-          mkdir -p ${lib.escapeShellArg u.workingDirectory}
-          install -m 0644 ${agentsMdFile} ${lib.escapeShellArg "${u.workingDirectory}/AGENTS.md"}
         fi
-      '';
-      # Every user-provided arg gets individually shell-escaped so a
-      # remoteControlName or extraArgs element containing whitespace or shell
-      # metacharacters can't inject into the tmux new-session command below.
-    in
-    pkgs.writeShellScript "claude-box-${name}-start" ''
-      set -u
-      ${lib.optionalString (agent.agent == "claude") seedClaudeState}
-      ${seedAgentsMd}
-      # Detached tmux session so a human can `tmux -L agent-box attach -t main`.
-      # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero agent exit;
-      # clean exits let the session die so systemd's Restart=always brings up
-      # a fresh agent. (Was `; exec bash`, which pinned the session forever.)
-      ${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} new-session -d -s main \
-        -c ${lib.escapeShellArg u.workingDirectory} \
-        ${lib.escapeShellArg (agent.command + " || exec ${pkgs.bashInteractive}/bin/bash")}
-      # Block ExecStart until the session actually goes away — a clean agent
-      # exit, the user typing `exit` in the post-mortem bash, someone
-      # `tmux kill-session`ing us, or ExecStop killing it. Type=exec + this
-      # supervising tail lets Restart=always distinguish "session died on its
-      # own" (restart) from "systemctl stop" (don't restart).
-      while ${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} has-session -t main 2>/dev/null; do
+      }
+
+      agent_bin() {
+        case "$1" in
+${agentBinCases}          *) return 1 ;;
+        esac
+      }
+
+      start_session() {
+        sname=$1
+        sjson="$($JQ -c --arg s "$sname" '.sessions[$s] // empty' "$SESSIONS_FILE")" || return 0
+        [ -n "$sjson" ] || return 0
+        agent="$($JQ -r '.agent // empty' <<<"$sjson")"
+        if ! bin="$(agent_bin "$agent")"; then
+          echo "session '$sname': agent '$agent' is not installed (see installAgents) — skipping" >&2
+          return 0
+        fi
+        wd="$($JQ -r '.workingDirectory // empty' <<<"$sjson")"
+        [ -n "$wd" ] || wd=${home}
+        skip="$($JQ -r 'if .skipPermissions == false then "false" else "true" end' <<<"$sjson")"
+        rc="$($JQ -r 'if .remoteControl == false then "false" else "true" end' <<<"$sjson")"
+        rcname="$($JQ -r '.remoteControlName // empty' <<<"$sjson")"
+        # Build the command with printf %q so runtime-provided fields
+        # (extraArgs, remoteControlName, cwd) can't inject into the tmux
+        # command line — the runtime equivalent of lib.escapeShellArg.
+        cmd="$(printf '%q' "$bin")"
+        if [ "$skip" = true ]; then
+          case "$agent" in
+            claude) cmd="$cmd --dangerously-skip-permissions" ;;
+            codex) cmd="$cmd --dangerously-bypass-approvals-and-sandbox" ;;
+          esac
+        fi
+        if [ "$agent" = claude ] && [ "$rc" = true ]; then
+          if [ -z "$rcname" ]; then
+            rcname="${name}@${fqdn}"
+            [ "$sname" = main ] || rcname="${name}-$sname@${fqdn}"
+          fi
+          cmd="$cmd --remote-control $(printf '%q' "$rcname")"
+        fi
+        while IFS= read -r xarg; do
+          cmd="$cmd $(printf '%q' "$xarg")"
+        done < <($JQ -r '.extraArgs // [] | .[]' <<<"$sjson")
+        if [ "$agent" = claude ]; then
+          # Upstream claude-code bug: the client persists only
+          # channelsEnabled to ~/.claude/remote-settings.json, losing the
+          # org's channel-plugin allowlist; the next launch trusts the stale
+          # cache and silently drops every channel notification. Clearing
+          # the cache before each claude launch forces a full policy fetch.
+          rm -f ${home}/.claude/remote-settings.json
+          seed_claude_state "$wd" "$skip"
+        fi
+${lib.optionalString (agentsMdFile != null) ''
+        # Seed AGENTS.md into the session's working directory IFF absent, so
+        # the agent's own edits or a repo checkout there never get clobbered.
+        if [ ! -e "$wd/AGENTS.md" ]; then
+          mkdir -p "$wd"
+          install -m 0644 ${agentsMdFile} "$wd/AGENTS.md"
+        fi
+''}        # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero agent
+        # exit — the dead session stays attachable for inspection and is NOT
+        # respawned over. A clean exit lets the session die; the reconcile
+        # loop below then starts a fresh agent within ~2s.
+        $TMUX new-session -d -s "$sname" -c "$wd" \
+          "$cmd || exec ${pkgs.bashInteractive}/bin/bash"
+      }
+
+      # Reconcile forever; systemd stop tears the whole tree down (ExecStop
+      # kill-server + cgroup kill), Restart=always revives a crashed loop.
+      while true; do
+        while IFS= read -r sname; do
+          case "$sname" in
+            (*[!A-Za-z0-9_-]*|"") continue ;;
+          esac
+          $TMUX has-session -t "=$sname" 2>/dev/null || start_session "$sname"
+        done < <($JQ -r '.sessions | keys[]' "$SESSIONS_FILE" 2>/dev/null)
         sleep 2
       done
     '';
@@ -322,6 +573,18 @@ in
       default = null;
       defaultText = lib.literalExpression ''null (pkgs.claude-code for agent = "claude"; pkgs.codex for agent = "codex")'';
       description = "Package to run for every agent user. Leave null to use the selected agent's default package.";
+    };
+
+    installAgents = lib.mkOption {
+      type = lib.types.listOf (lib.types.enum supportedAgents);
+      default = supportedAgents;
+      description = ''
+        Agent CLIs installed on the box — system PATH and every agent unit's
+        PATH — independently of what any session currently runs, so a
+        runtime `claude-box-session add --agent codex` needs no rebuild.
+        Sessions may only use agents listed here. Default: all supported
+        agents.
+      '';
     };
 
     users = lib.mkOption {
@@ -536,16 +799,33 @@ in
     assertions = [{
       assertion = cfg.users != { };
       message = "services.claude-box.enable is true but no users are defined in services.claude-box.users.";
-    }] ++ (lib.mapAttrsToList (name: u: {
-      # Cheap sanity check on the one string that lands verbatim in a shell
-      # command; deeper escaping happens in mkStart via lib.escapeShellArg.
-      assertion = u.remoteControlName == null || (
-        u.remoteControlName != ""
-        && !(lib.hasInfix "\n" u.remoteControlName)
-        && !(lib.hasInfix "\r" u.remoteControlName)
-      );
-      message = "services.claude-box.users.${name}.remoteControlName must be non-empty and free of newlines.";
-    }) cfg.users);
+    } {
+      assertion = cfg.installAgents != [ ];
+      message = "services.claude-box.installAgents must not be empty.";
+    }] ++ lib.concatLists (lib.mapAttrsToList (name: u:
+      lib.concatLists (lib.mapAttrsToList (sname: s: [
+        {
+          # Session names land in tmux -t targets, URLs and env-ish contexts;
+          # the same regex is enforced at runtime by the supervisor, the CLI
+          # and the settings daemon.
+          assertion = builtins.match "[A-Za-z0-9_-]+" sname != null;
+          message = "services.claude-box.users.${name}: session name \"${sname}\" must match [A-Za-z0-9_-]+.";
+        }
+        {
+          assertion = builtins.elem (if s.agent != null then s.agent else cfg.agent) cfg.installAgents;
+          message = "services.claude-box.users.${name}: session \"${sname}\" uses agent \"${if s.agent != null then s.agent else cfg.agent}\", which is not in services.claude-box.installAgents.";
+        }
+        {
+          # Cheap sanity check on a string that lands in a shell command;
+          # deeper escaping happens at runtime via printf %q in mkStart.
+          assertion = s.remoteControlName == null || (
+            s.remoteControlName != ""
+            && !(lib.hasInfix "\n" s.remoteControlName)
+            && !(lib.hasInfix "\r" s.remoteControlName)
+          );
+          message = "services.claude-box.users.${name}: session \"${sname}\"'s remoteControlName must be non-empty and free of newlines.";
+        }
+      ]) (seedSessions name u))) cfg.users);
 
     # Claude Code is unfree; allow just the bundled supported agent packages
     # (host can override).
@@ -561,13 +841,11 @@ in
     }) cfg.users;
 
     environment.systemPackages =
-      (lib.unique ((map (u: (agentCommand "" u).package) (lib.attrValues cfg.users)) ++ [ pkgs.tmux ] ++ cfg.extraPackages));
+      (lib.unique (installedAgentPackages ++ [ pkgs.tmux sessionCli ] ++ cfg.extraPackages));
 
     systemd.services = lib.mapAttrs' (name: u:
-      let agent = agentCommand name u;
-      in
       lib.nameValuePair "claude-box-${name}" {
-        description = "${agent.displayName} agent (tmux) for ${name}";
+        description = "Coding agent sessions (tmux) for ${name}";
         wantedBy = [ "multi-user.target" ];
         after = [ "network-online.target" ];
         wants = [ "network-online.target" ];
@@ -582,7 +860,9 @@ in
         # /run/wrappers is added when the agent has any sudo allowlist entries,
         # so the setuid `sudo` wrapper (which lives at /run/wrappers/bin/sudo,
         # NOT on the default systemd unit PATH) resolves in agent tool shells.
-        path = [ "/home/${name}/.nix-profile" agent.package pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ]
+        path = [ "/home/${name}/.nix-profile" ]
+          ++ installedAgentPackages
+          ++ [ sessionCli pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ]
           ++ cfg.extraPackages
           ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers";
         # TMUX_TMPDIR puts the control socket under the /run RuntimeDirectory
@@ -606,22 +886,17 @@ in
           // u.environment;
         serviceConfig = {
           User = name;
-          # ExecStart's mkStart supervises the tmux session and stays live for
-          # as long as the session is alive, so systemd can distinguish clean
-          # session termination (Restart=always kicks in -> fresh agent) from
-          # explicit `systemctl stop` (which systemd never restarts through).
+          # ExecStart's mkStart is the session supervisor (issue #59): it
+          # reconciles tmux sessions against the user-owned sessions.json
+          # forever. Individual session restarts happen inside the loop;
+          # Restart=always only backstops a crashed supervisor.
           Type = "exec";
           Restart = "always";
           RestartSec = "2s";
-          # Upstream claude-code bug: the client persists only channelsEnabled
-          # to ~/.claude/remote-settings.json, losing the org's channel-plugin
-          # allowlist; the next launch trusts the stale cache and silently
-          # drops every channel notification ("Channel notifications skipped"
-          # in the MCP debug log). Clearing the cache before each start forces
-          # a full policy fetch. Harmless otherwise — it's a cache file.
-          ExecStartPre = "${pkgs.coreutils}/bin/rm -f /home/${name}/.claude/remote-settings.json";
           ExecStart = mkStart name u;
-          ExecStop = "${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} kill-session -t main";
+          # Stopping the unit stops every session: kill the whole per-user
+          # tmux server (the supervisor loop dies with the cgroup).
+          ExecStop = "${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} kill-server";
           # Holds the tmux control socket (see TMUX_TMPDIR above). 0700 so only
           # the agent user can reach its own socket; ExecStop/attachers run as
           # the same user. Persist across restarts so an in-flight attach isn't
@@ -884,9 +1159,17 @@ in
         # browser -> TLS (Caddy) -> this daemon -> ~/.config/claude-box/env (0600).
         #
         # The UI lists key NAMES only; it never renders a stored value. "Apply"
-        # restarts the agent by killing its tmux session (same uid, via the
-        # PrivateTmp socket under TMUX_TMPDIR); the agent unit's Restart=always
-        # brings it back with the fresh environment.
+        # kills the user's tmux sessions (same uid, via the PrivateTmp socket
+        # under TMUX_TMPDIR); the supervisor in the agent unit brings them
+        # back with the fresh environment.
+        #
+        # Sessions (issue 59): the daemon is also the web CRUD surface for the
+        # user-owned sessions.json — add/delete/restart sessions and a public
+        # names-only listing that feeds the flat picker. The reconcile/respawn
+        # logic deliberately does NOT live here (a daemon crash or restart
+        # must never take the agent sessions down): the daemon only writes the
+        # file and kills the user's own tmux sessions; the supervisor in the
+        # hardened agent unit does the starting.
         #
         # Deliberately Python-3-stdlib only: no third-party imports, so it stays
         # tiny and auditable and needs nothing beyond pkgs.python3.
@@ -904,12 +1187,16 @@ in
         #   CLAUDE_BOX_SETTINGS_PORT      dev fallback TCP port on 127.0.0.1
         #                                 (ignored when socket-activated)
         #   CLAUDE_BOX_TMUX_SOCKET        tmux -L socket name (e.g. agent-box)
-        #   CLAUDE_BOX_TMUX_SESSION       tmux session name (e.g. main)
         #   CLAUDE_BOX_TMUX_TMPDIR        TMUX_TMPDIR the agent's socket lives under
         #   CLAUDE_BOX_TMUX_BIN           absolute path to the tmux binary
+        #   CLAUDE_BOX_SESSIONS_FILE      path to the user's sessions.json
+        #   CLAUDE_BOX_SESSIONS_PUBLIC    unauthenticated names-only list path
+        #   CLAUDE_BOX_AGENTS             comma-separated installed agent CLIs
+        #   CLAUDE_BOX_DEFAULT_AGENT      agent preselected in the add form
 
         import html
         import http.server
+        import json
         import os
         import re
         import socket
@@ -923,9 +1210,17 @@ in
         BASE = os.environ.get("CLAUDE_BOX_SETTINGS_BASE", "/settings").rstrip("/")
         PORT = int(os.environ.get("CLAUDE_BOX_SETTINGS_PORT", "8080"))
         TMUX_SOCKET = os.environ.get("CLAUDE_BOX_TMUX_SOCKET", "agent-box")
-        TMUX_SESSION = os.environ.get("CLAUDE_BOX_TMUX_SESSION", "main")
         TMUX_TMPDIR = os.environ.get("CLAUDE_BOX_TMUX_TMPDIR", "")
         TMUX_BIN = os.environ.get("CLAUDE_BOX_TMUX_BIN", "tmux")
+        # Sessions (issue 59): the daemon is the web CRUD surface for the
+        # user-owned sessions.json; the supervisor inside the agent unit
+        # reconciles tmux against it (starts within ~2s). The daemon only
+        # ever writes the file and kills the user's own tmux sessions.
+        SESSIONS_FILE = os.environ.get("CLAUDE_BOX_SESSIONS_FILE", "")
+        # Unauthenticated names-only listing path (feeds the flat picker).
+        SESSIONS_PUBLIC = os.environ.get("CLAUDE_BOX_SESSIONS_PUBLIC", "")
+        AGENTS = [a for a in os.environ.get("CLAUDE_BOX_AGENTS", "claude").split(",") if a]
+        DEFAULT_AGENT = os.environ.get("CLAUDE_BOX_DEFAULT_AGENT", "claude")
         # Full sudo command line that triggers the box update (issue 54). Empty
         # when selfUpdate is off, which hides the Update card and 404s the route.
         UPDATE_CMD = os.environ.get("CLAUDE_BOX_UPDATE_CMD", "")
@@ -934,6 +1229,9 @@ in
         # contain only letters, digits, underscores. This is what a shell / systemd
         # EnvironmentFile will accept as a variable name.
         KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+        # Session names: same charset the supervisor and CLI enforce (they
+        # land in tmux -t targets and URLs).
+        SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 
         def read_keys():
@@ -1017,24 +1315,81 @@ in
             write_pairs(pairs)
 
 
-        def restart_agent():
-            """Kill the agent's tmux session so systemd's Restart=always reloads it
-            with fresh env. Runs as the same uid; the socket lives under the agent
-            unit's PrivateTmp TMUX_TMPDIR (a /run path both processes share).
+        def read_sessions():
+            """Return the raw sessions dict from SESSIONS_FILE ({} on any problem).
+
+            Values are kept as-is for read-modify-write; callers that render or
+            publish names filter through SESSION_RE themselves.
             """
+            try:
+                with open(SESSIONS_FILE, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+            except (OSError, ValueError):
+                return {}
+            sessions = data.get("sessions") if isinstance(data, dict) else None
+            if not isinstance(sessions, dict):
+                return {}
+            result = {}
+            for k, v in sessions.items():
+                if isinstance(k, str) and isinstance(v, dict):
+                    result[k] = v
+            return result
+
+
+        def write_sessions(sessions):
+            """Atomically rewrite SESSIONS_FILE (0600) with the given dict.
+
+            Same tempfile-in-directory + os.replace dance as write_pairs. The
+            supervisor in the agent unit picks the change up within ~2s.
+            """
+            directory = os.path.dirname(SESSIONS_FILE) or "."
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix=".sessions.")
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump({"version": 1, "sessions": sessions}, fh, indent=2)
+                    fh.write("\n")
+                os.replace(tmp, SESSIONS_FILE)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+
+
+        def tmux(*args):
+            """Run a tmux command against the user's own server; None on OSError."""
             env = dict(os.environ)
             if TMUX_TMPDIR:
                 env["TMUX_TMPDIR"] = TMUX_TMPDIR
             try:
-                subprocess.run(
-                    [TMUX_BIN, "-L", TMUX_SOCKET, "kill-session", "-t", TMUX_SESSION],
+                return subprocess.run(
+                    [TMUX_BIN, "-L", TMUX_SOCKET] + list(args),
                     env=env,
                     check=False,
                     capture_output=True,
+                    text=True,
                 )
             except OSError as exc:
                 # Missing/unrunnable tmux binary must not 500 the request.
-                sys.stderr.write("restart_agent: %s\n" % exc)
+                sys.stderr.write("tmux: %s\n" % exc)
+                return None
+
+
+        def live_sessions():
+            proc = tmux("list-sessions", "-F", "#S")
+            if proc is None or proc.returncode != 0:
+                return set()
+            return {line for line in proc.stdout.splitlines() if line}
+
+
+        def kill_session(name):
+            """Kill one tmux session. The supervisor recreates it if it is still
+            listed in sessions.json (= restart); delisting first makes it stay
+            gone (= destroy)."""
+            tmux("kill-session", "-t", "=" + name)
 
 
         def update_box():
@@ -1076,7 +1431,7 @@ in
           li:last-child {{ border-bottom: 0; }}
           code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
                  color: #e8a087; }}
-          input {{ font: inherit; padding: 8px 10px; border-radius: 6px;
+          input, select {{ font: inherit; padding: 8px 10px; border-radius: 6px;
                   border: 1px solid #30363d; background: #0d1117; color: #e6edf3; }}
           input[type=text] {{ width: 160px; }}
           input[type=password] {{ width: 260px; }}
@@ -1102,6 +1457,23 @@ in
           </p>
           {message}
           <div class="card">
+            <h2 style="font-size:16px;margin-top:0">Sessions</h2>
+            <p class="note">Each session is one agent CLI in its own terminal.
+            New sessions start within a few seconds — no rebuild, no sudo.
+            Open a session from the front page or at
+            <code>/{user}/?arg=&lt;session&gt;</code>.</p>
+            {sessions}
+            <form method="post" action="{base}/sessions/add">
+              <div class="row">
+                <input type="text" name="name" placeholder="session-name"
+                       pattern="[A-Za-z0-9_-]+" required
+                       title="Letters, digits, dash and underscore">
+                <select name="agent">{agents}</select>
+                <button type="submit">Add session</button>
+              </div>
+            </form>
+          </div>
+          <div class="card">
             <h2 style="font-size:16px;margin-top:0">Current keys</h2>
             {keys}
           </div>
@@ -1120,13 +1492,14 @@ in
             </form>
           </div>
           <div class="card">
-            <h2 style="font-size:16px;margin-top:0">Apply changes (restart agent)</h2>
-            <p class="note">Restarting reloads the agent with the current keys.
-            <strong>This kills the live agent session</strong> — any in-flight work
-            in the terminal that the agent has not persisted is lost.</p>
+            <h2 style="font-size:16px;margin-top:0">Apply changes (restart all sessions)</h2>
+            <p class="note">Restarting reloads every session's agent with the
+            current keys. <strong>This kills all live agent sessions</strong> —
+            any in-flight work an agent has not persisted is lost. Individual
+            sessions can be restarted from the Sessions card above.</p>
             <form method="post" action="{base}/restart"
-                  onsubmit="return confirm('Restart the agent now? The live session will be killed and any unsaved in-flight work is lost.');">
-              <button type="submit" class="danger">Restart agent</button>
+                  onsubmit="return confirm('Restart all sessions now? Live sessions will be killed and any unsaved in-flight work is lost.');">
+              <button type="submit" class="danger">Restart all</button>
             </form>
           </div>
           {update}
@@ -1163,12 +1536,50 @@ in
             return "<ul>" + "".join(items) + "</ul>"
 
 
+        def render_sessions():
+            entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
+            if not entries:
+                return '<p class="note">No sessions defined.</p>'
+            live = live_sessions()
+            base = html.escape(BASE)
+            items = []
+            for name in sorted(entries):
+                safe = html.escape(name)
+                agent = html.escape(str(entries[name].get("agent") or "?"))
+                state = "live" if name in live else "starting"
+                items.append(
+                    f'<li><span><code>{safe}</code> '
+                    f'<span class="note">{agent} · {state}</span></span><span>'
+                    f'<form class="inline" method="post" action="{base}/sessions/restart" '
+                    f'onsubmit="return confirm(\'Restart {safe}? Unsaved in-flight work is lost.\');">'
+                    f'<input type="hidden" name="name" value="{safe}">'
+                    f'<button type="submit">Restart</button></form> '
+                    f'<form class="inline" method="post" action="{base}/sessions/delete" '
+                    f'onsubmit="return confirm(\'Delete session {safe}? Its live agent is killed.\');">'
+                    f'<input type="hidden" name="name" value="{safe}">'
+                    f'<button type="submit" class="danger">Delete</button></form>'
+                    f'</span></li>'
+                )
+            return "<ul>" + "".join(items) + "</ul>"
+
+
+        def render_agent_options():
+            items = []
+            for agent in AGENTS:
+                sel = " selected" if agent == DEFAULT_AGENT else ""
+                safe = html.escape(agent)
+                items.append(f'<option value="{safe}"{sel}>{safe}</option>')
+            return "".join(items)
+
+
         def render_page(message=""):
             msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
             return PAGE.format(
                 user=html.escape(USER),
                 base=html.escape(BASE),
                 keys=render_keys(read_keys()),
+                sessions=render_sessions(),
+                agents=render_agent_options(),
                 message=msg_html,
                 update=UPDATE_CARD.format(base=html.escape(BASE)) if UPDATE_CMD else "",
             )
@@ -1199,8 +1610,29 @@ in
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
+            def _send_json(self, obj):
+                data = (json.dumps(obj) + "\n").encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(data)
+
             def do_GET(self):
                 parsed = urllib.parse.urlparse(self.path)
+                if SESSIONS_PUBLIC and parsed.path == SESSIONS_PUBLIC:
+                    # Names+agents only — deliberately unauthenticated (Caddy
+                    # routes it outside the auth block): it feeds the flat
+                    # session picker, same public stance as user names there.
+                    # Never include argv/cwd/env — those may hold secrets.
+                    self._send_json([
+                        {"name": n, "agent": str(v.get("agent") or "")}
+                        for n, v in sorted(read_sessions().items())
+                        if SESSION_RE.match(n)
+                    ])
+                    return
                 if not self._under_base(parsed.path):
                     self._send_html("<h1>404</h1>", status=404)
                     return
@@ -1208,9 +1640,12 @@ in
                 message = ""
                 if "ok" in params:
                     message = {
-                        "saved": "Key saved. Restart the agent to apply.",
-                        "deleted": "Key deleted. Restart the agent to apply.",
-                        "restarted": "Agent restart requested.",
+                        "saved": "Key saved. Restart the sessions to apply.",
+                        "deleted": "Key deleted. Restart the sessions to apply.",
+                        "restarted": "Restart of all sessions requested.",
+                        "session_added": "Session added — it starts within a few seconds.",
+                        "session_deleted": "Session deleted.",
+                        "session_restarted": "Session restart requested.",
                         "update": "Box update started — the system rebuilds in the "
                                   "background and this page may briefly go away.",
                     }.get(params["ok"][0], "")
@@ -1242,8 +1677,52 @@ in
                     if KEY_RE.match(key):
                         delete_key(key)
                     self._redirect("ok=deleted")
+                elif path == BASE + "/sessions/add":
+                    name = (form.get("name", [""])[0]).strip()
+                    agent = (form.get("agent", [""])[0]).strip() or DEFAULT_AGENT
+                    if not SESSION_RE.match(name):
+                        self._send_html(
+                            render_page("Invalid session name. Use letters, digits, "
+                                        "dash and underscore (max 32 chars)."),
+                            status=400,
+                        )
+                        return
+                    if agent not in AGENTS:
+                        self._send_html(
+                            render_page("Unknown agent. Installed: " + ", ".join(AGENTS)),
+                            status=400,
+                        )
+                        return
+                    sessions = read_sessions()
+                    sessions[name] = {
+                        "agent": agent,
+                        "skipPermissions": True,
+                        "remoteControl": True,
+                        "remoteControlName": None,
+                        "workingDirectory": None,
+                        "extraArgs": [],
+                    }
+                    write_sessions(sessions)
+                    self._redirect("ok=session_added")
+                elif path == BASE + "/sessions/delete":
+                    name = (form.get("name", [""])[0]).strip()
+                    if SESSION_RE.match(name):
+                        sessions = read_sessions()
+                        sessions.pop(name, None)
+                        write_sessions(sessions)
+                        kill_session(name)
+                    self._redirect("ok=session_deleted")
+                elif path == BASE + "/sessions/restart":
+                    name = (form.get("name", [""])[0]).strip()
+                    if SESSION_RE.match(name):
+                        kill_session(name)
+                    self._redirect("ok=session_restarted")
                 elif path == BASE + "/restart":
-                    restart_agent()
+                    # Bounce every listed session so all agents reload the env
+                    # file; the supervisor brings them back within ~2s.
+                    for name in read_sessions():
+                        if SESSION_RE.match(name):
+                            kill_session(name)
                     self._redirect("ok=restarted")
                 elif path == BASE + "/update" and UPDATE_CMD:
                     update_box()
@@ -1295,6 +1774,39 @@ in
         if __name__ == "__main__":
             main()
       '';
+      # Per-connection tmux attach for ttyd (issue #59). ttyd runs with
+      # --url-arg, so /<user>/?arg=<session> passes <session> as $1 — ONE
+      # ttyd per user serves every session, including runtime-created ones.
+      # Strict allowlist on the client-supplied argument: session-name
+      # charset AND an existing tmux session; anything else prints the live
+      # list and exits (ttyd spawns a fresh instance per connection).
+      attachScript = name: pkgs.writeShellScript "claude-box-${name}-attach" ''
+        set -u
+        T="${pkgs.tmux}/bin/tmux -L ${tmuxSocketName}"
+        want="''${1:-}"
+        case "$want" in (*[!A-Za-z0-9_-]*) want="" ;; esac
+        if [ -n "$want" ]; then
+          if $T has-session -t "=$want" 2>/dev/null; then
+            exec $T attach -t "=$want"
+          fi
+          echo "no session named '$want'. Live sessions:"
+          $T list-sessions -F '  #S' 2>/dev/null || echo "  (none)"
+          echo "create it with: claude-box-session add $want"
+          sleep 5
+          exit 1
+        fi
+        # No session requested: prefer "main", else the first live session.
+        if $T has-session -t "=main" 2>/dev/null; then
+          exec $T attach -t "=main"
+        fi
+        first="$($T list-sessions -F '#S' 2>/dev/null | ${pkgs.coreutils}/bin/head -n 1)"
+        if [ -n "$first" ]; then
+          exec $T attach -t "=$first"
+        fi
+        echo "no live sessions yet — the supervisor may still be starting them."
+        sleep 5
+        exit 1
+      '';
       # Per-user env var suffix for the Caddyfile placeholders; linux user
       # names may contain chars that are invalid in env var names.
       envName = n: lib.toUpper (lib.stringAsChars (c: if builtins.match "[a-zA-Z0-9]" c != null then c else "_") n);
@@ -1310,6 +1822,13 @@ in
         # auth credentials to WebSocket upgrades — then basic auth with the
         # linux user name as the login name.
         redir /${name} /${name}/
+        # ${name}'s session list (issue #59): session names + agent kinds
+        # only, no secrets — same public stance as the user names on the
+        # picker, which this feeds. Served by the settings daemon over its
+        # unix socket, deliberately OUTSIDE the auth block.
+        handle /${name}/sessions.json {
+          reverse_proxy unix/${settingsSocketOf name}
+        }
         # ${name}'s settings page (issue #36). Same auth surface as the
         # terminal (cookie-or-basic-auth, same user name), just a different
         # upstream — the settings daemon over its user+caddy-only unix socket
@@ -1349,7 +1868,14 @@ in
 
       pickerBlock = ''
         # Anything else, including /: unauthenticated picker listing this
-        # box's terminals. User names are not secrets; the passwords are.
+        # box's agent SESSIONS (issue #59), flat — the users->sessions
+        # hierarchy survives only in the URL and the auth realm. Fetched
+        # client-side from each user's public names-only sessions.json;
+        # session and user names are not secrets, the passwords are. The
+        # <noscript> fallback keeps per-user links. No userinfo in any href
+        # (issue 56): Chrome answers the basic-auth challenge with URL
+        # userinfo + an EMPTY password, and credentials typed into the
+        # prompt cannot override the URL-embedded identity.
         handle {
           header Content-Type "text/html; charset=utf-8"
           respond <<PICKER_HTML
@@ -1358,7 +1884,7 @@ in
             <meta charset="utf-8">
             <meta name="viewport" content="width=device-width, initial-scale=1">
             <meta name="robots" content="noindex">
-            <title>Terminals — ${cfg.web.domain}</title>
+            <title>Sessions — ${cfg.web.domain}</title>
             <style>
               body { margin: 0; min-height: 100vh; display: grid; place-items: center;
                      background: #0d1117; color: #e6edf3; font: 16px/1.6 system-ui, sans-serif; }
@@ -1368,18 +1894,56 @@ in
                        padding: 12px 36px;
                        border: 1px solid #30363d; border-radius: 10px; background: #161b22;
                        color: #e8a087; font-size: 20px; text-decoration: none; }
-              main a.term { flex: 1; }
+              main a.term { flex: 1; flex-direction: column; }
               main a.gear { padding: 12px 18px; text-decoration: none; }
               main a:hover { border-color: #e8a087; }
+              main .sub { display: block; font-size: 13px; color: #8b949e; }
             </style>
             <main>
-              <h1>Terminals</h1>
-              ${/* No ${n}@ userinfo in these hrefs: Chrome answers the basic-auth
-                    challenge with URL userinfo + an EMPTY password, and credentials
-                    typed into the prompt cannot override the URL-embedded identity
-                    (issue 56). */
-                lib.concatMapStringsSep "\n      " (n: ''<div class="row"><a class="term" href="https://${cfg.web.domain}/${n}/">${n}</a><a class="gear" href="https://${cfg.web.domain}/${n}/settings/" title="${n} settings" aria-label="${n} settings">&#9881;</a></div>'') terminalUsers}
+              <h1>Sessions</h1>
+              <div id="list"><noscript>
+              ${lib.concatMapStringsSep "\n      " (n: ''<div class="row"><a class="term" href="https://${cfg.web.domain}/${n}/">${n}</a><a class="gear" href="https://${cfg.web.domain}/${n}/settings/" title="${n} settings" aria-label="${n} settings">&#9881;</a></div>'') terminalUsers}
+              </noscript></div>
             </main>
+            <script>
+              var users = [${lib.concatMapStringsSep ", " (n: "\"${n}\"") terminalUsers}];
+              var list = document.getElementById("list");
+              function card(user, session, agent) {
+                var row = document.createElement("div");
+                row.className = "row";
+                var a = document.createElement("a");
+                a.className = "term";
+                if (session === null) {
+                  a.href = "/" + user + "/";
+                  a.textContent = user;
+                } else {
+                  a.href = "/" + user + "/?arg=" + encodeURIComponent(session);
+                  a.textContent = session;
+                  var sub = document.createElement("span");
+                  sub.className = "sub";
+                  sub.textContent = agent + (users.length > 1 ? " · " + user : "");
+                  a.appendChild(sub);
+                }
+                var gear = document.createElement("a");
+                gear.className = "gear";
+                gear.href = "/" + user + "/settings/";
+                gear.title = user + " settings";
+                gear.setAttribute("aria-label", user + " settings");
+                gear.innerHTML = "&#9881;";
+                row.appendChild(a);
+                row.appendChild(gear);
+                list.appendChild(row);
+              }
+              users.forEach(function (u) {
+                fetch("/" + u + "/sessions.json").then(function (r) {
+                  if (!r.ok) { throw new Error("http " + r.status); }
+                  return r.json();
+                }).then(function (sessions) {
+                  if (!sessions.length) { card(u, null, null); return; }
+                  sessions.forEach(function (s) { card(u, s.name, s.agent); });
+                }).catch(function () { card(u, null, null); });
+              });
+            </script>
             PICKER_HTML 200
         }
       '';
@@ -1591,11 +2155,14 @@ in
           ExecStart = lib.concatStringsSep " " [
             "${pkgs.ttyd}/bin/ttyd"
             "--writable"
+            # ?arg=<session> in the URL becomes $1 of the attach wrapper —
+            # session-level deep links from the picker (issue #59).
+            "--url-arg"
             "-p" (toString portOf.${name})
             "-i" "127.0.0.1"
             "-b" "/${name}"
             "-t" "titleFixed=${name}@${cfg.web.domain}"
-            "${pkgs.tmux}/bin/tmux" "-L" tmuxSocketName "attach" "-t" "main"
+            (toString (attachScript name))
           ];
         };
       }) terminalUsers)
@@ -1620,9 +2187,12 @@ in
           CLAUDE_BOX_SETTINGS_ENV_FILE = userEnvFile name;
           CLAUDE_BOX_SETTINGS_BASE = settingsBaseOf name;
           CLAUDE_BOX_TMUX_SOCKET = tmuxSocketName;
-          CLAUDE_BOX_TMUX_SESSION = tmuxSessionName;
           CLAUDE_BOX_TMUX_TMPDIR = "/run/${runtimeDirectory name}";
           CLAUDE_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
+          CLAUDE_BOX_SESSIONS_FILE = userSessionsFile name;
+          CLAUDE_BOX_SESSIONS_PUBLIC = "/${name}/sessions.json";
+          CLAUDE_BOX_AGENTS = lib.concatStringsSep "," cfg.installAgents;
+          CLAUDE_BOX_DEFAULT_AGENT = cfg.agent;
         } // lib.optionalAttrs cfg.selfUpdate.enable {
           # --no-block so the daemon's HTTP response goes out before the
           # rebuild (possibly) restarts the daemon itself.

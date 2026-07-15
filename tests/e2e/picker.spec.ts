@@ -26,3 +26,25 @@ test('no picker href embeds URL userinfo (user@host)', async ({ request }) => {
     expect(href, `userinfo in picker link: ${href}`).not.toMatch(/^https?:\/\/[^/]*@/);
   }
 });
+
+// Flat session picker (issue 59): the page fetches each user's public
+// sessions.json and renders one card per SESSION deep-linking into the
+// terminal via ttyd's ?arg= session selector.
+test('picker lists sessions with ?arg= deep links', async ({ page }) => {
+  await page.goto('/');
+  const card = page.locator(`#list a.term[href*="/${USER}/?arg="]`).first();
+  await expect(card).toBeVisible();
+  const href = await card.getAttribute('href');
+  expect(href, `userinfo in session link: ${href}`).not.toMatch(/^https?:\/\/[^/]*@/);
+});
+
+test('public sessions.json lists names and agents only', async ({ request }) => {
+  const res = await request.get(`/${USER}/sessions.json`);
+  expect(res.status()).toBe(200);
+  const sessions = await res.json();
+  expect(Array.isArray(sessions)).toBe(true);
+  expect(sessions.length).toBeGreaterThan(0);
+  for (const s of sessions) {
+    expect(Object.keys(s).sort()).toEqual(['agent', 'name']);
+  }
+});
