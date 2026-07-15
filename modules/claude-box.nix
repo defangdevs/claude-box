@@ -207,12 +207,49 @@ let
   mkStart = name: u:
     let
       agent = agentCommand name u;
+      # Pre-accept claude-code's one-time startup dialogs. A fresh home
+      # otherwise parks the session on interactive prompts — the folder-trust
+      # dialog ("Is this a project you trust?") and, when running with
+      # --dangerously-skip-permissions, the Bypass Permissions warning (whose
+      # default answer is "No, exit"). On a headless box nobody is at the
+      # terminal to answer them, and Remote Control can't drive a session
+      # that is stuck on a dialog, so the ONLY interactive step left should
+      # be the one-time OAuth login. claude persists both acceptances in
+      # per-user state files, which it round-trips (read-modify-write), so
+      # values seeded before first launch survive login/onboarding:
+      #   ~/.claude.json          projects.<workdir>.hasTrustDialogAccepted
+      #   ~/.claude/settings.json skipDangerousModePermissionPrompt
+      # Runs on every start (idempotent), which also covers upstream's
+      # occasional failure to persist an interactive acceptance
+      # (anthropics/claude-code issue 36403). Codex has no such dialogs.
+      seedClaudeState = ''
+        seed_json() {
+          # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
+          # if missing. A file jq can't parse is left untouched: the dialog
+          # comes back, but the agent still starts.
+          file=$1; shift
+          [ -s "$file" ] || printf '{}' > "$file"
+          if ${pkgs.jq}/bin/jq "$@" "$file" > "$file.seed-tmp" 2>/dev/null; then
+            mv "$file.seed-tmp" "$file"
+          else
+            rm -f "$file.seed-tmp"
+          fi
+        }
+        mkdir -p /home/${name}/.claude
+        seed_json /home/${name}/.claude.json --arg wd ${lib.escapeShellArg u.workingDirectory} \
+          '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})'
+        ${lib.optionalString u.skipPermissions ''
+          seed_json /home/${name}/.claude/settings.json \
+            '.skipDangerousModePermissionPrompt = true'
+        ''}
+      '';
       # Every user-provided arg gets individually shell-escaped so a
       # remoteControlName or extraArgs element containing whitespace or shell
       # metacharacters can't inject into the tmux new-session command below.
     in
     pkgs.writeShellScript "claude-box-${name}-start" ''
       set -u
+      ${lib.optionalString (agent.agent == "claude") seedClaudeState}
       # Detached tmux session so a human can `tmux -L agent-box attach -t main`.
       # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero agent exit;
       # clean exits let the session die so systemd's Restart=always brings up

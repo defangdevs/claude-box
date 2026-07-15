@@ -144,6 +144,13 @@ tmux control socket lives under `/run/agent-box-<user>` rather than `/tmp`.
 Credentials live in that user's home directory (`~/.claude` for Claude Code,
 `~/.codex` for Codex) - per-user runtime state, never baked into the config.
 
+Sign-in is the *only* interactive step: the module pre-accepts Claude Code's
+other first-run dialogs (the folder-trust prompt for the agent's working
+directory, and the Bypass Permissions warning when `skipPermissions` is on)
+by seeding the acceptance flags into `~/.claude.json` and
+`~/.claude/settings.json` before each start. Without that, a fresh box parks
+the session on a dialog that Remote Control can't answer.
+
 **Claude Code quirks to know about first-time login in the browser terminal:**
 
 - **The login URL may not be clickable at narrow browser widths.** The URL
