@@ -221,6 +221,46 @@ All under `services.claude-box`:
 | `tokenDir` | `/etc/claude-box` | Where per-agent `<user>.env` token files live. |
 | `manageTokenDir` | `true` | Create `tokenDir` (root-owned) via tmpfiles. |
 | `protectMemory` | `true` | zram swap (zstd, sized to RAM), earlyoom, and `OOMScoreAdjust=500` on agent units, so runaway agent memory gets its process killed (and auto-restarted) instead of livelocking the whole box. All knobs are `mkDefault` - tune or disable pieces from the host config. |
+| `runtimeAgents.enable` | `false` | Let the operator add/remove agent users at runtime, no rebuild (below). Requires `web.enable`. |
+| `runtimeAgents.stateDir` | `/var/lib/claude-box-agents` | One root-owned subdirectory per runtime agent; presence marks a name as runtime-managed. |
+| `runtimeAgents.vhostsDir` | `/var/lib/claude-box-vhosts` | Per-runtime-agent Caddy snippets (`0640 root:caddy`, bcrypt hash inline), imported by the module Caddyfile. |
+
+## Runtime agents (no rebuild)
+
+With `runtimeAgents.enable = true`, the operator (`web.user`) can provision a
+whole extra agent - Linux user, tmux-backed agent service, browser terminal,
+settings page - while the box runs:
+
+```console
+$ echo "$PASSWORD" | sudo claude-box-agent add pairbot
+added: pairbot (https://box.example.com/pairbot/)
+$ sudo claude-box-agent remove pairbot   # home dir is preserved
+```
+
+or from the **Additional agents** card on the operator's own settings page.
+The password (16-64 chars from `[A-Za-z0-9._~-]`) is read from stdin, never
+argv. Under the hood the root helper creates the user, writes a Caddy vhost
+snippet into `runtimeAgents.vhostsDir`, reloads caddy, and starts systemd
+*template* instances (`claude-box@<name>`, `claude-web-terminal@<name>`,
+`claude-box-settings@<name>`) that carry the same hardening as the
+declarative units; a boot-time oneshot (`claude-box-runtime-reconcile`)
+restarts everything recorded in `runtimeAgents.stateDir` after a reboot or
+spot restart. The `/` picker becomes a small daemon that lists declarative +
+runtime terminals at request time.
+
+Scope, by design:
+
+- Only the operator gets the `claude-box-agent` sudo entry (the broad
+  `sudoAllowlist` never fans out user creation to every agent). Runtime
+  agents themselves get **no** sudo at all.
+- Runtime agents run the module's default agent CLI with its default flags.
+  For per-agent customization (different CLI, extra args, groups), use the
+  declarative `users.<name>` path instead.
+- `remove` stops the units, deletes the vhost/state/user, but preserves
+  `/home/<name>` - wipe it deliberately if that's what you want. Re-adding
+  the same name re-owns the preserved home.
+- Runtime users live in `/etc/passwd` mutation land: keep
+  `users.mutableUsers = true` (the NixOS default) on hosts that enable this.
 
 ## Security model
 

@@ -83,3 +83,9 @@ jobs:
       # while the box stays responsive.
       - name: Run memory protection VM test
         run: nix build -L .#checks.x86_64-linux.memory-protection
+
+      # Interactive VM test: runtime agent add/remove via the operator-only
+      # claude-box-agent sudo helper — user, vhost, units, picker, boot
+      # reconcile, all without a rebuild.
+      - name: Run runtime agents VM test
+        run: nix build -L .#checks.x86_64-linux.runtime-agents

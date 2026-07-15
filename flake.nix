@@ -97,6 +97,13 @@
           memory-protection = pkgs.testers.runNixOSTest
             (import ./tests/memory-protection.nix { claude-box = self.nixosModules.claude-box; });
 
+          # Interactive VM test: the operator provisions and removes agent
+          # users at runtime through the claude-box-agent helper (operator-only
+          # sudo entry) — OS user, vhost snippet, template units, picker
+          # listing, boot reconcile — all without a nixos-rebuild.
+          runtime-agents = pkgs.testers.runNixOSTest
+            (import ./tests/runtime-agents.nix { claude-box = self.nixosModules.claude-box; });
+
           # Regression guard (issue #51): deployed boxes fetch
           # modules/claude-box.nix as a SINGLE file — the CFN user-data and
           # claude-box-update.service both fetchurl just that path — so the

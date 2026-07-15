@@ -37,10 +37,19 @@ let
   # answer the HTTP request before the rebuild (possibly) restarts the daemon
   # itself. A separate literal because sudoers matches argv exactly.
   updateStartNoBlockCmd = "/run/current-system/sw/bin/systemctl start --no-block claude-box-update.service";
-  effectiveSudoAllowlist =
+  # Commands granted to EVERY declarative claude-box user.
+  broadSudoCommands =
     cfg.sudoAllowlist
     ++ lib.optional cfg.web.enable caddyReloadCmd
     ++ lib.optionals cfg.selfUpdate.enable [ updateStartCmd updateStartNoBlockCmd ];
+  # Commands granted ONLY to the operator user (web.user) — the box's main
+  # admin surface. Creating another OS user is a bigger power than the broad
+  # allowlist, so it doesn't fan out to every declarative agent.
+  operatorSudoCommands =
+    lib.optional cfg.runtimeAgents.enable claudeBoxAgentCmd;
+  # Union — used for the NoNewPrivileges gate. Any setuid entry on any
+  # user's unit needs NNP off; the split above is a sudoers-scope concern.
+  effectiveSudoAllowlist = broadSudoCommands ++ operatorSudoCommands;
   # Agent CLIs (claude-code, codex) move much faster than any host channel.
   # When the host wires selfUpdate.agentNixpkgs (from the pin file the update
   # service maintains — see that option), resolve just the agent packages from
@@ -306,6 +315,83 @@ let
         sleep 2
       done
     '';
+
+  # ---- Runtime-agent support (services.claude-box.runtimeAgents.enable) ----
+  # Parent of the per-instance ttyd socket dirs. Each claude-web-terminal@
+  # instance gets RuntimeDirectory=claude-web-terminal/%i — a systemd-owned
+  # subdirectory the instance USER owns, holding that terminal's tty.sock
+  # (0660 <user>:caddy via ttyd -U). Kept OUTSIDE /run/agent-box-<name>
+  # (the agent unit's 0700 RuntimeDirectory) so caddy — a different uid —
+  # can reach it; per-instance subdirs rather than one shared writable dir
+  # so no other local user can pre-squat a future agent's socket path and
+  # capture its (post-auth) terminal traffic. The settings sockets have no
+  # such problem: systemd binds those as root via the template socket unit.
+  runtimeTermSocketDir = "/run/claude-web-terminal";
+  # Picker daemon (rendered inline below): served at "/" so runtime agents
+  # show up without regenerating a static index. Root:caddy 0660.
+  pickerSocketPath = "/run/claude-box-picker.sock";
+  # Fixed path under the system profile so sudoers can name it. `useradd` +
+  # `caddy hash-password` live under the same profile at nixos-rebuild time.
+  claudeBoxAgentCmd = "/run/current-system/sw/bin/claude-box-agent";
+
+  # Runtime-agent tmux launcher. Mirrors mkStart but reads the user name
+  # from $1 (systemd passes it as %i) so a single script serves all runtime
+  # instances. Deliberately does NOT read a per-user config file — v1
+  # runtime agents get the module's default agent CLI, skipPermissions on,
+  # remoteControl on (for claude), and remoteControlName = <name>@<host>.
+  # If a user needs per-agent customization, they use the declarative
+  # `services.claude-box.users.<name>` path.
+  runtimeAgentStart =
+    let
+      agent = cfg.agent;
+      package = agentPackage agent;
+      autonomyFlag =
+        if agent == "claude" then "--dangerously-skip-permissions"
+        else "--dangerously-bypass-approvals-and-sandbox";
+    in
+    pkgs.writeShellScript "claude-box-runtime-start" ''
+      set -u
+      name="$1"
+      workdir="/home/$name"
+      ${lib.optionalString (agent == "claude") ''
+        # Same startup-dialog pre-accept as mkStart's seedClaudeState (see
+        # the rationale there), with user and workdir resolved at run time
+        # from $1 instead of at eval time. Runtime agents always run with
+        # the autonomy flag, so the Bypass Permissions acceptance is
+        # seeded unconditionally.
+        seed_json() {
+          file=$1; shift
+          [ -s "$file" ] || printf '{}' > "$file"
+          if ${pkgs.jq}/bin/jq "$@" "$file" > "$file.seed-tmp" 2>/dev/null; then
+            mv "$file.seed-tmp" "$file"
+          else
+            rm -f "$file.seed-tmp"
+          fi
+        }
+        mkdir -p "/home/$name/.claude"
+        seed_json "/home/$name/.claude.json" --arg wd "$workdir" \
+          '.projects[$wd] = ((.projects[$wd] // {}) + {hasTrustDialogAccepted: true, hasCompletedProjectOnboarding: true})'
+        seed_json "/home/$name/.claude/settings.json" \
+          '.skipDangerousModePermissionPrompt = true'
+      ''}
+      # Session name for --remote-control (claude only). Falls back to the
+      # bare hostname when networking.domain is unset — same shape as the
+      # declarative default.
+      host="${config.networking.fqdnOrHostName}"
+      session_name="$name@$host"
+      ${lib.optionalString (agent == "claude") ''
+        agent_cmd=${lib.escapeShellArg (lib.getExe package)}" ${autonomyFlag} --remote-control $(printf %q "$session_name")"
+      ''}
+      ${lib.optionalString (agent == "codex") ''
+        agent_cmd=${lib.escapeShellArg (lib.getExe package)}" ${autonomyFlag}"
+      ''}
+      ${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} new-session -d -s ${tmuxSessionName} \
+        -c "$workdir" \
+        "$agent_cmd || exec ${pkgs.bashInteractive}/bin/bash"
+      while ${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} has-session -t ${tmuxSessionName} 2>/dev/null; do
+        sleep 2
+      done
+    '';
 in
 {
   options.services.claude-box = {
@@ -530,12 +616,66 @@ in
         '';
       };
     };
+
+    runtimeAgents = {
+      enable = lib.mkEnableOption ''
+        run-time provisioning of additional agent users WITHOUT nixos-rebuild.
+        Adds systemd template units (claude-box@, claude-web-terminal@,
+        claude-box-settings@) and a root-owned helper (`claude-box-agent
+        add|remove|list`) that the operator (services.claude-box.web.user) can
+        invoke through a single NOPASSWD sudo entry. Requires web.enable; new
+        agents get the module's default agent CLI, autonomy flag on, and a
+        browser terminal + settings page just like a declarative user. Runtime
+        agents' vhost snippets land in /var/lib/claude-box-vhosts/ (imported by
+        the top-level Caddyfile) with the bcrypt hash inlined so a caddy
+        reload picks them up without restarting the daemon
+      '';
+
+      stateDir = lib.mkOption {
+        type = lib.types.str;
+        default = "/var/lib/claude-box-agents";
+        description = ''
+          Directory holding per-runtime-agent state (one subdirectory per
+          agent, root-owned 0700). Presence of a subdirectory here is what
+          identifies a name as runtime-managed vs declarative — the helper
+          refuses names that already exist as OS users but have no state dir.
+        '';
+      };
+
+      vhostsDir = lib.mkOption {
+        type = lib.types.str;
+        default = "/var/lib/claude-box-vhosts";
+        description = ''
+          Directory the top-level Caddyfile imports at runtime-agent-enabled
+          hosts. The helper writes one <name>.caddy file per runtime agent
+          (0640 root:caddy, bcrypt hash and cookie secret inline).
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [{
     assertions = [{
       assertion = cfg.users != { };
       message = "services.claude-box.enable is true but no users are defined in services.claude-box.users.";
+    } {
+      # Runtime agents need the shared web plumbing (Caddy vhost import,
+      # settings-socket dir, picker daemon slot) — turning them on without
+      # web enabled would silently do nothing.
+      assertion = !cfg.runtimeAgents.enable || cfg.web.enable;
+      message = "services.claude-box.runtimeAgents.enable = true requires services.claude-box.web.enable = true.";
+    } {
+      # The operator (services.claude-box.web.user) is what carries the
+      # NOPASSWD claude-box-agent sudo entry, so they have to be a real
+      # declarative user for the rule to land on any account.
+      assertion = !cfg.runtimeAgents.enable || (cfg.users ? ${cfg.web.user});
+      message = "services.claude-box.runtimeAgents.enable requires services.claude-box.web.user to be defined in services.claude-box.users.";
+    } {
+      # useradd-created users live in /etc/passwd; with mutableUsers = false
+      # the next activation regenerates that file from the Nix config and
+      # silently deletes every runtime agent.
+      assertion = !cfg.runtimeAgents.enable || config.users.mutableUsers;
+      message = "services.claude-box.runtimeAgents.enable requires users.mutableUsers = true (runtime agents are created with useradd).";
     }] ++ (lib.mapAttrsToList (name: u: {
       # Cheap sanity check on the one string that lands verbatim in a shell
       # command; deeper escaping happens in mkStart via lib.escapeShellArg.
@@ -682,13 +822,18 @@ in
       "Z ${cfg.tokenDir}/*.env 0600 root root - -"
     ];
 
-    security.sudo.extraRules = lib.mkIf (effectiveSudoAllowlist != [ ]) [{
-      users = lib.attrNames cfg.users;
+    security.sudo.extraRules =
       # NOPASSWD only — no SETENV. SETENV lets the caller alter env vars
       # visible to the sudo'd command, which broadens the surface for no
       # gain given the allowlist is meant to be tight and command-scoped.
-      commands = map (command: { inherit command; options = [ "NOPASSWD" ]; }) effectiveSudoAllowlist;
-    }];
+      (lib.optional (broadSudoCommands != [ ]) {
+        users = lib.attrNames cfg.users;
+        commands = map (command: { inherit command; options = [ "NOPASSWD" ]; }) broadSudoCommands;
+      })
+      ++ (lib.optional (operatorSudoCommands != [ ] && cfg.users ? ${cfg.web.user}) {
+        users = [ cfg.web.user ];
+        commands = map (command: { inherit command; options = [ "NOPASSWD" ]; }) operatorSudoCommands;
+      });
   } (lib.mkIf cfg.protectMemory {
     # Memory protection (issue 62). The incident that motivated this: a
     # swapless 2 GB box under agent memory pressure never OOM-killed —
@@ -930,10 +1075,21 @@ in
         # when selfUpdate is off, which hides the Update card and 404s the route.
         UPDATE_CMD = os.environ.get("CLAUDE_BOX_UPDATE_CMD", "")
 
+        # Full sudo command line that shells out to claude-box-agent (runtime
+        # agent add/remove). Set only for the OPERATOR's settings daemon; empty
+        # everywhere else, which hides the Add-agent card and 404s the routes.
+        ADD_AGENT_CMD = os.environ.get("CLAUDE_BOX_ADD_AGENT_CMD", "")
+        ADD_AGENT_DOMAIN = os.environ.get("CLAUDE_BOX_ADD_AGENT_DOMAIN", "")
+
         # Env var names: POSIX-ish. Must start with a letter or underscore and
         # contain only letters, digits, underscores. This is what a shell / systemd
         # EnvironmentFile will accept as a variable name.
         KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+        # Runtime-agent user names — same shape claude-box-agent enforces
+        # server-side, echoed here so we can 400 obvious garbage before
+        # spawning sudo.
+        AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
 
 
         def read_keys():
@@ -1054,6 +1210,92 @@ in
                 sys.stderr.write("update_box: %s\n" % exc)
 
 
+        def list_agents():
+            """Return the sorted list of runtime agent names.
+
+            Shells out to `sudo -n claude-box-agent list`. Runs even for
+            non-operator daemons if ADD_AGENT_CMD is set (it isn't, elsewhere);
+            returns [] if the helper fails or is absent.
+            """
+            if not ADD_AGENT_CMD:
+                return []
+            try:
+                proc = subprocess.run(
+                    ADD_AGENT_CMD.split() + ["list"],
+                    check=False,
+                    capture_output=True,
+                    timeout=10,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                sys.stderr.write("list_agents: %s\n" % exc)
+                return []
+            if proc.returncode != 0:
+                sys.stderr.write("list_agents: rc=%d\n" % proc.returncode)
+                return []
+            names = []
+            for line in proc.stdout.decode("utf-8", "replace").splitlines():
+                line = line.strip()
+                if AGENT_NAME_RE.match(line):
+                    names.append(line)
+            return sorted(set(names))
+
+
+        def add_agent(name, password):
+            """Spawn `sudo -n claude-box-agent add <name>` with the password on
+            stdin. Returns (ok: bool, message: str) — message is a short
+            human-readable status suitable for the redirect flash, never a raw
+            copy of stderr (which could echo an attempted password).
+            """
+            if not ADD_AGENT_CMD:
+                return False, "Add-agent disabled."
+            if not AGENT_NAME_RE.match(name):
+                return False, "Invalid agent name."
+            try:
+                proc = subprocess.run(
+                    ADD_AGENT_CMD.split() + ["add", name],
+                    input=(password + "\n").encode("utf-8"),
+                    check=False,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                sys.stderr.write("add_agent: %s\n" % exc)
+                return False, "Helper failed to spawn."
+            sys.stderr.write("add_agent %s: rc=%d\n" % (name, proc.returncode))
+            if proc.returncode == 0:
+                return True, "Added."
+            # Best-effort: surface stderr's *first* line only, and only if it
+            # contains no obvious secret token. The password itself is never
+            # echoed by the helper, but keep the surface narrow.
+            first = proc.stderr.decode("utf-8", "replace").splitlines()[:1]
+            hint = first[0] if first else "add failed"
+            return False, "Add failed: " + hint[:120]
+
+
+        def remove_agent(name):
+            """Spawn `sudo -n claude-box-agent remove <name>`."""
+            if not ADD_AGENT_CMD:
+                return False, "Remove disabled."
+            if not AGENT_NAME_RE.match(name):
+                return False, "Invalid agent name."
+            try:
+                proc = subprocess.run(
+                    ADD_AGENT_CMD.split() + ["remove", name],
+                    check=False,
+                    capture_output=True,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                sys.stderr.write("remove_agent: %s\n" % exc)
+                return False, "Helper failed to spawn."
+            sys.stderr.write("remove_agent %s: rc=%d\n" % (name, proc.returncode))
+            if proc.returncode == 0:
+                return True, "Removed."
+            first = proc.stderr.decode("utf-8", "replace").splitlines()[:1]
+            hint = first[0] if first else "remove failed"
+            return False, "Remove failed: " + hint[:120]
+
+
         PAGE = """<!doctype html>
         <html lang="en">
         <meta charset="utf-8">
@@ -1130,6 +1372,7 @@ in
             </form>
           </div>
           {update}
+          {agents}
         </main>
         </html>
         """
@@ -1143,6 +1386,35 @@ in
             <form method="post" action="{base}/update"
                   onsubmit="return confirm('Update the box now? This rebuilds the system and may restart the agent session.');">
               <button type="submit" class="danger">Update box</button>
+            </form>
+          </div>"""
+
+        # Operator-only: create/remove additional runtime agents from the
+        # settings page. Only rendered when ADD_AGENT_CMD is set (see the
+        # module: only the web.user's daemon receives it). The list of
+        # existing runtime agents shows a Remove button per row; the form
+        # accepts a name + password and shells out to claude-box-agent add.
+        ADD_AGENT_CARD = """<div class="card">
+            <h2 style="font-size:16px;margin-top:0">Additional agents</h2>
+            <p class="note">Extra terminals share this box's hardware and its
+            operator-level trust boundary. Each agent gets its own Linux user,
+            browser terminal at <code>https://{domain}/&lt;name&gt;/</code>, and
+            its own settings page.</p>
+            {agent_rows}
+            <form method="post" action="{base}/add-agent" style="margin-top:12px">
+              <div class="row">
+                <input type="text" name="name" placeholder="agent name"
+                       pattern="[a-z][a-z0-9_-]{{1,31}}" required
+                       title="Lowercase letters, digits, - and _; 2-32 chars; starts with a letter">
+                <input type="password" name="password" placeholder="terminal password"
+                       autocomplete="off" required
+                       pattern="[A-Za-z0-9._~-]{{16,64}}"
+                       title="16-64 chars from A-Za-z0-9._~-">
+                <button type="submit">Add agent</button>
+              </div>
+              <p class="note">Password is 16-64 chars from
+              <code>[A-Za-z0-9._~-]</code>. Save it somewhere — this page
+              cannot recover it later.</p>
             </form>
           </div>"""
 
@@ -1163,14 +1435,38 @@ in
             return "<ul>" + "".join(items) + "</ul>"
 
 
+        def render_agent_rows(agents):
+            if not agents:
+                return '<p class="note">No additional agents yet.</p>'
+            items = []
+            for name in agents:
+                safe = html.escape(name)
+                items.append(
+                    f'<li><code>{safe}</code>'
+                    f'<form class="inline" method="post" action="{html.escape(BASE)}/remove-agent" '
+                    f'onsubmit="return confirm(\'Remove agent {safe}? The user\\\'s /home/{safe} is preserved.\');">'
+                    f'<input type="hidden" name="name" value="{safe}">'
+                    f'<button type="submit" class="danger">Remove</button></form></li>'
+                )
+            return "<ul>" + "".join(items) + "</ul>"
+
+
         def render_page(message=""):
             msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
+            agents_html = ""
+            if ADD_AGENT_CMD:
+                agents_html = ADD_AGENT_CARD.format(
+                    base=html.escape(BASE),
+                    domain=html.escape(ADD_AGENT_DOMAIN),
+                    agent_rows=render_agent_rows(list_agents()),
+                )
             return PAGE.format(
                 user=html.escape(USER),
                 base=html.escape(BASE),
                 keys=render_keys(read_keys()),
                 message=msg_html,
                 update=UPDATE_CARD.format(base=html.escape(BASE)) if UPDATE_CMD else "",
+                agents=agents_html,
             )
 
 
@@ -1213,7 +1509,11 @@ in
                         "restarted": "Agent restart requested.",
                         "update": "Box update started — the system rebuilds in the "
                                   "background and this page may briefly go away.",
+                        "agent-added": "Agent added.",
+                        "agent-removed": "Agent removed.",
                     }.get(params["ok"][0], "")
+                if "err" in params:
+                    message = params["err"][0][:200]
                 self._send_html(render_page(message))
 
             def _read_form(self):
@@ -1248,6 +1548,21 @@ in
                 elif path == BASE + "/update" and UPDATE_CMD:
                     update_box()
                     self._redirect("ok=update")
+                elif path == BASE + "/add-agent" and ADD_AGENT_CMD:
+                    name = (form.get("name", [""])[0]).strip()
+                    password = form.get("password", [""])[0]
+                    ok, msg = add_agent(name, password)
+                    if ok:
+                        self._redirect("ok=agent-added")
+                    else:
+                        self._redirect("err=" + urllib.parse.quote(msg))
+                elif path == BASE + "/remove-agent" and ADD_AGENT_CMD:
+                    name = (form.get("name", [""])[0]).strip()
+                    ok, msg = remove_agent(name)
+                    if ok:
+                        self._redirect("ok=agent-removed")
+                    else:
+                        self._redirect("err=" + urllib.parse.quote(msg))
                 else:
                     self._send_html("<h1>404</h1>", status=404)
 
@@ -1347,7 +1662,13 @@ in
         }
       '';
 
-      pickerBlock = ''
+      # Static picker: unauthenticated /: HTML listing terminals. Used when
+      # runtimeAgents is off — the set of users is fixed at eval time so a
+      # baked-in respond block is cheapest. When runtimeAgents is on, the
+      # picker becomes a reverse_proxy to a small daemon (below) that
+      # enumerates the runtime state dir at request time so freshly-added
+      # agents show up without a caddy reload.
+      pickerBlockStatic = ''
         # Anything else, including /: unauthenticated picker listing this
         # box's terminals. User names are not secrets; the passwords are.
         handle {
@@ -1382,6 +1703,27 @@ in
             </main>
             PICKER_HTML 200
         }
+      '';
+      pickerBlockDaemon = ''
+        # Runtime-agents mode: picker is a small daemon (root:caddy 0660
+        # unix socket) that lists declarative + runtime terminals at
+        # request time. No caddy reload needed when a runtime agent is
+        # added.
+        handle {
+          reverse_proxy unix/${pickerSocketPath}
+        }
+      '';
+      pickerBlock = if cfg.runtimeAgents.enable then pickerBlockDaemon else pickerBlockStatic;
+
+      # Runtime-agent vhost snippets — one <name>.caddy per agent, written
+      # by claude-box-agent with the bcrypt hash and cookie secret inline
+      # (0640 root:caddy, so the world-readable /nix/store never holds the
+      # hash). Empty when runtimeAgents is off.
+      runtimeVhostImport = lib.optionalString cfg.runtimeAgents.enable ''
+
+        # Runtime-agent vhosts. Written/removed by claude-box-agent; a
+        # caddy reload picks new agents up without a nixos-rebuild.
+        import ${cfg.runtimeAgents.vhostsDir}/*.caddy
       '';
 
       # Rendered Caddyfile. Module-managed (regenerated every rebuild) — safe
@@ -1438,6 +1780,7 @@ in
 
       ''
       + lib.concatMapStringsSep "\n" (name: indent "  " (terminalCaddyBlock name)) terminalUsers
+      + indent "  " runtimeVhostImport
       + "\n"
       + indent "  " pickerBlock
       + "}\n\n"
@@ -1481,6 +1824,359 @@ in
           mv "$tmp" /run/claude-box-web/env
         '';
       };
+
+      # -----------------------------------------------------------------
+      # Runtime-agent helpers. Only wired into config below when
+      # cfg.runtimeAgents.enable, but defined here so both share the web
+      # block's `settingsDaemon` binding (settings socket path, module
+      # constants) without a second let scope.
+      # -----------------------------------------------------------------
+
+      # Root helper for adding/removing OS-level agent users at runtime,
+      # invoked by the operator (services.claude-box.web.user) through a
+      # single NOPASSWD sudo entry. Everything else about a new agent —
+      # tmux service, ttyd, settings daemon, Caddy vhost — is derived
+      # from state files this helper writes; no nixos-rebuild involved.
+      #
+      # Trust model: sudoers grants the OPERATOR the ability to invoke
+      # this binary with any arguments; input validation (name shape,
+      # password shape, reserved-name checks, collision checks) lives
+      # entirely inside the helper. Password is read from stdin, never
+      # from argv, so it never lands in /proc/*/cmdline.
+      helperScript = pkgs.writeShellApplication {
+        name = "claude-box-agent";
+        runtimeInputs = with pkgs; [
+          shadow caddy openssl coreutils gnugrep gnused systemd util-linux findutils
+        ];
+        # The Nix-generated `declarative_user` case body confuses
+        # shellcheck when cfg.users is empty; and the rm -rf line only
+        # ever removes paths under a Nix-baked, non-empty state dir with
+        # a name that passed name_ok — SC2115's warning about expanding
+        # to `/` is not reachable here.
+        excludeShellChecks = [ "SC2317" "SC2115" ];
+        text = ''
+          # Runtime-agent add/remove helper (claude-box).
+          if [ "$(id -u)" -ne 0 ]; then
+            echo "claude-box-agent: must run as root (via sudo)" >&2
+            exit 2
+          fi
+
+          STATE_DIR=${lib.escapeShellArg cfg.runtimeAgents.stateDir}
+          VHOSTS_DIR=${lib.escapeShellArg cfg.runtimeAgents.vhostsDir}
+          DOMAIN=${lib.escapeShellArg cfg.web.domain}
+          OPERATOR=${lib.escapeShellArg cfg.web.user}
+
+          name_ok() {
+            [[ "$1" =~ ^[a-z][a-z0-9_-]{1,31}$ ]]
+          }
+
+          # Same shape as the CFN WebPassword parameter — punctuation
+          # limited to the URL-safe subset so the value survives every
+          # transport (env file, curl -u, cookie) without escaping.
+          password_ok() {
+            [[ "$1" =~ ^[A-Za-z0-9._~-]{16,64}$ ]]
+          }
+
+          reserved_name() {
+            case "$1" in
+              root|caddy|nobody|nogroup|systemd-*|nixbld*|"$OPERATOR") return 0 ;;
+            esac
+            return 1
+          }
+
+          # Any name defined in services.claude-box.users at eval time —
+          # baked in so runtime add cannot shadow a declarative agent.
+          declarative_user() {
+            case "$1" in
+          ${lib.concatMapStrings (n: "    ${lib.escapeShellArg n}) return 0 ;;\n") (lib.attrNames cfg.users)}
+              *) return 1 ;;
+            esac
+          }
+
+          cmd_add() {
+            local name="''${1:-}" password
+            if ! name_ok "$name"; then
+              echo "invalid name: must match [a-z][a-z0-9_-]{1,31}" >&2
+              exit 2
+            fi
+            if reserved_name "$name"; then
+              echo "refusing reserved name: $name" >&2
+              exit 2
+            fi
+            if declarative_user "$name"; then
+              echo "refusing: $name is a declarative claude-box user" >&2
+              exit 2
+            fi
+            if [ -d "$STATE_DIR/$name" ]; then
+              echo "already exists: $name" >&2
+              exit 2
+            fi
+            if id -u "$name" >/dev/null 2>&1; then
+              echo "OS user $name already exists outside claude-box control" >&2
+              exit 2
+            fi
+
+            # Password from stdin (single line) so it never lands in argv
+            # or process env. `read` returns 1 on EOF without newline —
+            # that's the common shell case, ignore it and validate the
+            # value we got.
+            IFS= read -r password || true
+            if ! password_ok "$password"; then
+              echo "invalid password: 16-64 chars from [A-Za-z0-9._~-]" >&2
+              exit 2
+            fi
+
+            # Everything sensitive (bcrypt hash, cookie secret) lands in
+            # the vhost snippet, mode 0640 root:caddy — no separate
+            # state file, no env-var indirection, so a caddy reload picks
+            # the new user up without restarting the daemon.
+            cookie_secret="$(openssl rand -hex 32)"
+            # Not --plaintext: that would put the password in the caddy
+            # subprocess's argv, world-readable via /proc for its (brief)
+            # lifetime. On a non-tty stdin caddy reads password +
+            # confirmation lines instead.
+            password_hash="$(printf '%s\n%s\n' "$password" "$password" | caddy hash-password)"
+
+            # OS user. `caddy` supplementary group lets the per-user
+            # settings daemon chown its unix socket 0660 <name>:caddy.
+            useradd -m -s ${pkgs.bashInteractive}/bin/bash -G caddy "$name"
+            # cmd_remove preserves /home/$name, so a recycled name may find
+            # an old home owned by a now-recycled uid — re-own it so the new
+            # incarnation can use it. No-op on a fresh home. "$name:" =
+            # the user's login group (useradd here creates no per-user
+            # group). Does not dereference symlinks (GNU chown -R default),
+            # and fs.protected_hardlinks (NixOS default) blocks the
+            # hardlink-to-root-file trick, so this can't be steered at
+            # files outside the home.
+            chown -R "$name:" "/home/$name"
+
+            install -d -m 0700 -o root -g root "$STATE_DIR/$name"
+
+            umask 037
+            tmp="$(mktemp "$VHOSTS_DIR/.$name.caddy.XXXXXX")"
+            cat >"$tmp" <<CADDY
+          # Runtime agent: $name (managed by claude-box-agent — do not edit).
+          redir /$name /$name/
+          handle /$name/settings* {
+            @cookie_settings_$name header_regexp Cookie "(^|; )__Host-agent_box_auth_$name=$cookie_secret(;|$)"
+            handle @cookie_settings_$name {
+              reverse_proxy unix/${settingsSocketDir}/$name.sock
+            }
+            handle {
+              route {
+                basic_auth bcrypt $name {
+                  $name $password_hash
+                }
+                header >Set-Cookie "__Host-agent_box_auth_$name=$cookie_secret; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+                reverse_proxy unix/${settingsSocketDir}/$name.sock
+              }
+            }
+          }
+          handle /$name/* {
+            @cookie_$name header_regexp Cookie "(^|; )__Host-agent_box_auth_$name=$cookie_secret(;|$)"
+            handle @cookie_$name {
+              reverse_proxy unix/${runtimeTermSocketDir}/$name/tty.sock
+            }
+            handle {
+              route {
+                basic_auth bcrypt $name {
+                  $name $password_hash
+                }
+                header >Set-Cookie "__Host-agent_box_auth_$name=$cookie_secret; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+                reverse_proxy unix/${runtimeTermSocketDir}/$name/tty.sock
+              }
+            }
+          }
+          CADDY
+            chown root:caddy "$tmp"
+            chmod 0640 "$tmp"
+            mv "$tmp" "$VHOSTS_DIR/$name.caddy"
+
+            # Reload first so the new vhost is live before services come
+            # up (avoids a brief 502 window on the first hit).
+            systemctl reload caddy.service
+
+            systemctl start "claude-box-settings@$name.socket"
+            systemctl start "claude-box@$name.service"
+            systemctl start "claude-web-terminal@$name.service"
+
+            echo "added: $name (https://$DOMAIN/$name/)"
+          }
+
+          cmd_remove() {
+            local name="''${1:-}"
+            if ! name_ok "$name"; then
+              echo "invalid name" >&2
+              exit 2
+            fi
+            if [ ! -d "$STATE_DIR/$name" ]; then
+              echo "not a runtime agent: $name" >&2
+              exit 2
+            fi
+            # Best-effort — template units may already be inactive.
+            systemctl stop "claude-web-terminal@$name.service" 2>/dev/null || true
+            systemctl stop "claude-box@$name.service" 2>/dev/null || true
+            systemctl stop "claude-box-settings@$name.service" 2>/dev/null || true
+            systemctl stop "claude-box-settings@$name.socket" 2>/dev/null || true
+            rm -f "$VHOSTS_DIR/$name.caddy"
+            systemctl reload caddy.service 2>/dev/null || true
+            rm -rf "$STATE_DIR/$name"
+            # Leave /home/$name intact — matches the module's stance that
+            # each agent home is untrusted state to back up or wipe with
+            # intent. Operator can rm -rf later.
+            userdel "$name" 2>/dev/null || true
+            echo "removed: $name (home /home/$name preserved)"
+          }
+
+          cmd_list() {
+            [ -d "$STATE_DIR" ] || return 0
+            find "$STATE_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+          }
+
+          case "''${1:-}" in
+            add)    shift; cmd_add "$@" ;;
+            remove) shift; cmd_remove "$@" ;;
+            list)   shift; cmd_list "$@" ;;
+            *) echo "usage: claude-box-agent {add|remove|list} [name]" >&2; exit 2 ;;
+          esac
+        '';
+      };
+
+      # Picker daemon (issue: dynamic terminal listing under runtime
+      # agents). Serves the same HTML as the static picker but enumerates
+      # the runtime state dir at request time, so a freshly-added agent
+      # shows up without regenerating any file. Root:caddy 0660 unix
+      # socket; adopted through socket activation (LISTEN_FDS).
+      # Same Python-3-stdlib-only rule as the settings daemon so the
+      # module stays audit-friendly.
+      pickerDaemon = pkgs.writers.writePython3Bin "claude-box-picker" {
+        flakeIgnore = [ "E501" "E302" "E305" "W503" "E226" ];
+      } ''
+        import html
+        import http.server
+        import os
+        import re
+        import socket
+        import sys
+
+        DOMAIN = os.environ.get("CLAUDE_BOX_PICKER_DOMAIN", "")
+        DECLARATIVE = [
+            u for u in os.environ.get("CLAUDE_BOX_PICKER_DECLARATIVE_USERS", "").split(",") if u
+        ]
+        RUNTIME_DIR = os.environ.get("CLAUDE_BOX_PICKER_RUNTIME_DIR", "/var/lib/claude-box-agents")
+
+        NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
+
+
+        def runtime_users():
+            try:
+                names = os.listdir(RUNTIME_DIR)
+            except OSError:
+                return []
+            out = []
+            for name in sorted(names):
+                if not NAME_RE.match(name):
+                    continue
+                if os.path.isdir(os.path.join(RUNTIME_DIR, name)):
+                    out.append(name)
+            return out
+
+
+        PAGE = """<!doctype html>
+        <html lang="en">
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="robots" content="noindex">
+        <title>Terminals — {domain}</title>
+        <style>
+          body {{ margin: 0; min-height: 100vh; display: grid; place-items: center;
+                 background: #0d1117; color: #e6edf3; font: 16px/1.6 system-ui, sans-serif; }}
+          main {{ text-align: center; }}
+          main .row {{ display: flex; gap: 8px; margin: 10px 0; align-items: stretch; }}
+          main a {{ display: flex; align-items: center; justify-content: center;
+                   padding: 12px 36px;
+                   border: 1px solid #30363d; border-radius: 10px; background: #161b22;
+                   color: #e8a087; font-size: 20px; text-decoration: none; }}
+          main a.term {{ flex: 1; }}
+          main a.gear {{ padding: 12px 18px; text-decoration: none; }}
+          main a:hover {{ border-color: #e8a087; }}
+        </style>
+        <main>
+          <h1>Terminals</h1>
+        {rows}
+        </main>
+        </html>
+        """
+
+
+        def render_row(user):
+            safe = html.escape(user)
+            return (
+                f'    <div class="row"><a class="term" href="/{safe}/">{safe}</a>'
+                f'<a class="gear" href="/{safe}/settings/" title="{safe} settings" '
+                f'aria-label="{safe} settings">&#9881;</a></div>'
+            )
+
+
+        def render():
+            # dict.fromkeys keeps first-occurrence order and dedups if a
+            # runtime name accidentally shadows a declarative one (the
+            # helper refuses that at add-time, but harmless as a belt).
+            seen = list(dict.fromkeys(DECLARATIVE + runtime_users()))
+            rows = "\n".join(render_row(u) for u in seen)
+            return PAGE.format(domain=html.escape(DOMAIN), rows=rows)
+
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            server_version = "claude-box-picker/1"
+
+            def do_GET(self):
+                body = render().encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def address_string(self):
+                if isinstance(self.client_address, tuple) and self.client_address:
+                    return super().address_string()
+                return "unix"
+
+            def log_message(self, fmt, *args):
+                sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+
+        SD_LISTEN_FDS_START = 3
+
+
+        class UnixHTTPServer(http.server.ThreadingHTTPServer):
+            # AF_UNIX so __init__'s placeholder socket() call stays within the
+            # unit's RestrictAddressFamilies=AF_UNIX (an AF_INET placeholder
+            # dies with EAFNOSUPPORT before the activation fd is adopted).
+            address_family = socket.AF_UNIX
+
+
+        def make_server():
+            if int(os.environ.get("LISTEN_FDS", "0") or "0") >= 1:
+                server = UnixHTTPServer(
+                    ("127.0.0.1", 0), Handler, bind_and_activate=False
+                )
+                # Swap the never-bound placeholder for the systemd-bound fd.
+                server.socket.close()
+                server.socket = socket.socket(fileno=SD_LISTEN_FDS_START)
+                server.server_name = "claude-box-picker"
+                server.server_port = 0
+                return server
+            # Dev fallback — not used by the module (always socket-activated).
+            return http.server.ThreadingHTTPServer(("127.0.0.1", 8079), Handler)
+
+
+        if __name__ == "__main__":
+            make_server().serve_forever()
+      '';
     in
     {
       assertions = [
@@ -1539,7 +2235,20 @@ in
       # even before the user saves any key.
       ++ lib.map (name:
         "d /home/${name}/.config/claude-box 0700 ${name} ${name} - -"
-      ) terminalUsers;
+      ) terminalUsers
+      # Runtime-agent state. stateDir is 0700 root-only (holds nothing
+      # sensitive right now, but that's the trust boundary); vhostsDir is
+      # 0755 root:caddy so caddy can traverse to read individual snippet
+      # files (which themselves are 0640 root:caddy — the bcrypt hash and
+      # cookie secret live inside each snippet, no separate secrets file).
+      # runtimeTermSocketDir only holds the per-instance RuntimeDirectory
+      # subdirs (see its definition for the squatting rationale) — root-owned
+      # 0755, explicit here even though systemd would create it on demand.
+      ++ lib.optionals cfg.runtimeAgents.enable [
+        "d ${cfg.runtimeAgents.stateDir} 0700 root root - -"
+        "d ${cfg.runtimeAgents.vhostsDir} 0755 root caddy - -"
+        "d ${runtimeTermSocketDir} 0755 root root - -"
+      ];
 
       services.caddy = {
         enable = true;
@@ -1627,6 +2336,13 @@ in
           # --no-block so the daemon's HTTP response goes out before the
           # rebuild (possibly) restarts the daemon itself.
           CLAUDE_BOX_UPDATE_CMD = "/run/wrappers/bin/sudo -n ${updateStartNoBlockCmd}";
+        } // lib.optionalAttrs (cfg.runtimeAgents.enable && name == webUser) {
+          # Runtime-agent management from the settings page — visible only
+          # on the operator's own settings daemon. Sudo entry is
+          # operator-only (see operatorSudoCommands); the daemon shells
+          # out here with the password on stdin.
+          CLAUDE_BOX_ADD_AGENT_CMD = "/run/wrappers/bin/sudo -n ${claudeBoxAgentCmd}";
+          CLAUDE_BOX_ADD_AGENT_DOMAIN = cfg.web.domain;
         };
         serviceConfig = {
           User = name;
@@ -1634,8 +2350,15 @@ in
           RestartSec = "5s";
           ExecStart = "${settingsDaemon}/bin/claude-box-settings";
           # Hardening: the daemon needs to write ~/.config/claude-box and run
-          # tmux against the /run socket dir, nothing else.
-          ProtectSystem = "strict";
+          # tmux against the /run socket dir, nothing else — EXCEPT the
+          # operator's daemon under runtimeAgents: its sudo'd claude-box-agent
+          # child runs inside THIS unit's mount namespace, and
+          # ProtectSystem=strict is a namespace property, not a uid check —
+          # it vetoes even root's useradd writing /etc, creating /home/<n>,
+          # or managing the state/vhost dirs. Drop it just there; plain DAC
+          # still keeps the daemon's own (non-root) uid out of those paths.
+          ProtectSystem =
+            if cfg.runtimeAgents.enable && name == webUser then false else "strict";
           ReadWritePaths = [ "/home/${name}" "/run/${runtimeDirectory name}" ];
           ProtectHome = false;
           PrivateDevices = true;
@@ -1648,11 +2371,207 @@ in
           # Setuid sudo needs privilege escalation, which NNP vetoes — same
           # tradeoff the agent unit makes for its sudoAllowlist. The only
           # extra power gained is the daemon user's own allowlist (the
-          # argument-free update trigger), so relax NNP only when selfUpdate
-          # is on.
-          NoNewPrivileges = !cfg.selfUpdate.enable;
+          # argument-free update trigger, and — on the operator's daemon —
+          # the runtime-agent helper), so relax NNP only for those cases.
+          NoNewPrivileges =
+            !(cfg.selfUpdate.enable || (cfg.runtimeAgents.enable && name == webUser));
         };
-      }) terminalUsers);
+      }) terminalUsers)
+      // lib.optionalAttrs cfg.runtimeAgents.enable {
+        # ---- Runtime-agent template units ----
+        # One tmux-backed agent per runtime user. Systemd substitutes %i
+        # (the instance name) at start time, so a single template serves
+        # every runtime agent. Mirrors the declarative claude-box-<name>
+        # service, minus the per-user customization surface — runtime
+        # agents get the module's default agent CLI and its default
+        # flags. For customization, add the user declaratively.
+        "claude-box@" = {
+          description = "Runtime coding-agent (tmux) for %I";
+          after = [ "network-online.target" ];
+          wants = [ "network-online.target" ];
+          # Deliberately no wantedBy — instances come up via
+          # `systemctl start` from the claude-box-agent helper.
+          # %i in a path list is preserved through makeBinPath and
+          # expanded by systemd in the resulting PATH env var.
+          path = [ "/home/%i/.nix-profile" (agentPackage cfg.agent) pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ]
+            ++ cfg.extraPackages;
+          environment = {
+            HOME = "/home/%i";
+            TMUX_TMPDIR = "/run/agent-box-%i";
+            TERM = "xterm-256color";
+            # Unconditional (unlike the declarative unit's optionalAttrs):
+            # every runtime agent has a browser terminal by construction.
+            CLAUDE_BOX_URL = "https://${cfg.web.domain}/%i/";
+          };
+          serviceConfig = {
+            User = "%i";
+            Type = "exec";
+            Restart = "always";
+            RestartSec = "2s";
+            # Same channel-plugin-cache reset the declarative unit does.
+            ExecStartPre = "${pkgs.coreutils}/bin/rm -f /home/%i/.claude/remote-settings.json";
+            ExecStart = "${runtimeAgentStart} %i";
+            ExecStop = "${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} kill-session -t ${tmuxSessionName}";
+            EnvironmentFile = [ "-/home/%i/.config/claude-box/env" ];
+            RuntimeDirectory = "agent-box-%i";
+            RuntimeDirectoryMode = "0700";
+            RuntimeDirectoryPreserve = "yes";
+            PrivateTmp = true;
+            PrivateDevices = true;
+            ProtectSystem = "strict";
+            ReadWritePaths = [ "/home/%i" ];
+            ProtectKernelTunables = true;
+            ProtectKernelModules = true;
+            ProtectControlGroups = true;
+            ProtectClock = true;
+            RestrictSUIDSGID = true;
+            RestrictRealtime = true;
+            LockPersonality = true;
+            # Runtime users are not in cfg.users, so effectiveSudoAllowlist
+            # never applied to them anyway — NNP=true is unconditionally
+            # safe here.
+            NoNewPrivileges = true;
+          } // lib.optionalAttrs cfg.protectMemory {
+            # Same memory-pressure stance as the declarative agent units:
+            # sacrifice agent work before sshd/caddy/SSM.
+            OOMScoreAdjust = lib.mkDefault 500;
+          };
+        };
+        # Browser terminal on a unix socket rather than a localhost port.
+        # ttyd's -U <user>:<group> sets the socket owner directly, so no
+        # chmod dance in a wrapper is needed.
+        "claude-web-terminal@" = {
+          description = "Browser terminal (ttyd) for %I";
+          after = [ "claude-box@%i.service" "network-online.target" ];
+          wants = [ "network-online.target" ];
+          environment.TMUX_TMPDIR = "/run/agent-box-%i";
+          serviceConfig = {
+            User = "%i";
+            Restart = "always";
+            RestartSec = "5s";
+            # Per-instance socket dir owned by the instance user — ttyd
+            # (running as %i) can bind there, and no other local user can
+            # squat the path (see runtimeTermSocketDir).
+            RuntimeDirectory = "claude-web-terminal/%i";
+            RuntimeDirectoryMode = "0755";
+            ExecStart = lib.concatStringsSep " " [
+              "${pkgs.ttyd}/bin/ttyd"
+              "--writable"
+              "-i" "${runtimeTermSocketDir}/%i/tty.sock"
+              "-U" "%i:caddy"
+              "-b" "/%i"
+              "-t" "titleFixed=%i@${cfg.web.domain}"
+              "${pkgs.tmux}/bin/tmux" "-L" tmuxSocketName "attach" "-t" tmuxSessionName
+            ];
+            ProtectSystem = "strict";
+            ProtectHome = "read-only";
+            PrivateDevices = true;
+            NoNewPrivileges = true;
+          };
+        };
+        # Per-runtime-agent settings daemon. Same binary as the
+        # declarative one (reads the same env-var contract), just
+        # activated through the template socket unit above.
+        "claude-box-settings@" = {
+          description = "Per-user secrets settings page for %I";
+          requires = [ "claude-box-settings@%i.socket" ];
+          after = [ "network-online.target" "claude-box-settings@%i.socket" ];
+          wants = [ "network-online.target" ];
+          environment = {
+            TMUX_TMPDIR = "/run/agent-box-%i";
+            CLAUDE_BOX_SETTINGS_USER = "%i";
+            CLAUDE_BOX_SETTINGS_ENV_FILE = "/home/%i/.config/claude-box/env";
+            CLAUDE_BOX_SETTINGS_BASE = "/%i/settings";
+            CLAUDE_BOX_TMUX_SOCKET = tmuxSocketName;
+            CLAUDE_BOX_TMUX_SESSION = tmuxSessionName;
+            CLAUDE_BOX_TMUX_TMPDIR = "/run/agent-box-%i";
+            CLAUDE_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
+          };
+          serviceConfig = {
+            User = "%i";
+            Restart = "always";
+            RestartSec = "5s";
+            ExecStart = "${settingsDaemon}/bin/claude-box-settings";
+            ProtectSystem = "strict";
+            ReadWritePaths = [ "/home/%i" "/run/agent-box-%i" ];
+            ProtectHome = false;
+            PrivateDevices = true;
+            ProtectKernelTunables = true;
+            ProtectKernelModules = true;
+            ProtectControlGroups = true;
+            RestrictSUIDSGID = true;
+            RestrictRealtime = true;
+            LockPersonality = true;
+            NoNewPrivileges = true;
+          };
+        };
+        # Boot-time reconcile. The helper starts template instances
+        # imperatively and they have no wantedBy, so nothing would bring
+        # runtime agents back after a reboot (or an EC2 spot restart).
+        # This oneshot walks the state dir — the single source of truth
+        # for "is <name> a runtime agent" — and starts the trio for each
+        # entry. A oneshot loop rather than `systemctl enable` symlinks:
+        # NixOS regenerates /etc/systemd/system on every switch, so
+        # runtime enablement links there are not durable.
+        claude-box-runtime-reconcile = {
+          description = "Start runtime agents recorded in ${cfg.runtimeAgents.stateDir}";
+          wantedBy = [ "multi-user.target" ];
+          after = [ "network-online.target" ];
+          wants = [ "network-online.target" ];
+          path = [ pkgs.coreutils pkgs.systemd ];
+          serviceConfig = {
+            Type = "oneshot";
+            RemainAfterExit = true;
+          };
+          script = ''
+            shopt -s nullglob
+            for state in ${cfg.runtimeAgents.stateDir}/*/; do
+              name=$(basename "$state")
+              systemctl start --no-block "claude-box-settings@$name.socket"
+              systemctl start --no-block "claude-box@$name.service"
+              systemctl start --no-block "claude-web-terminal@$name.service"
+            done
+          '';
+        };
+        # Picker daemon. stateDir is 0700 root:root, so a non-root
+        # DynamicUser could not list it. Run as root (the daemon holds no
+        # user credentials anyway — it serves an unauthenticated picker)
+        # with tight hardening below.
+        claude-box-picker = {
+          description = "Terminal picker daemon";
+          requires = [ "claude-box-picker.socket" ];
+          after = [ "claude-box-picker.socket" ];
+          wantedBy = [ "multi-user.target" ];
+          environment = {
+            CLAUDE_BOX_PICKER_DOMAIN = cfg.web.domain;
+            CLAUDE_BOX_PICKER_DECLARATIVE_USERS = lib.concatStringsSep "," terminalUsers;
+            CLAUDE_BOX_PICKER_RUNTIME_DIR = cfg.runtimeAgents.stateDir;
+          };
+          serviceConfig = {
+            User = "root";
+            Restart = "always";
+            RestartSec = "5s";
+            ExecStart = "${pickerDaemon}/bin/claude-box-picker";
+            # Runs as root but touches almost nothing — just read the
+            # state dir at request time. Hardening bounds the blast
+            # radius so a listing bug can't wander further.
+            ProtectSystem = "strict";
+            ProtectHome = true;
+            ReadOnlyPaths = [ cfg.runtimeAgents.stateDir ];
+            PrivateDevices = true;
+            PrivateTmp = true;
+            ProtectKernelTunables = true;
+            ProtectKernelModules = true;
+            ProtectControlGroups = true;
+            ProtectClock = true;
+            RestrictSUIDSGID = true;
+            RestrictRealtime = true;
+            RestrictAddressFamilies = [ "AF_UNIX" ];
+            LockPersonality = true;
+            NoNewPrivileges = true;
+          };
+        };
+      };
 
       # The settings daemon's listening sockets (issue #49). systemd (root)
       # binds each unix socket with exact ownership BEFORE the daemon starts:
@@ -1669,7 +2588,44 @@ in
           SocketGroup = "caddy";
           SocketMode = "0660";
         };
-      }) terminalUsers);
+      }) terminalUsers)
+      // lib.optionalAttrs cfg.runtimeAgents.enable {
+        # Picker daemon socket. Root:caddy 0660 — root owns because the
+        # daemon doesn't run as a real user (see the service below); caddy
+        # is the only client that talks to it via reverse_proxy.
+        claude-box-picker = {
+          description = "Picker socket";
+          wantedBy = [ "sockets.target" ];
+          socketConfig = {
+            ListenStream = pickerSocketPath;
+            SocketUser = "root";
+            SocketGroup = "caddy";
+            SocketMode = "0660";
+          };
+        };
+        # Settings-daemon template socket. `%i` in ListenStream and
+        # SocketUser is expanded by systemd at instance activation, so
+        # `systemctl start claude-box-settings@alice.socket` binds
+        # /run/claude-box-settings/alice.sock 0660 alice:caddy — the
+        # same story as the declarative sockets above, generalized.
+        "claude-box-settings@" = {
+          description = "Settings page socket for %I";
+          socketConfig = {
+            ListenStream = "${settingsSocketDir}/%i.sock";
+            SocketUser = "%i";
+            SocketGroup = "caddy";
+            SocketMode = "0660";
+          };
+        };
+      };
+
+      # Runtime-agent helper is on every user's PATH — most invocations
+      # go via sudo -n, but stashing it here keeps `claude-box-agent list`
+      # working under any interactive root shell. mkIf (rather than
+      # `// optionalAttrs cfg.…` at the top of the return attrset) keeps
+      # the module system's shape-determination step from recursing
+      # through cfg on its own definition.
+      environment.systemPackages = lib.mkIf cfg.runtimeAgents.enable [ helperScript ];
     }
   ))]);
 }
