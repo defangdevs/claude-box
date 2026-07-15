@@ -16,6 +16,10 @@ Metadata:
           - UseSpot
           - PublicIpv4
       - Label:
+          default: Agent instructions
+        Parameters:
+          - AgentsMd
+      - Label:
           default: Advanced (rarely needed)
         Parameters:
           - AllowCidr
@@ -39,6 +43,8 @@ Metadata:
         default: IPv4 CIDR allowed to reach 443
       EnableSsm:
         default: Enable SSM Session Manager root access
+      AgentsMd:
+        default: AGENTS.md seeded on first agent start
       ClaudeBoxRev:
         default: claude-box git rev
       ClaudeBoxSha256:
@@ -131,6 +137,31 @@ Parameters:
       launch — there is no way to recover it later. Even Claude Code stacks
       that plan to drive the box via Remote Control need this the first time,
       to complete `claude login` in the browser terminal.
+
+  AgentsMd:
+    Type: String
+    Default: |-
+      # claude-box
+
+      You are running inside a claude-box deployment. Your browser terminal is
+      reachable at $CLAUDE_BOX_URL (run `echo $CLAUDE_BOX_URL` to print it).
+      Share that URL with anyone who needs to view or take over your session;
+      sign-in username is `agent` and the password was set at deploy time.
+
+      Update the box's software with:
+      `sudo systemctl start claude-box-update.service`
+      (kills the running tmux session — save context first).
+    Description: >-
+      Content seeded to /home/agent/AGENTS.md on first agent start (skipped if
+      the file already exists). AGENTS.md is the cross-vendor agent-
+      instructions convention read natively by codex and opencode, and by
+      claude-code as a CLAUDE.md fallback. The default references
+      $CLAUDE_BOX_URL, which the agent's systemd env sets to this box's
+      browser-terminal URL; `echo $CLAUDE_BOX_URL` in the terminal prints it.
+      Blank to skip seeding entirely. Content is embedded into user-data as a
+      Nix indented string, so avoid the sequences `${` and `''` in the body —
+      Nix will otherwise try to antiquote / close the string mid-file. Plain
+      $VAR (no braces) is fine.
 
   AllowCidr:
     Type: String
@@ -488,6 +519,17 @@ Resources:
                     environment = { TERM = "xterm-256color"; };
                     remoteControlName = "${StackName}";
                     web.passwordHashFile = "/var/lib/claude-box-web/password-hash";
+                    # AGENTS.md content from the CFN AgentsMd parameter, spliced
+                    # as-is into a Nix indented string. Content lines land at
+                    # column 0 (matching the CFN sub position), so Nix's
+                    # dedent leaves them untouched. The default references
+                    # $CLAUDE_BOX_URL, which the module exports in the agent's
+                    # systemd env — the agent can `echo` it in the terminal.
+                    # The module skips seeding when the target file already
+                    # exists, so this is safe to (re)apply.
+                    agentsMd = ''
+${AgentsMd}
+'';
                   };
                   web = {
                     enable = true;

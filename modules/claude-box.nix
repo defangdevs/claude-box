@@ -180,6 +180,30 @@ let
         example = lib.literalExpression ''{ TERM = "xterm-256color"; }'';
         description = "Extra (non-secret) environment variables for this agent's service. Merged over the default HOME.";
       };
+      agentsMd = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = lib.literalExpression ''
+          '''
+            # claude-box
+            Your terminal is at $CLAUDE_BOX_URL — `echo` it to print.
+          '''
+        '';
+        description = ''
+          Content seeded to <workingDirectory>/AGENTS.md on agent start,
+          IFF that file does not already exist — so the agent's own
+          edits or a repo checkout in workingDirectory never get
+          clobbered. Null (default) writes nothing.
+
+          AGENTS.md is the cross-vendor agent-instructions convention
+          read natively by codex and opencode, and by claude-code as a
+          fallback when CLAUDE.md is absent. The agent's systemd env
+          exports CLAUDE_BOX_URL whenever this user has a browser
+          terminal (see web.passwordHashFile), so an AGENTS.md that
+          references that variable lets the agent answer "where am I
+          reachable?" without hard-coding the URL.
+        '';
+      };
       web.passwordHashFile = lib.mkOption {
         type = lib.types.nullOr lib.types.path;
         default = null;
@@ -243,6 +267,21 @@ let
             '.skipDangerousModePermissionPrompt = true'
         ''}
       '';
+      # AGENTS.md — cross-vendor agent-instructions file (codex, opencode
+      # native; claude-code as CLAUDE.md fallback). Only seed if absent so
+      # the agent's own edits or a repo checkout in workingDirectory never
+      # get clobbered. Content lives in the Nix store so no in-shell
+      # quoting; $CLAUDE_BOX_URL and other $refs in the content stay
+      # literal for the agent to expand at read time.
+      agentsMdFile =
+        if u.agentsMd == null then null
+        else pkgs.writeText "claude-box-${name}-agents.md" u.agentsMd;
+      seedAgentsMd = lib.optionalString (agentsMdFile != null) ''
+        if [ ! -e ${lib.escapeShellArg "${u.workingDirectory}/AGENTS.md"} ]; then
+          mkdir -p ${lib.escapeShellArg u.workingDirectory}
+          install -m 0644 ${agentsMdFile} ${lib.escapeShellArg "${u.workingDirectory}/AGENTS.md"}
+        fi
+      '';
       # Every user-provided arg gets individually shell-escaped so a
       # remoteControlName or extraArgs element containing whitespace or shell
       # metacharacters can't inject into the tmux new-session command below.
@@ -250,6 +289,7 @@ let
     pkgs.writeShellScript "claude-box-${name}-start" ''
       set -u
       ${lib.optionalString (agent.agent == "claude") seedClaudeState}
+      ${seedAgentsMd}
       # Detached tmux session so a human can `tmux -L agent-box attach -t main`.
       # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero agent exit;
       # clean exits let the session die so systemd's Restart=always brings up
@@ -534,7 +574,19 @@ in
         # process that attaches (the AWS ttyd service, or `sudo -u <name> tmux`).
         # /run/agent-box-<name> is a normal host path both sides can reach.
         # Attach with: env TMUX_TMPDIR=/run/agent-box-<name> tmux -L agent-box attach -t main
-        environment = { HOME = "/home/${name}"; TMUX_TMPDIR = "/run/${runtimeDirectory name}"; } // u.environment;
+        #
+        # CLAUDE_BOX_URL: the user's browser-terminal URL, exported only when
+        # this user actually has a terminal (web.enable + web.passwordHashFile).
+        # An AGENTS.md (see users.<name>.agentsMd) can reference it so any
+        # agent — claude-code, codex, opencode — can answer "where am I
+        # reachable?" without hard-coding the URL, which is useful because
+        # the hostname is a spot-restart away from changing.
+        environment =
+          { HOME = "/home/${name}"; TMUX_TMPDIR = "/run/${runtimeDirectory name}"; }
+          // (lib.optionalAttrs (cfg.web.enable && u.web.passwordHashFile != null) {
+            CLAUDE_BOX_URL = "https://${cfg.web.domain}/${name}/";
+          })
+          // u.environment;
         serviceConfig = {
           User = name;
           # ExecStart's mkStart supervises the tmux session and stays live for
