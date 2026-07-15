@@ -332,6 +332,23 @@ in
       description = "Create tokenDir (root-owned) via tmpfiles so token files can be dropped in.";
     };
 
+    protectMemory = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Guard the box against agent-driven memory exhaustion: compressed
+        zram swap, earlyoom as an OOM backstop, and a raised OOMScoreAdjust
+        on the agent units so the kernel and earlyoom sacrifice agent work
+        before sshd/caddy/the SSM agent. A small swapless box under memory
+        pressure never OOM-kills — reclaim keeps "succeeding" by evicting
+        clean page-cache pages (including running programs' own code),
+        which immediately refault from disk, and the whole userspace
+        livelocks (issue 62). Every knob below is set with mkDefault, so
+        hosts can tune individual pieces — e.g. add disk swap on top via
+        the standard swapDevices option.
+      '';
+    };
+
     web = {
       enable = lib.mkEnableOption ''
         browser terminals (one ttyd per user with web.passwordHashFile set)
@@ -592,6 +609,12 @@ in
           # (from cfg.sudoAllowlist or the web-implied caddy reload) we've
           # traded some containment for scoped elevation as a host choice.
           NoNewPrivileges = effectiveSudoAllowlist == [ ];
+        } // lib.optionalAttrs cfg.protectMemory {
+          # Sacrifice agent work first under memory pressure: the kernel OOM
+          # killer and earlyoom both weigh oom_score_adj, so a runaway agent
+          # process dies before sshd/caddy/SSM — and Restart=always brings
+          # the session back fresh instead of leaving a frozen box.
+          OOMScoreAdjust = lib.mkDefault 500;
         };
       }
     ) cfg.users;
@@ -614,7 +637,49 @@ in
       # gain given the allowlist is meant to be tight and command-scoped.
       commands = map (command: { inherit command; options = [ "NOPASSWD" ]; }) effectiveSudoAllowlist;
     }];
-  } (lib.mkIf cfg.selfUpdate.enable {
+  } (lib.mkIf cfg.protectMemory {
+    # Memory protection (issue 62). The incident that motivated this: a
+    # swapless 2 GB box under agent memory pressure never OOM-killed —
+    # reclaim kept "succeeding" by evicting clean page-cache pages
+    # (including running programs' own code), which immediately refaulted
+    # from disk (~80 GB/h of reads), and every userspace process froze for
+    # hours while EC2 status checks stayed green. Swap gives reclaim
+    # somewhere cheap to go; earlyoom kills the largest offender BEFORE
+    # the livelock; the agent units' OOMScoreAdjust (above) points both
+    # killers at agent work first. All mkDefault — hosts can tune.
+    zramSwap = {
+      enable = lib.mkDefault true;
+      algorithm = lib.mkDefault "zstd";
+      # Cap on UNCOMPRESSED bytes stored; at zstd's typical ~3:1 a full
+      # device costs ~1/3 of RAM, so 100% is safe and doubles headroom.
+      memoryPercent = lib.mkDefault 100;
+    };
+    # Canonical zram tuning: swap early and eagerly (compressed swap is
+    # far cheaper than dropping hot page cache), and no readahead on swap
+    # faults (meaningless on a RAM-backed device).
+    boot.kernel.sysctl = {
+      "vm.swappiness" = lib.mkDefault 180;
+      "vm.page-cluster" = lib.mkDefault 0;
+    };
+    services.earlyoom = {
+      enable = lib.mkDefault true;
+      # Kill the biggest process when free RAM and free swap both dip
+      # under the (default 10%) thresholds — i.e. act where the kernel
+      # OOM killer wouldn't, which is exactly the livelock window.
+      # Patterns match comm names, truncated by the kernel to 15 chars —
+      # hence "amazon-ssm-agen". Never pick the management plane or the
+      # tmux server (that would take every session down, not just the
+      # offender); prefer the agent CLI processes, which their unit's
+      # Restart=always respawns.
+      extraArgs = lib.mkDefault [
+        "--avoid" "^(sshd|systemd|systemd-.*|caddy|ttyd|tmux.*|amazon-ssm-agen|ssm-.*|nix-daemon)$"
+        "--prefer" "^(node|claude|codex)$"
+      ];
+    };
+    # systemd-oomd overlaps earlyoom (two daemons racing to kill under
+    # pressure); keep exactly one, explicitly.
+    systemd.oomd.enable = lib.mkDefault false;
+  }) (lib.mkIf cfg.selfUpdate.enable {
     # Agent-triggerable box update. The agents' only power here is the
     # allowlisted `sudo systemctl start claude-box-update.service` (see
     # updateStartCmd) — a trigger with no arguments, so everything below
