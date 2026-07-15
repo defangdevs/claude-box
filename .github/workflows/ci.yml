@@ -77,3 +77,9 @@ jobs:
       # wired into CI).
       - name: Run settings page VM test
         run: nix build -L .#checks.x86_64-linux.settings-page
+
+      # Interactive VM test (issue 62): protectMemory — zram swap up,
+      # OOMScoreAdjust on the agent unit, earlyoom kills a memory hog
+      # while the box stays responsive.
+      - name: Run memory protection VM test
+        run: nix build -L .#checks.x86_64-linux.memory-protection

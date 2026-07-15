@@ -220,6 +220,7 @@ All under `services.claude-box`:
 | `environmentFiles` | `[]` | Extra `EnvironmentFile` paths applied to every agent. |
 | `tokenDir` | `/etc/claude-box` | Where per-agent `<user>.env` token files live. |
 | `manageTokenDir` | `true` | Create `tokenDir` (root-owned) via tmpfiles. |
+| `protectMemory` | `true` | zram swap (zstd, sized to RAM), earlyoom, and `OOMScoreAdjust=500` on agent units, so runaway agent memory gets its process killed (and auto-restarted) instead of livelocking the whole box. All knobs are `mkDefault` - tune or disable pieces from the host config. |
 
 ## Security model
 

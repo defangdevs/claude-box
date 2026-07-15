@@ -89,6 +89,14 @@
           settings-page = pkgs.testers.runNixOSTest
             (import ./tests/settings-page.nix { claude-box = self.nixosModules.claude-box; });
 
+          # Interactive VM test (issue 62): protectMemory defaults — zram
+          # swap active, agent unit's OOMScoreAdjust applied, and earlyoom
+          # kills a runaway memory hog while the box stays responsive
+          # (instead of the swapless refault livelock that froze a deployed
+          # 2 GB box for hours).
+          memory-protection = pkgs.testers.runNixOSTest
+            (import ./tests/memory-protection.nix { claude-box = self.nixosModules.claude-box; });
+
           # Regression guard (issue #51): deployed boxes fetch
           # modules/claude-box.nix as a SINGLE file — the CFN user-data and
           # claude-box-update.service both fetchurl just that path — so the
