@@ -55,7 +55,16 @@ function addForm(page: Page): Locator {
   return page.locator('form[action$="/settings/set"]');
 }
 
+// The secret editor collapses on load when JS is live; the header button
+// toggles it. Open it only if needed (a second click would close it again).
+async function openSecretEditor(page: Page) {
+  if (await page.locator('#secret-editor').isHidden()) {
+    await page.getByRole('button', { name: 'Add secret' }).click();
+  }
+}
+
 async function saveKey(page: Page, key: string, value: string) {
+  await openSecretEditor(page);
   await addForm(page).locator('input[name="key"]').fill(key);
   await addForm(page).locator('input[name="value"]').fill(value);
   await addForm(page).getByRole('button', { name: 'Save' }).click();
@@ -122,6 +131,7 @@ test('secret value input is a password field', async ({ browser }) => {
 test('HTML5 validation blocks an invalid key name', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto(SETTINGS_PATH);
+  await openSecretEditor(page);
   await addForm(page).locator('input[name="key"]').fill('1BAD-NAME');
   await addForm(page).locator('input[name="value"]').fill('whatever');
   await addForm(page).getByRole('button', { name: 'Save' }).click();
@@ -158,6 +168,39 @@ test('saving a key lists its NAME and never its value; re-saving replaces', asyn
   await deleteKey(page, key);
 });
 
+test('pencil opens the editor with the key prefilled read-only; saving replaces the value', async ({ browser }) => {
+  const key = uniqueKey();
+  const page = await authedPage(browser);
+  await page.goto(SETTINGS_PATH);
+  await saveKey(page, key, 'before-edit');
+
+  await page.locator(`button[data-edit="${key}"]`).click();
+  const keyInput = addForm(page).locator('input[name="key"]');
+  await expect(keyInput).toHaveValue(key);
+  expect(await keyInput.evaluate((el: HTMLInputElement) => el.readOnly)).toBe(true);
+  await addForm(page).locator('input[name="value"]').fill('after-edit');
+  await addForm(page).getByRole('button', { name: 'Save' }).click();
+  await expect(page.locator('.msg')).toHaveText(/Key saved/);
+  await expect(page.locator('li', { hasText: key })).toHaveCount(1);
+
+  if (ENV_FILE) {
+    expect(fs.readFileSync(ENV_FILE, 'utf-8')).toContain(`${key}=after-edit`);
+  }
+  await deleteKey(page, key);
+});
+
+test('SPA layer: saving and deleting never triggers a full page load', async ({ browser }) => {
+  const key = uniqueKey();
+  const page = await authedPage(browser);
+  await page.goto(SETTINGS_PATH);
+  await page.evaluate(() => { (window as any).__noReloadMarker = true; });
+
+  await saveKey(page, key, 'spa-check');
+  await deleteKey(page, key);
+
+  expect(await page.evaluate(() => (window as any).__noReloadMarker)).toBe(true);
+});
+
 test('dismissing the delete confirm keeps the key; accepting removes it', async ({ browser }) => {
   const key = uniqueKey();
   const page = await authedPage(browser);
@@ -182,7 +225,7 @@ test('dismissing the delete confirm keeps the key; accepting removes it', async 
 test('restart is confirm-guarded and kills the agent tmux session', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto(SETTINGS_PATH);
-  const restart = page.getByRole('button', { name: 'Restart agent' });
+  const restart = page.getByRole('button', { name: 'Restart all' });
 
   if (TMUX_BIN) {
     expect(tmuxSessionAlive(), 'agent tmux session should be alive before the test').toBe(true);
@@ -195,7 +238,7 @@ test('restart is confirm-guarded and kills the agent tmux session', async ({ bro
 
   page.once('dialog', (d) => d.accept());
   await restart.click();
-  await expect(page.locator('.msg')).toHaveText(/Agent restart requested/);
+  await expect(page.locator('.msg')).toHaveText(/Restart of all sessions requested/);
 
   if (TMUX_BIN) {
     await expect.poll(tmuxSessionAlive, { timeout: 10_000 }).toBe(false);
