@@ -42,10 +42,6 @@ on:
         description: Deploy the ipv4-full leg as a Spot instance (matches the 1-click default)
         type: boolean
         default: false
-      enable_ssm:
-        description: EnableSsm=true on the stack + dump auth state via SSM if smoke tests fail
-        type: boolean
-        default: false
 
 permissions:
   id-token: write
@@ -141,7 +137,7 @@ jobs:
               "ParameterKey=UseSpot,ParameterValue=${{ (inputs.use_spot == true && matrix.public_ipv4 == 'true') && 'true' || matrix.use_spot }}" \
               "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
               "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small (2 vCPU / 2 GiB)' }}" \
-              "ParameterKey=EnableSsm,ParameterValue=${{ inputs.enable_ssm == true && 'true' || 'false' }}" \
+              "ParameterKey=EnableSsm,ParameterValue=${{ matrix.public_ipv4 }}" \
               "ParameterKey=AgentBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
               "ParameterKey=AgentBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
             --on-failure DO_NOTHING \
@@ -407,12 +403,16 @@ jobs:
           exit 1
 
       - name: Diagnose auth state via SSM
-        # Debug aid for dispatch runs with enable_ssm: when a smoke test fails,
-        # pull unit status, file listings, and journals off the box before it's
-        # destroyed (issue 53). Deliberately does NOT cat secret files (hash,
-        # cookie secret, caddy env) into the public log — file presence, perms,
-        # and journals cover the diagnostic need.
-        if: ${{ failure() && github.event_name == 'workflow_dispatch' && inputs.enable_ssm && matrix.public_ipv4 == 'true' }}
+        # When a smoke test fails, pull unit status, file listings, and
+        # journals off the box before it's destroyed (issues 53/84). Runs on
+        # EVERY ipv4-full failure — the failures are intermittent, so
+        # dispatch-only diagnostics kept missing them (EnableSsm rides
+        # matrix.public_ipv4: the SSM agent can't reach its IPv4-only
+        # endpoints from the IPv6-only leg, which also keeps that leg on the
+        # pure template defaults). Deliberately does NOT cat secret files
+        # (hash, cookie secret, caddy env) or user-data into the public log —
+        # file presence, perms, and journals cover the diagnostic need.
+        if: ${{ failure() && matrix.public_ipv4 == 'true' }}
         run: |
           iid='${{ steps.outputs.outputs.instance_id }}'
           if [ -z "$iid" ] || [ "$iid" = "None" ]; then
@@ -424,8 +424,11 @@ jobs:
               "systemctl --failed --no-pager || true",
               "systemctl status caddy agent-web-auth-secrets --no-pager -l 2>&1 | head -60 || true",
               "ls -la /var/lib/agent-box-web/ /run/agent-box-web/ || true",
+              "ls -la /etc/ec2-metadata/ || true",
+              "ss -ltn || true",
+              "echo ---fetch-ec2-metadata-journal---; journalctl -u fetch-ec2-metadata --no-pager 2>&1 | tail -40 || true",
               "echo ---caddy-journal---; journalctl -u caddy --no-pager 2>&1 | tail -40 || true",
-              "echo ---amazon-init-journal---; journalctl -u amazon-init --no-pager 2>&1 | tail -40 || true"
+              "echo ---amazon-init-journal---; journalctl -u amazon-init --no-pager 2>&1 | tail -60 || true"
             ]' \
             --query Command.CommandId --output text) || { echo "::warning::SSM send-command failed (missing IAM perms?)."; exit 0; }
           for i in $(seq 1 24); do
