@@ -834,6 +834,11 @@ in
     nixpkgs.config.allowUnfreePredicate =
       lib.mkDefault (pkg: builtins.elem (lib.getName pkg) [ "claude-code" "codex" ]);
 
+    # Agents self-serve tools with `nix profile add nixpkgs#<pkg>` (see the
+    # agent unit's path below) — that flake-ref syntax needs both features.
+    # List settings merge, so hosts can still extend this.
+    nix.settings.experimental-features = [ "nix-command" "flakes" ];
+
     users.users = lib.mapAttrs (name: u: {
       isNormalUser = true;
       home = "/home/${name}";
@@ -862,7 +867,10 @@ in
         # /run/wrappers is added when the agent has any sudo allowlist entries,
         # so the setuid `sudo` wrapper (which lives at /run/wrappers/bin/sudo,
         # NOT on the default systemd unit PATH) resolves in agent tool shells.
-        path = [ "/home/${name}/.nix-profile" ]
+        # config.nix.package puts the `nix` CLI itself on the agent PATH —
+        # /run/current-system/sw/bin is NOT on systemd unit PATHs, so without
+        # it `nix profile add` is unreachable from agent tool shells.
+        path = [ "/home/${name}/.nix-profile" config.nix.package ]
           ++ installedAgentPackages
           ++ [ sessionCli pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git pkgs.which ]
           ++ cfg.extraPackages

@@ -148,6 +148,9 @@ Parameters:
       Share that URL with anyone who needs to view or take over your session;
       sign-in username is `agent` and the password was set at deploy time.
 
+      Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
+      (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
+
       Update the box's software with:
       `sudo systemctl start claude-box-update.service`
       (kills the running tmux session — save context first).
