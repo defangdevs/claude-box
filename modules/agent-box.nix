@@ -970,8 +970,8 @@ in
     # One-shot migration for boxes crossing the claude-box -> agent-box
     # rename (issue 70): live state — the web password hash + cookie
     # secrets, per-user caddy snippet dirs, the settings page's env +
-    # sessions.json, dropped-in token files, and the self-update pin
-    # files — moves from the old-name paths exactly once. No-op on fresh
+    # sessions.json, dropped-in token files, and the self-update AGENT
+    # pin — moves from the old-name paths exactly once. No-op on fresh
     # boxes and after migration. Runs before switch-to-configuration
     # applies tmpfiles/units, but tolerate a pre-created empty target dir
     # anyway (rmdir only succeeds when empty, so real state never loses).
@@ -986,7 +986,12 @@ in
       _abox_migrate /etc/claude-box           ${lib.escapeShellArg cfg.tokenDir}
     ''
     + lib.optionalString cfg.selfUpdate.enable ''
-      _abox_migrate /etc/nixos/claude-box-pin.nix       ${lib.escapeShellArg cfg.selfUpdate.pinFile}
+      # The MODULE pin is deliberately NOT migrated: an old pin file holds a
+      # pre-rename rev, where modules/agent-box.nix does not exist — carrying
+      # it over would 404 the next rebuild's fetchurl. A host config crossing
+      # the rename must bake a fresh post-rename starting pin; the stale
+      # claude-box-pin.nix stays behind as a dead file. The AGENT pin (a
+      # nixos-unstable snapshot url+sha) is rename-agnostic and safe to keep.
       _abox_migrate /etc/nixos/claude-box-agent-pin.nix ${lib.escapeShellArg cfg.selfUpdate.agentPinFile}
     ''
     + lib.concatMapStrings (name: ''
