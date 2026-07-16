@@ -843,7 +843,7 @@ in
     }) cfg.users;
 
     environment.systemPackages =
-      (lib.unique (installedAgentPackages ++ [ pkgs.tmux sessionCli ] ++ cfg.extraPackages));
+      (lib.unique (installedAgentPackages ++ [ pkgs.tmux pkgs.which sessionCli ] ++ cfg.extraPackages));
 
     systemd.services = lib.mapAttrs' (name: u:
       lib.nameValuePair "claude-box-${name}" {
@@ -864,7 +864,7 @@ in
         # NOT on the default systemd unit PATH) resolves in agent tool shells.
         path = [ "/home/${name}/.nix-profile" ]
           ++ installedAgentPackages
-          ++ [ sessionCli pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ]
+          ++ [ sessionCli pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git pkgs.which ]
           ++ cfg.extraPackages
           ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers";
         # TMUX_TMPDIR puts the control socket under the /run RuntimeDirectory
