@@ -24,8 +24,38 @@ let
   settingsSocketDir = "/run/agent-box-settings";
   settingsSocketOf = name: "${settingsSocketDir}/${name}.sock";
   # The per-user secrets file the settings page (issue #36) manages. User-
-  # owned, 0600, loaded (optionally) by the agent unit's EnvironmentFile.
+  # owned, 0600, read by envExecWrapper at every session spawn (issue 89).
   userEnvFile = name: "/home/${name}/.config/agent-box/env";
+
+  # Session-spawn env loader (issue 89). Sessions are (re)created by the
+  # long-lived supervisor inside the agent unit, so a unit-level
+  # EnvironmentFile= snapshot of the user's env file goes stale the moment
+  # the settings page (or a hand edit) changes it — "restart the sessions
+  # to apply" silently applied nothing. This wrapper re-reads the file at
+  # EVERY session spawn and then execs the agent, making the file the
+  # single live source for those keys (it is deliberately NOT in the
+  # unit's EnvironmentFile, so a DELETED key disappears on restart too).
+  # Values are exported literally — never eval'd — so a secret full of
+  # shell metacharacters can't break or inject anything; one pair of
+  # surrounding quotes is stripped to match how systemd read the same
+  # file before. Key charset mirrors the settings daemon's KEY_RE.
+  envExecWrapper = name: pkgs.writeShellScript "agent-box-${name}-env-exec" ''
+    FILE=${lib.escapeShellArg (userEnvFile name)}
+    if [ -r "$FILE" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
+        key=''${line%%=*}
+        case "$key" in (*[!A-Za-z0-9_]*|""|[0-9]*) continue ;; esac
+        val=''${line#*=}
+        case "$val" in
+          \"*\") val=''${val#\"}; val=''${val%\"} ;;
+          \'*\') val=''${val#\'}; val=''${val%\'} ;;
+        esac
+        export "$key=$val"
+      done < "$FILE"
+    fi
+    exec "$@"
+  '';
 
   # Reload command is granted when web is enabled so the agent can add a
   # virtual host and reload without root — pooled with the user-supplied
@@ -539,12 +569,16 @@ ${lib.optionalString (agentsMdFile != null) ''
           mkdir -p "$wd"
           install -m 0644 ${agentsMdFile} "$wd/AGENTS.md"
         fi
-''}        # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero agent
+''}        # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
+        # time, not unit start — then execs the agent (issue 89), so
+        # settings-page secrets land on the next session (re)start.
+        # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero agent
         # exit — the dead session stays attachable for inspection and is NOT
-        # respawned over. A clean exit lets the session die; the reconcile
+        # respawned over (the wrapper execs the agent, so the exit status
+        # is the agent's). A clean exit lets the session die; the reconcile
         # loop below then starts a fresh agent within ~2s.
         $TMUX new-session -d -s "$sname" -c "$wd" \
-          "$cmd || exec ${pkgs.bashInteractive}/bin/bash"
+          "${envExecWrapper name} $cmd || exec ${pkgs.bashInteractive}/bin/bash"
       }
 
       # Reconcile forever; systemd stop tears the whole tree down (ExecStop
@@ -918,14 +952,19 @@ in
           RuntimeDirectoryPreserve = true;
           # Custom tokens (GH_TOKEN, etc.) land here. The '-' makes the per-user
           # file optional so the agent starts even before any token is dropped in.
-          # The self-serve settings page (issue #36) writes the user-owned
-          # ~/.config/agent-box/env; it's listed here (also '-'-optional) so an
-          # end user can add secrets through the browser without a rebuild and
-          # without typing them into the agent chat/terminal. Restarting the
-          # agent (settings-page "Apply") reloads this env.
+          # NOTE: the settings page's user-owned ~/.config/agent-box/env is
+          # deliberately NOT listed here. Unit env is a snapshot from unit
+          # start, and sessions are respawned by the long-lived supervisor —
+          # so browser-added secrets never reached restarted sessions, and
+          # deleted keys never left (issue 89). The supervisor's env-exec
+          # wrapper reads that file at every session spawn instead. The
+          # tokenDir file stays unit-level: it's root-owned 0600, which the
+          # agent user can't read at spawn time — the settings page's
+          # "Restart all" bounces this whole unit (the daemon SIGTERMs the
+          # supervisor, its own uid; Restart=always below), so token drops
+          # apply there without sudo.
           EnvironmentFile = cfg.environmentFiles
             ++ [ "-${cfg.tokenDir}/${name}.env" ]
-            ++ [ "-/home/${name}/.config/agent-box/env" ]
             ++ u.environmentFiles;
 
           # Systemd hardening. The OS boundary has to stay meaningful even
@@ -1252,6 +1291,7 @@ in
         import json
         import os
         import re
+        import signal
         import socket
         import subprocess
         import sys
@@ -1455,6 +1495,50 @@ in
             tmux("kill-session", "-t", "=" + name)
 
 
+        def find_supervisor_pids():
+            """PIDs of this user's session supervisor — the agent unit's main
+            process (the mkStart store script). Matched by an argv element
+            ending in "agent-box-<user>-start", restricted to our own uid."""
+            marker = "agent-box-%s-start" % USER
+            uid = os.getuid()
+            pids = []
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    if os.stat("/proc/" + entry).st_uid != uid:
+                        continue
+                    with open("/proc/%s/cmdline" % entry, "rb") as fh:
+                        argv = fh.read().split(b"\0")
+                except OSError:
+                    continue  # process raced away
+                if any(a.decode("utf-8", "replace").endswith(marker) for a in argv):
+                    pids.append(int(entry))
+            return pids
+
+
+        def restart_all():
+            """Bounce the WHOLE agent unit, no sudo needed: SIGTERM the
+            supervisor (the unit's main process, our own uid). systemd then
+            tears the session tree down and Restart=always brings the unit
+            back with freshly read EnvironmentFiles — unit env is a
+            start-time snapshot, so this is the only lever that applies
+            root-dropped tokenDir changes (issue 89). Per-session restarts
+            stay cheap: the spawn wrapper re-reads the user env file anyway.
+            Dev rigs without the unit fall back to bouncing the sessions."""
+            pids = find_supervisor_pids()
+            if not pids:
+                for name in read_sessions():
+                    if SESSION_RE.match(name):
+                        kill_session(name)
+                return
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError as exc:
+                    sys.stderr.write("restart_all: pid %d: %s\n" % (pid, exc))
+
+
         def update_box():
             """Trigger the box update oneshot via the allowlisted sudo command.
             --no-block (baked into UPDATE_CMD) means this returns immediately;
@@ -1625,7 +1709,8 @@ in
             <ul class="tbl danger">
               <li>
                 <span class="dz"><strong>Restart all sessions</strong>
-                <span class="note">Reloads every agent with the current secrets.
+                <span class="note">Restarts the whole agent service: every
+                session comes back with the current secrets and token files.
                 Live sessions are killed &mdash; unsaved in-flight work is lost.</span></span>
                 <form method="post" action="{base}/restart"
                       onsubmit="return confirm('Restart all sessions now? Live sessions will be killed and any unsaved in-flight work is lost.');">
@@ -2012,11 +2097,9 @@ in
                         kill_session(name)
                     self._redirect("ok=session_restarted", SESS_PAGE)
                 elif path == BASE + "/restart":
-                    # Bounce every listed session so all agents reload the env
-                    # file; the supervisor brings them back within ~2s.
-                    for name in read_sessions():
-                        if SESSION_RE.match(name):
-                            kill_session(name)
+                    # Full unit bounce (see restart_all): re-reads unit-level
+                    # EnvironmentFiles, which per-session restarts can't.
+                    restart_all()
                     self._redirect("ok=restarted")
                 elif path == BASE + "/update" and UPDATE_CMD:
                     update_box()
