@@ -93,8 +93,17 @@
   testScript = ''
     start_all()
     machine.wait_for_unit("caddy.service")
+    machine.wait_for_unit("agent-box-agent.service")
     machine.wait_for_unit("agent-box-settings-agent.service")
     client.wait_for_unit("multi-user.target")
+
+    def tmux(cmd):
+        # Run a tmux command as the agent user against its own server (the
+        # socket lives under the agent unit's RuntimeDirectory, not /tmp).
+        return (
+            "su -s /bin/sh agent -c 'env TMUX_TMPDIR=/run/agent-box-agent "
+            "tmux -L agent-box " + cmd + "'"
+        )
 
     machine_ip = machine.succeed("ip -4 -o addr show eth1 | head -1").split()[3].split("/")[0]
     curl = f"curl -sk --resolve box.test:443:{machine_ip}"
@@ -172,12 +181,69 @@
     )
     machine.fail("grep -q GH_TOKEN /home/agent/.config/agent-box/env")
 
-    # The agent unit lists the user env file as an optional EnvironmentFile so
-    # saved keys land in its environment after a restart — no rebuild.
-    machine.succeed(
+    # Issue 89: the user env file must NOT be a unit-level EnvironmentFile —
+    # that's a snapshot from unit start, and sessions are respawned by the
+    # long-lived supervisor, so UI-added secrets never reached restarted
+    # sessions (and deleted keys never left). The spawn wrapper below is
+    # the live source instead.
+    machine.fail(
         "systemctl show agent-box-agent --property=EnvironmentFiles "
         "| grep -q '/home/agent/.config/agent-box/env'"
     )
+
+    # Dump the main session's pane environment (NUL-separated /proc environ
+    # as lines) — used by the issue 89 regression subtests below.
+    pane_env = (
+        tmux('display -p -t "=main:" "#{pane_pid}"')
+        + " | xargs -I{} sh -c \"tr '\\0' '\\n' < /proc/{}/environ\""
+    )
+
+    def restart_all_and_wait_new_pane():
+        old_pane = machine.succeed(tmux('display -p -t "=main:" "#{pane_pid}"')).strip()
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-X POST https://box.test/agent/settings/restart | grep -x 303"
+        )
+        machine.wait_until_succeeds(
+            tmux('display -p -t "=main:" "#{pane_pid}"')
+            + f" | grep . | grep -vx '{old_pane}'",
+            timeout=90,
+        )
+
+    # Issue 89 regression test: secrets saved through the page reach the
+    # SESSION's process environment after a page-triggered restart (the
+    # spawn wrapper re-reads the env file; the old unit-level
+    # EnvironmentFile was a stale snapshot from unit start)...
+    with subtest("UI-added env reaches restarted sessions"):
+        machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=120)
+        for kv in ["key=UI_SECRET&value=from-the-ui", "key=UI_KEEP&value=stays"]:
+            client.succeed(
+                f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+                f"-d '{kv}' https://box.test/agent/settings/set | grep -x 303"
+            )
+        restart_all_and_wait_new_pane()
+        # wait_until: right after spawn the pane may still be the wrapper
+        # (pre-exec), whose /proc environ doesn't show the exports yet.
+        machine.wait_until_succeeds(
+            pane_env + " | grep -qx 'UI_SECRET=from-the-ui'", timeout=30
+        )
+        machine.succeed(pane_env + " | grep -qx 'UI_KEEP=stays'")
+
+    # ...and a DELETED key is gone from the next spawn (the old unit-level
+    # env kept stale values alive until reboot). UI_KEEP doubles as the
+    # exec sentinel: once it shows up, the agent env is live, so the same
+    # read proving UI_KEEP present must show UI_SECRET absent.
+    with subtest("deleted env leaves restarted sessions"):
+        client.succeed(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-d 'key=UI_SECRET' https://box.test/agent/settings/delete | grep -x 303"
+        )
+        restart_all_and_wait_new_pane()
+        machine.wait_until_succeeds(
+            pane_env + " > /tmp/pane-env && grep -qx 'UI_KEEP=stays' /tmp/pane-env",
+            timeout=30,
+        )
+        machine.fail("grep -q '^UI_SECRET=' /tmp/pane-env")
 
     # Issue 54: with selfUpdate enabled the page shows the Update card...
     assert "Update box" in page, "Update box card should be rendered when selfUpdate is on"

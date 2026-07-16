@@ -24,8 +24,38 @@ let
   settingsSocketDir = "/run/agent-box-settings";
   settingsSocketOf = name: "${settingsSocketDir}/${name}.sock";
   # The per-user secrets file the settings page (issue #36) manages. User-
-  # owned, 0600, loaded (optionally) by the agent unit's EnvironmentFile.
+  # owned, 0600, read by envExecWrapper at every session spawn (issue 89).
   userEnvFile = name: "/home/${name}/.config/agent-box/env";
+
+  # Session-spawn env loader (issue 89). Sessions are (re)created by the
+  # long-lived supervisor inside the agent unit, so a unit-level
+  # EnvironmentFile= snapshot of the user's env file goes stale the moment
+  # the settings page (or a hand edit) changes it — "restart the sessions
+  # to apply" silently applied nothing. This wrapper re-reads the file at
+  # EVERY session spawn and then execs the agent, making the file the
+  # single live source for those keys (it is deliberately NOT in the
+  # unit's EnvironmentFile, so a DELETED key disappears on restart too).
+  # Values are exported literally — never eval'd — so a secret full of
+  # shell metacharacters can't break or inject anything; one pair of
+  # surrounding quotes is stripped to match how systemd read the same
+  # file before. Key charset mirrors the settings daemon's KEY_RE.
+  envExecWrapper = name: pkgs.writeShellScript "agent-box-${name}-env-exec" ''
+    FILE=${lib.escapeShellArg (userEnvFile name)}
+    if [ -r "$FILE" ]; then
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
+        key=''${line%%=*}
+        case "$key" in (*[!A-Za-z0-9_]*|""|[0-9]*) continue ;; esac
+        val=''${line#*=}
+        case "$val" in
+          \"*\") val=''${val#\"}; val=''${val%\"} ;;
+          \'*\') val=''${val#\'}; val=''${val%\'} ;;
+        esac
+        export "$key=$val"
+      done < "$FILE"
+    fi
+    exec "$@"
+  '';
 
   # Reload command is granted when web is enabled so the agent can add a
   # virtual host and reload without root — pooled with the user-supplied
@@ -539,12 +569,16 @@ ${lib.optionalString (agentsMdFile != null) ''
           mkdir -p "$wd"
           install -m 0644 ${agentsMdFile} "$wd/AGENTS.md"
         fi
-''}        # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero agent
+''}        # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
+        # time, not unit start — then execs the agent (issue 89), so
+        # settings-page secrets land on the next session (re)start.
+        # `|| exec bash` gives a POST-MORTEM shell ONLY on non-zero agent
         # exit — the dead session stays attachable for inspection and is NOT
-        # respawned over. A clean exit lets the session die; the reconcile
+        # respawned over (the wrapper execs the agent, so the exit status
+        # is the agent's). A clean exit lets the session die; the reconcile
         # loop below then starts a fresh agent within ~2s.
         $TMUX new-session -d -s "$sname" -c "$wd" \
-          "$cmd || exec ${pkgs.bashInteractive}/bin/bash"
+          "${envExecWrapper name} $cmd || exec ${pkgs.bashInteractive}/bin/bash"
       }
 
       # Reconcile forever; systemd stop tears the whole tree down (ExecStop
@@ -918,14 +952,17 @@ in
           RuntimeDirectoryPreserve = true;
           # Custom tokens (GH_TOKEN, etc.) land here. The '-' makes the per-user
           # file optional so the agent starts even before any token is dropped in.
-          # The self-serve settings page (issue #36) writes the user-owned
-          # ~/.config/agent-box/env; it's listed here (also '-'-optional) so an
-          # end user can add secrets through the browser without a rebuild and
-          # without typing them into the agent chat/terminal. Restarting the
-          # agent (settings-page "Apply") reloads this env.
+          # NOTE: the settings page's user-owned ~/.config/agent-box/env is
+          # deliberately NOT listed here. Unit env is a snapshot from unit
+          # start, and sessions are respawned by the long-lived supervisor —
+          # so browser-added secrets never reached restarted sessions, and
+          # deleted keys never left (issue 89). The supervisor's env-exec
+          # wrapper reads that file at every session spawn instead. The
+          # tokenDir file stays unit-level: it's root-owned 0600, which the
+          # agent user can't read at spawn time (root drops require a
+          # unit restart to apply, as before).
           EnvironmentFile = cfg.environmentFiles
             ++ [ "-${cfg.tokenDir}/${name}.env" ]
-            ++ [ "-/home/${name}/.config/agent-box/env" ]
             ++ u.environmentFiles;
 
           # Systemd hardening. The OS boundary has to stay meaningful even
