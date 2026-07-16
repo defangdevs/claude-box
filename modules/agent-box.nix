@@ -959,8 +959,10 @@ in
           # deleted keys never left (issue 89). The supervisor's env-exec
           # wrapper reads that file at every session spawn instead. The
           # tokenDir file stays unit-level: it's root-owned 0600, which the
-          # agent user can't read at spawn time (root drops require a
-          # unit restart to apply, as before).
+          # agent user can't read at spawn time — the settings page's
+          # "Restart all" bounces this whole unit (the daemon SIGTERMs the
+          # supervisor, its own uid; Restart=always below), so token drops
+          # apply there without sudo.
           EnvironmentFile = cfg.environmentFiles
             ++ [ "-${cfg.tokenDir}/${name}.env" ]
             ++ u.environmentFiles;
@@ -1289,6 +1291,7 @@ in
         import json
         import os
         import re
+        import signal
         import socket
         import subprocess
         import sys
@@ -1492,6 +1495,50 @@ in
             tmux("kill-session", "-t", "=" + name)
 
 
+        def find_supervisor_pids():
+            """PIDs of this user's session supervisor — the agent unit's main
+            process (the mkStart store script). Matched by an argv element
+            ending in "agent-box-<user>-start", restricted to our own uid."""
+            marker = "agent-box-%s-start" % USER
+            uid = os.getuid()
+            pids = []
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    if os.stat("/proc/" + entry).st_uid != uid:
+                        continue
+                    with open("/proc/%s/cmdline" % entry, "rb") as fh:
+                        argv = fh.read().split(b"\0")
+                except OSError:
+                    continue  # process raced away
+                if any(a.decode("utf-8", "replace").endswith(marker) for a in argv):
+                    pids.append(int(entry))
+            return pids
+
+
+        def restart_all():
+            """Bounce the WHOLE agent unit, no sudo needed: SIGTERM the
+            supervisor (the unit's main process, our own uid). systemd then
+            tears the session tree down and Restart=always brings the unit
+            back with freshly read EnvironmentFiles — unit env is a
+            start-time snapshot, so this is the only lever that applies
+            root-dropped tokenDir changes (issue 89). Per-session restarts
+            stay cheap: the spawn wrapper re-reads the user env file anyway.
+            Dev rigs without the unit fall back to bouncing the sessions."""
+            pids = find_supervisor_pids()
+            if not pids:
+                for name in read_sessions():
+                    if SESSION_RE.match(name):
+                        kill_session(name)
+                return
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError as exc:
+                    sys.stderr.write("restart_all: pid %d: %s\n" % (pid, exc))
+
+
         def update_box():
             """Trigger the box update oneshot via the allowlisted sudo command.
             --no-block (baked into UPDATE_CMD) means this returns immediately;
@@ -1662,7 +1709,8 @@ in
             <ul class="tbl danger">
               <li>
                 <span class="dz"><strong>Restart all sessions</strong>
-                <span class="note">Reloads every agent with the current secrets.
+                <span class="note">Restarts the whole agent service: every
+                session comes back with the current secrets and token files.
                 Live sessions are killed &mdash; unsaved in-flight work is lost.</span></span>
                 <form method="post" action="{base}/restart"
                       onsubmit="return confirm('Restart all sessions now? Live sessions will be killed and any unsaved in-flight work is lost.');">
@@ -2049,11 +2097,9 @@ in
                         kill_session(name)
                     self._redirect("ok=session_restarted", SESS_PAGE)
                 elif path == BASE + "/restart":
-                    # Bounce every listed session so all agents reload the env
-                    # file; the supervisor brings them back within ~2s.
-                    for name in read_sessions():
-                        if SESSION_RE.match(name):
-                            kill_session(name)
+                    # Full unit bounce (see restart_all): re-reads unit-level
+                    # EnvironmentFiles, which per-session restarts can't.
+                    restart_all()
                     self._redirect("ok=restarted")
                 elif path == BASE + "/update" and UPDATE_CMD:
                     update_box()

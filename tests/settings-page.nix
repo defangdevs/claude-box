@@ -79,8 +79,16 @@
             reverse_proxy unix//run/agent-box-settings/agent.sock
           }
         }
+        # Root catch-all: the session manager and its /sessions/* CRUD
+        # routes (the daemon runs in AGENT_BOX_HOME mode for web.user) —
+        # same auth gate, same upstream, mirroring the module Caddyfile.
         handle {
-          respond "ok" 200
+          route {
+            basic_auth bcrypt agent {
+              agent {$WEB_PASSWORD_HASH_AGENT}
+            }
+            reverse_proxy unix//run/agent-box-settings/agent.sock
+          }
         }
       }
     '');
@@ -191,19 +199,20 @@
         "| grep -q '/home/agent/.config/agent-box/env'"
     )
 
-    # Dump the main session's pane environment (NUL-separated /proc environ
-    # as lines) — used by the issue 89 regression subtests below.
-    pane_env = (
+    # Dump the environment of the main session's AGENT process. The pane
+    # pid is the `sh -c "wrapper cmd || exec bash"` shell; the env-exec
+    # wrapper (and the agent it execs, same pid) is that shell's CHILD —
+    # /proc environ is an exec-time snapshot, so the exports only show up
+    # there. Empty output (no child yet) just fails the grep and retries.
+    agent_env = (
         tmux('display -p -t "=main:" "#{pane_pid}"')
+        + " | xargs -I{} sh -c 'pgrep -P {} | head -1'"
         + " | xargs -I{} sh -c \"tr '\\0' '\\n' < /proc/{}/environ\""
     )
 
-    def restart_all_and_wait_new_pane():
+    def wait_new_pane(restart_cmd):
         old_pane = machine.succeed(tmux('display -p -t "=main:" "#{pane_pid}"')).strip()
-        client.succeed(
-            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
-            "-X POST https://box.test/agent/settings/restart | grep -x 303"
-        )
+        client.succeed(restart_cmd)
         machine.wait_until_succeeds(
             tmux('display -p -t "=main:" "#{pane_pid}"')
             + f" | grep . | grep -vx '{old_pane}'",
@@ -211,39 +220,52 @@
         )
 
     # Issue 89 regression test: secrets saved through the page reach the
-    # SESSION's process environment after a page-triggered restart (the
-    # spawn wrapper re-reads the env file; the old unit-level
-    # EnvironmentFile was a stale snapshot from unit start)...
-    with subtest("UI-added env reaches restarted sessions"):
+    # SESSION's process environment after a PER-SESSION restart (the spawn
+    # wrapper re-reads the env file; the old unit-level EnvironmentFile
+    # was a stale snapshot from unit start)...
+    with subtest("UI-added env reaches a restarted session (spawn wrapper)"):
         machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=120)
         for kv in ["key=UI_SECRET&value=from-the-ui", "key=UI_KEEP&value=stays"]:
             client.succeed(
                 f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
                 f"-d '{kv}' https://box.test/agent/settings/set | grep -x 303"
             )
-        restart_all_and_wait_new_pane()
-        # wait_until: right after spawn the pane may still be the wrapper
-        # (pre-exec), whose /proc environ doesn't show the exports yet.
-        machine.wait_until_succeeds(
-            pane_env + " | grep -qx 'UI_SECRET=from-the-ui'", timeout=30
+        wait_new_pane(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-d 'name=main' https://box.test/sessions/restart | grep -x 303"
         )
-        machine.succeed(pane_env + " | grep -qx 'UI_KEEP=stays'")
+        machine.wait_until_succeeds(
+            agent_env + " | grep -qx 'UI_SECRET=from-the-ui'", timeout=30
+        )
+        machine.succeed(agent_env + " | grep -qx 'UI_KEEP=stays'")
 
-    # ...and a DELETED key is gone from the next spawn (the old unit-level
-    # env kept stale values alive until reboot). UI_KEEP doubles as the
-    # exec sentinel: once it shows up, the agent env is live, so the same
-    # read proving UI_KEEP present must show UI_SECRET absent.
-    with subtest("deleted env leaves restarted sessions"):
+    # ...and "Restart all" bounces the WHOLE unit (the daemon SIGTERMs the
+    # supervisor — no sudo), so unit-level EnvironmentFiles like tokenDir
+    # are re-read, and a DELETED key is gone from the next spawn. UI_KEEP
+    # doubles as the exec sentinel: the same read that proves it arrived
+    # must show UI_SECRET absent.
+    with subtest("restart-all bounces the unit; deleted env leaves"):
         client.succeed(
             f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
             "-d 'key=UI_SECRET' https://box.test/agent/settings/delete | grep -x 303"
         )
-        restart_all_and_wait_new_pane()
+        old_main = machine.succeed(
+            "systemctl show agent-box-agent --property=MainPID --value"
+        ).strip()
+        wait_new_pane(
+            f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+            "-X POST https://box.test/agent/settings/restart | grep -x 303"
+        )
         machine.wait_until_succeeds(
-            pane_env + " > /tmp/pane-env && grep -qx 'UI_KEEP=stays' /tmp/pane-env",
+            "p=$(systemctl show agent-box-agent --property=MainPID --value); "
+            f"[ -n \"$p\" ] && [ \"$p\" != 0 ] && [ \"$p\" != {old_main} ]",
+            timeout=60,
+        )
+        machine.wait_until_succeeds(
+            agent_env + " > /tmp/agent-env && grep -qx 'UI_KEEP=stays' /tmp/agent-env",
             timeout=30,
         )
-        machine.fail("grep -q '^UI_SECRET=' /tmp/pane-env")
+        machine.fail("grep -q '^UI_SECRET=' /tmp/agent-env")
 
     # Issue 54: with selfUpdate enabled the page shows the Update card...
     assert "Update box" in page, "Update box card should be rendered when selfUpdate is on"
