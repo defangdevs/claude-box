@@ -115,6 +115,8 @@
     # (installAgents defaults to all supported agents).
     machine.succeed("test -x /run/current-system/sw/bin/claude")
     machine.succeed("test -x /run/current-system/sw/bin/codex")
+    machine.succeed("su -s /bin/sh agent -c 'test -x /home/agent/.codex/packages/standalone/current/codex'")
+    machine.succeed("test -x /run/current-system/sw/bin/bwrap")
 
     # --- runtime add: no sudo, no rebuild ---------------------------------
     machine.succeed(

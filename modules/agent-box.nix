@@ -96,6 +96,12 @@ let
     else if agent == "claude" then agentPkgs.claude-code
     else agentPkgs.codex;
   installedAgentPackages = map agentPackage cfg.installAgents;
+  installedCodexPackage = lib.optional (builtins.elem "codex" cfg.installAgents) (agentPackage "codex");
+  agentRuntimePackages = lib.unique (
+    installedAgentPackages
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli ]
+    ++ cfg.extraPackages
+  );
   # Sessions are RUNTIME data (issue #59): the Nix-declared
   # users.<name>.sessions (or the legacy per-user agent/… options, which
   # stand in for a single session named "main") only SEED
@@ -473,6 +479,17 @@ let
       if [ ! -s "$SESSIONS_FILE" ]; then
         install -m 0600 ${sessionsSeedFile name u} "$SESSIONS_FILE"
       fi
+
+${lib.optionalString (installedCodexPackage != [ ]) ''
+      # Codex remote-control pairing currently requires the standalone
+      # installer layout at ~/.codex/packages/standalone/current/codex.
+      # Mirror that fixed path to the Nix-provided Codex so pairing works
+      # without a curl-installed second copy.
+      mkdir -p ${home}/.codex/packages/standalone/agent-box-current
+      ln -sfn ${lib.escapeShellArg (lib.getExe (lib.head installedCodexPackage))} \
+        ${home}/.codex/packages/standalone/agent-box-current/codex
+      ln -sfn agent-box-current ${home}/.codex/packages/standalone/current
+''}
 
       seed_json() {
         # seed_json FILE JQ_ARGS... — jq-edit FILE in place, creating it
@@ -883,8 +900,7 @@ in
       shell = pkgs.bashInteractive;
     }) cfg.users;
 
-    environment.systemPackages =
-      (lib.unique (installedAgentPackages ++ [ pkgs.tmux pkgs.which sessionCli ] ++ cfg.extraPackages));
+    environment.systemPackages = agentRuntimePackages;
 
     systemd.services = lib.mapAttrs' (name: u:
       lib.nameValuePair "agent-box-${name}" {
@@ -907,9 +923,8 @@ in
         # /run/current-system/sw/bin is NOT on systemd unit PATHs, so without
         # it `nix profile add` is unreachable from agent tool shells.
         path = [ "/home/${name}/.nix-profile" config.nix.package ]
-          ++ installedAgentPackages
-          ++ [ sessionCli pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git pkgs.which ]
-          ++ cfg.extraPackages
+          ++ agentRuntimePackages
+          ++ [ pkgs.bashInteractive pkgs.coreutils pkgs.git ]
           ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers";
         # TMUX_TMPDIR puts the control socket under the /run RuntimeDirectory
         # below instead of /tmp. PrivateTmp (in serviceConfig) gives this unit a
