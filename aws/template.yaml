@@ -7,6 +7,7 @@ Metadata:
           default: Terminal access
         Parameters:
           - Agent
+          - UserName
           - WebPassword
       - Label:
           default: Compute and cost
@@ -31,6 +32,8 @@ Metadata:
         default: Web terminal password (16-64 chars — save it, AWS masks it)
       Agent:
         default: Agent CLI
+      UserName:
+        default: Linux user the agent runs as
       InstanceType:
         default: EC2 instance type
       RootVolumeSize:
@@ -67,6 +70,17 @@ Parameters:
       Agent CLI to run in the persistent tmux session. Supported values:
       claude (Claude Code) and codex (OpenAI Codex CLI). Claude-specific
       Remote Control settings are ignored when codex is selected.
+
+  UserName:
+    Type: String
+    Default: agent
+    AllowedPattern: ^[a-z_][a-z0-9_-]{0,30}$
+    Description: >-
+      Linux user the agent CLI runs as. Doubles as the browser-terminal
+      sign-in username (the basic-auth username picks the terminal), the
+      /<user>/ path in the WebURL, the home directory (/home/<user>), and
+      the <user>@<stack> Remote Control session name. Lowercase letters,
+      digits, "_" and "-", starting with a letter or "_", max 31 chars.
 
   InstanceType:
     Type: String
@@ -129,9 +143,10 @@ Parameters:
     MaxLength: 64
     AllowedPattern: ^[A-Za-z0-9._~-]{16,64}$
     Description: >-
-      Shared secret for the browser terminal. Log in with username "agent" and
-      this password; Caddy then sets an HttpOnly Secure cookie so the WebSocket
-      upgrade can authenticate without putting the secret in the URL. Use 16-64
+      Shared secret for the browser terminal. Log in with the UserName chosen
+      above (default "agent") and this password; Caddy then sets an HttpOnly
+      Secure cookie so the WebSocket upgrade can authenticate without putting
+      the secret in the URL. Use 16-64
       chars from [A-Za-z0-9._~-]. AWS masks this field with dots after you type
       it and never emits it in stack outputs, so save it somewhere before you
       launch — there is no way to recover it later. Even Claude Code stacks
@@ -146,7 +161,8 @@ Parameters:
       You are running inside a claude-box deployment. Your browser terminal is
       reachable at $CLAUDE_BOX_URL (run `echo $CLAUDE_BOX_URL` to print it).
       Share that URL with anyone who needs to view or take over your session;
-      sign-in username is `agent` and the password was set at deploy time.
+      the sign-in username is your own login name (`whoami`) and the password
+      was set at deploy time.
 
       Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
       (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
@@ -155,8 +171,8 @@ Parameters:
       `sudo systemctl start claude-box-update.service`
       (kills the running tmux session — save context first).
     Description: >-
-      Content seeded to /home/agent/AGENTS.md on first agent start (skipped if
-      the file already exists). AGENTS.md is the cross-vendor agent-
+      Content seeded to the agent user's ~/AGENTS.md on first agent start
+      (skipped if the file already exists). AGENTS.md is the cross-vendor agent-
       instructions convention read natively by codex and opencode, and by
       claude-code as a CLAUDE.md fallback. The default references
       $CLAUDE_BOX_URL, which the agent's systemd env sets to this box's
@@ -518,9 +534,9 @@ Resources:
                 services.claude-box = {
                   enable = true;
                   agent = "${Agent}";
-                  users.agent = {
+                  users."${UserName}" = {
                     environment = { TERM = "xterm-256color"; };
-                    remoteControlName = "${StackName}";
+                    remoteControlName = "${UserName}@${StackName}";
                     web.passwordHashFile = "/var/lib/claude-box-web/password-hash";
                     # AGENTS.md content from the CFN AgentsMd parameter, spliced
                     # as-is into a Nix indented string. The next line's leading
@@ -539,7 +555,7 @@ Resources:
                   web = {
                     enable = true;
                     domain = hostname;
-                    user = "agent";
+                    user = "${UserName}";
                   };
                   # Lets the agent update the box on request:
                   #   sudo systemctl start claude-box-update.service
@@ -610,13 +626,13 @@ Outputs:
       Browser terminal for the selected agent. Claude Code deployments are also
       drivable from the Claude apps via Remote Control after the first login.
       First load takes ~2-3 minutes while the instance provisions and Caddy
-      issues an ACME cert. Sign in with username "agent" and the WebPassword
-      chosen at deployment time. (The URL deliberately carries no user@
-      prefix: Chrome answers the auth challenge with URL userinfo plus an
+      issues an ACME cert. Sign in with the UserName (default "agent") and the
+      WebPassword chosen at deployment time. (The URL deliberately carries no
+      user@ prefix: Chrome answers the auth challenge with URL userinfo plus an
       EMPTY password, and credentials typed into the prompt cannot override
       the URL-embedded identity — issue 56.)
     Value: !Sub
-      - "https://${Host}.sslip.io/agent/"
+      - "https://${Host}.sslip.io/${UserName}/"
       - Host: !If
           - UseIpv4
           - !Ref EIP
@@ -626,11 +642,12 @@ Outputs:
 
   RemoteControlSession:
     Description: >-
-      Claude Remote Control session name. After finishing `claude login` once
-      in the browser terminal, the Claude desktop / mobile apps can drive this
-      session directly (sign in with the same Claude account). Only meaningful
-      when Agent=claude; Codex has no Remote Control channel.
-    Value: !Ref AWS::StackName
+      Claude Remote Control session name (<UserName>@<stack name>). After
+      finishing `claude login` once in the browser terminal, the Claude
+      desktop / mobile apps can drive this session directly (sign in with the
+      same Claude account). Only meaningful when Agent=claude; Codex has no
+      Remote Control channel.
+    Value: !Sub ${UserName}@${AWS::StackName}
 
   PublicAddress:
     Description: Elastic IP (IPv4 mode) or primary IPv6 (IPv6 mode).
