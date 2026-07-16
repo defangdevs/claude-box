@@ -82,22 +82,29 @@ Parameters:
       the <user>@<stack> Remote Control session name. Lowercase letters,
       digits, "_" and "-", starting with a letter or "_", max 31 chars.
 
+  # The picker annotates each value with vCPU/RAM because the CloudFormation
+  # console renders AllowedValues verbatim — there is no separate label field.
+  # The EC2 API only ever sees the first token: the Instance resource splits
+  # on the first space. No commas in the values, so
+  # `ParameterKey=InstanceType,ParameterValue=...` CLI shorthand still parses.
   InstanceType:
     Type: String
-    Default: t4g.small
+    Default: t4g.medium (2 vCPU / 4 GiB)
     AllowedValues:
-      - t4g.small
-      - t4g.medium
-      - t4g.large
-      - t4g.xlarge
-      - m7g.large
-      - m7g.xlarge
-      - c7g.large
+      - t4g.small (2 vCPU / 2 GiB)
+      - t4g.medium (2 vCPU / 4 GiB)
+      - t4g.large (2 vCPU / 8 GiB)
+      - t4g.xlarge (4 vCPU / 16 GiB)
+      - m7g.large (2 vCPU / 8 GiB)
+      - m7g.xlarge (4 vCPU / 16 GiB)
+      - c7g.large (2 vCPU / 4 GiB)
     Description: >-
-      EC2 instance type. All choices are Graviton (aarch64) — cheaper than
-      the x86 equivalents and paired with an aarch64 NixOS AMI in the
-      RegionMap below. t4g.small (~2 GB RAM, ~$0.017/hr) is fine for a
-      single light agent.
+      EC2 instance type (the part before the parenthesis; vCPU/RAM shown for
+      convenience). All choices are Graviton (aarch64) — cheaper than the x86
+      equivalents and paired with an aarch64 NixOS AMI in the RegionMap below.
+      The t4g.medium default (~$0.034/hr) gives nixos-rebuild the eval
+      headroom self-updates need; t4g.small (~$0.017/hr) runs a single light
+      agent but its 2 GiB is tight during updates.
 
   RootVolumeSize:
     Type: Number
@@ -454,7 +461,9 @@ Resources:
       - IgwAttach
       - SubnetRouteAssoc
     Properties:
-      InstanceType: !Ref InstanceType
+      # First token of the annotated picker value (see the InstanceType
+      # parameter) — "t4g.medium (2 vCPU / 4 GiB)" -> "t4g.medium".
+      InstanceType: !Select [0, !Split [" ", !Ref InstanceType]]
       ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
       # Root volume. DeviceName must match the AMI's RootDeviceName
       # (/dev/xvda on official NixOS AMIs) — a mismatch would silently
