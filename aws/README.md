@@ -19,20 +19,22 @@ choose Claude Code or Codex.
   plus a per-user `ttyd` on `127.0.0.1:7681` that attaches to `agent`'s tmux
   session; `TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box -t main` - the
   socket lives under `/run` because the agent runs with `PrivateTmp`).
-- **Basic-auth-to-cookie web auth**. The terminal lives at `/agent/`; Caddy
-  prompts for username `agent` (the linux user name selects the terminal) and
-  the `WebPassword`, sets an `HttpOnly; Secure; SameSite=Strict` cookie, then
-  lets browser WebSocket upgrades authenticate with that cookie. ttyd still
-  binds only to localhost. The site root serves an unauthenticated index page
-  listing the configured terminals (just `agent` on this template).
-- The stack output URL is `https://<host>.sslip.io/agent/`; sign in as `agent`
-  with the `WebPassword`. The URL deliberately carries no `agent@` userinfo:
-  Chrome answers the auth challenge with URL userinfo plus an empty password,
-  and credentials typed into the prompt cannot override the URL-embedded
-  identity (issue 56).
-- The CloudFormation stack name becomes the Claude Remote Control session name.
-  Rename the stack before launch if you want a friendlier label in the Claude
-  apps; post-deploy, this can still be changed in the NixOS config.
+- **Basic-auth-to-cookie web auth**. The terminal lives at `/<UserName>/`
+  (default `/agent/`); Caddy prompts for the `UserName` (the linux user name
+  selects the terminal) and the `WebPassword`, sets an
+  `HttpOnly; Secure; SameSite=Strict` cookie, then lets browser WebSocket
+  upgrades authenticate with that cookie. ttyd still binds only to localhost.
+  The site root serves an unauthenticated index page listing the configured
+  terminals (just the one `UserName` on this template).
+- The stack output URL is `https://<host>.sslip.io/<UserName>/`; sign in as
+  the `UserName` with the `WebPassword`. The URL deliberately carries no
+  `user@` userinfo: Chrome answers the auth challenge with URL userinfo plus
+  an empty password, and credentials typed into the prompt cannot override
+  the URL-embedded identity (issue 56).
+- `<UserName>@<stack name>` becomes the Claude Remote Control session name
+  (default user: `agent`). Rename the stack before launch if you want a
+  friendlier label in the Claude apps; post-deploy, this can still be changed
+  in the NixOS config.
 - The hostname `<addr>.sslip.io` is derived at CFN time via `Fn::Split ':'
   + Fn::Join '-'` on the NetworkInterface's PrimaryIpv6Address (IPv6 mode)
   or the EIP address (IPv4 mode). Consecutive `::` becomes an empty split
