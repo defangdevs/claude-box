@@ -561,7 +561,7 @@ in
     }) cfg.users;
 
     environment.systemPackages =
-      (lib.unique ((map (u: (agentCommand "" u).package) (lib.attrValues cfg.users)) ++ [ pkgs.tmux ] ++ cfg.extraPackages));
+      (lib.unique ((map (u: (agentCommand "" u).package) (lib.attrValues cfg.users)) ++ [ pkgs.tmux pkgs.which ] ++ cfg.extraPackages));
 
     systemd.services = lib.mapAttrs' (name: u:
       let agent = agentCommand name u;
@@ -582,7 +582,7 @@ in
         # /run/wrappers is added when the agent has any sudo allowlist entries,
         # so the setuid `sudo` wrapper (which lives at /run/wrappers/bin/sudo,
         # NOT on the default systemd unit PATH) resolves in agent tool shells.
-        path = [ "/home/${name}/.nix-profile" agent.package pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git ]
+        path = [ "/home/${name}/.nix-profile" agent.package pkgs.tmux pkgs.bashInteractive pkgs.coreutils pkgs.git pkgs.which ]
           ++ cfg.extraPackages
           ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers";
         # TMUX_TMPDIR puts the control socket under the /run RuntimeDirectory
