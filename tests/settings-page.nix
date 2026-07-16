@@ -181,6 +181,13 @@
 
     # Issue 54: with selfUpdate enabled the page shows the Update card...
     assert "Update box" in page, "Update box card should be rendered when selfUpdate is on"
+    # ...including the running rev as a GitHub commit link (selfUpdate.rev +
+    # the default repo), so the page answers "what version is this box on".
+    assert (
+        "github.com/defangdevs/agent-box/commit/"
+        "0000000000000000000000000000000000000000" in page
+    ), "Update card should link the running rev to its GitHub commit"
+    assert "<code>000000000000</code>" in page, "Update card should show the short rev"
 
     # ...and POSTing to /update triggers agent-box-update.service through the
     # daemon's sudo -n systemctl start --no-block. The unit was inactive

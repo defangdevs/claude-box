@@ -1265,6 +1265,10 @@ in
         # Full sudo command line that triggers the box update (issue 54). Empty
         # when selfUpdate is off, which hides the Update card and 404s the route.
         UPDATE_CMD = os.environ.get("AGENT_BOX_UPDATE_CMD", "")
+        # Running agent-box git rev + GitHub owner/repo (set alongside
+        # UPDATE_CMD when selfUpdate is on) — shown on the Update card.
+        REPO = os.environ.get("AGENT_BOX_REPO", "")
+        REV = os.environ.get("AGENT_BOX_REV", "")
 
         # Env var names: POSIX-ish. Must start with a letter or underscore and
         # contain only letters, digits, underscores. This is what a shell / systemd
@@ -1478,6 +1482,8 @@ in
           a.back { color: #8b949e; text-decoration: none; font-size: 13px; }
           a.back:hover { color: #e6edf3; }
           .note { color: #8b949e; font-size: 13px; margin: 6px 0 0; }
+          .note a { color: #58a6ff; text-decoration: none; }
+          .note a:hover { text-decoration: underline; }
           code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
                  font-size: 13px; }
           .tbl { list-style: none; margin: 12px 0 0; padding: 0;
@@ -1601,7 +1607,7 @@ in
                 <span class="dz"><strong>Update box</strong>
                 <span class="note">Fetches the latest agent-box release and agent
                 CLI versions, then rebuilds the system. Takes a few minutes; sessions
-                restart if their software changed.</span></span>
+                restart if their software changed.{rev_line}</span></span>
                 <form method="post" action="{base}/update"
                       onsubmit="return confirm('Update the box now? This rebuilds the system and may restart the agent sessions.');">
                   <button type="submit" class="btn danger-btn">Update box</button>
@@ -1787,6 +1793,22 @@ in
             return "".join(items)
 
 
+        def render_rev_line():
+            """The running agent-box rev as a GitHub commit link (Update card).
+
+            REV is a full git sha; the label shows the usual short form. Empty
+            when the module didn't pass a rev (selfUpdate off — but then the
+            whole Update card is hidden anyway).
+            """
+            if not REV:
+                return ""
+            label = f"<code>{html.escape(REV[:12])}</code>"
+            if REPO:
+                url = html.escape(f"https://github.com/{REPO}/commit/{REV}")
+                label = f'<a href="{url}">{label}</a>'
+            return " Currently at " + label + "."
+
+
         def render_page(message=""):
             msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
             return (
@@ -1799,7 +1821,10 @@ in
                     sessions=render_sessions(),
                     agents=render_agent_options(),
                     message=msg_html,
-                    update_row=UPDATE_ROW.format(base=html.escape(BASE)) if UPDATE_CMD else "",
+                    update_row=(
+                        UPDATE_ROW.format(base=html.escape(BASE), rev_line=render_rev_line())
+                        if UPDATE_CMD else ""
+                    ),
                 )
                 + SCRIPT
             )
@@ -2417,6 +2442,10 @@ in
           # --no-block so the daemon's HTTP response goes out before the
           # rebuild (possibly) restarts the daemon itself.
           AGENT_BOX_UPDATE_CMD = "/run/wrappers/bin/sudo -n ${updateStartNoBlockCmd}";
+          # Running rev + repo, rendered on the Update card as a GitHub
+          # commit link so the page answers "what version is this box on".
+          AGENT_BOX_REPO = cfg.selfUpdate.repo;
+          AGENT_BOX_REV = cfg.selfUpdate.rev;
         };
         serviceConfig = {
           User = name;

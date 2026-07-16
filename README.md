@@ -80,7 +80,8 @@ one CAPABILITY_IAM checkbox to the Launch Stack form; opt out with
 details.
 
 **Updating the box.** Click "Update box" on the settings page (the gear icon
-next to your terminal), or ask the agent in its terminal to run
+next to your terminal; the card also shows the running agent-box rev, linked
+to its GitHub commit), or ask the agent in its terminal to run
 `sudo systemctl start agent-box-update.service` — a root oneshot (alongside
 the caddy reload, the only sudo the agent holds) that fast-forwards the box
 to this repo's latest master, advances the agent-CLI pin to the newest
