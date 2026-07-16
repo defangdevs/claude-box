@@ -659,7 +659,9 @@ in
         browser terminals (one ttyd per user with web.passwordHashFile set)
         fronted by Caddy with basic-auth-to-cookie web auth — the basic-auth
         username is the linux user name, so logging in picks the terminal.
-        An unauthenticated picker page at / lists them. The top-level
+        The vhost root (/) serves the primary user's (web.user) session
+        manager behind that same auth; other users' terminals live at
+        /<user>/. The top-level
         Caddyfile is module-managed (regenerated every rebuild); each agent
         user's own virtual hosts live in ~/sites/*.caddy (a symlink to
         /var/lib/agent-box-sites/<user>/, which caddy can read) and land
@@ -1161,6 +1163,13 @@ in
       # Users that get a browser terminal, in sorted order (attrNames sorts) —
       # port assignment below depends on that order being deterministic.
       terminalUsers = lib.filter (n: cfg.users.${n}.web.passwordHashFile != null) (lib.attrNames cfg.users);
+      # Whose session manager the vhost ROOT serves (the / page): web.user if
+      # it has a terminal, else the first terminal user. Null only when no
+      # user has a terminal at all (then the vhost serves nothing anyway).
+      rootUser =
+        if lib.elem webUser terminalUsers then webUser
+        else if terminalUsers != [ ] then lib.head terminalUsers
+        else null;
       portOf = lib.listToAttrs (lib.imap0 (i: n: lib.nameValuePair n (ttydPortBase + i)) terminalUsers);
       # Public URL base path for a user's settings page (Caddy does not strip
       # a prefix, so the daemon matches this full path).
@@ -1205,8 +1214,10 @@ in
         # back with the fresh environment.
         #
         # Sessions (issue 59): the daemon is also the web CRUD surface for the
-        # user-owned sessions.json — add/delete/restart sessions and a public
-        # names-only listing that feeds the flat picker. The reconcile/respawn
+        # user-owned sessions.json — add/delete/restart sessions. For the
+        # primary web user (AGENT_BOX_HOME=1) that session manager is served
+        # at the vhost root (/), replacing the old unauthenticated picker;
+        # other users keep it on their settings page. The reconcile/respawn
         # logic deliberately does NOT live here (a daemon crash or restart
         # must never take the agent sessions down): the daemon only writes the
         # file and kills the user's own tmux sessions; the supervisor in the
@@ -1231,7 +1242,8 @@ in
         #   AGENT_BOX_TMUX_TMPDIR        TMUX_TMPDIR the agent's socket lives under
         #   AGENT_BOX_TMUX_BIN           absolute path to the tmux binary
         #   AGENT_BOX_SESSIONS_FILE      path to the user's sessions.json
-        #   AGENT_BOX_SESSIONS_PUBLIC    unauthenticated names-only list path
+        #   AGENT_BOX_HOME               "1" = also serve the session manager
+        #                                 at / (the primary web user's daemon)
         #   AGENT_BOX_AGENTS             comma-separated installed agent CLIs
         #   AGENT_BOX_DEFAULT_AGENT      agent preselected in the add form
 
@@ -1258,8 +1270,14 @@ in
         # reconciles tmux against it (starts within ~2s). The daemon only
         # ever writes the file and kills the user's own tmux sessions.
         SESSIONS_FILE = os.environ.get("AGENT_BOX_SESSIONS_FILE", "")
-        # Unauthenticated names-only listing path (feeds the flat picker).
-        SESSIONS_PUBLIC = os.environ.get("AGENT_BOX_SESSIONS_PUBLIC", "")
+        # Primary web user's daemon (Caddy proxies the vhost root here, behind
+        # the same cookie-or-basic auth as the terminal): GET / renders the
+        # session manager and session CRUD moves to /sessions/*. The settings
+        # page then keeps only secrets + danger zone.
+        HOME = os.environ.get("AGENT_BOX_HOME", "") == "1"
+        # Where session CRUD routes live, and the page they redirect back to.
+        SESS_BASE = "" if HOME else BASE
+        SESS_PAGE = "/" if HOME else BASE + "/"
         AGENTS = [a for a in os.environ.get("AGENT_BOX_AGENTS", "claude").split(",") if a]
         DEFAULT_AGENT = os.environ.get("AGENT_BOX_DEFAULT_AGENT", "claude")
         # Full sudo command line that triggers the box update (issue 54). Empty
@@ -1467,7 +1485,7 @@ in
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta name="robots" content="noindex">
-        <title>Settings &mdash; {user}</title>
+        <title>{title}</title>
         """
 
         STYLE = """<style>
@@ -1496,6 +1514,8 @@ in
           li.empty { color: #8b949e; font-size: 13px; }
           .nm { display: flex; align-items: center; gap: 8px; min-width: 0; }
           .nm svg { color: #8b949e; flex: none; }
+          a.sess { color: #58a6ff; text-decoration: none; }
+          a.sess:hover { text-decoration: underline; }
           .acts { display: flex; align-items: center; gap: 4px; flex: none; }
           .meta { color: #8b949e; font-size: 12px; }
           .state { font-size: 12px; color: #8b949e; }
@@ -1533,21 +1553,20 @@ in
         </style>
         """
 
-        BODY = """<main>
-          <a class="back" href="/">&larr; all terminals</a>
-          <h1>Settings for {user}</h1>
-          <div id="msg-slot">{message}</div>
-          <section>
+        # The session manager, one <section> shared by the two pages that can
+        # host it: the root page (primary user, HOME) and the settings page
+        # (everyone else). {action_base} is SESS_BASE, so the forms post to
+        # wherever the session routes actually live.
+        SESSIONS_SECTION_TPL = """<section>
             <div class="sec-head">
               <h2>Sessions</h2>
               <button type="button" class="btn" data-toggle="session-editor">Add session</button>
             </div>
             <p class="note">Each session is one agent CLI in its own terminal.
             New sessions start within a few seconds &mdash; no rebuild, no sudo.
-            Open a session from the front page or at
-            <code>/{user}/?arg=&lt;session&gt;</code>.</p>
+            Click a session to open its terminal.</p>
             <div id="session-editor" class="editor">
-              <form method="post" action="{base}/sessions/add">
+              <form method="post" action="{action_base}/sessions/add">
                 <div class="row">
                   <input type="text" name="name" placeholder="session-name"
                          pattern="[A-Za-z0-9_-]+" required
@@ -1558,7 +1577,24 @@ in
               </form>
             </div>
             <div id="sessions-list">{sessions}</div>
-          </section>
+          </section>"""
+
+        # Root page (HOME mode): the session manager IS the front page; the
+        # settings page holds everything else.
+        HOME_BODY = """<main>
+          <a class="back" href="{base}/">&#9881; Settings</a>
+          <h1>Sessions</h1>
+          <div id="msg-slot">{message}</div>
+          {sessions_section}
+        </main>
+        </html>
+        """
+
+        BODY = """<main>
+          <a class="back" href="/">&larr; sessions</a>
+          <h1>Settings for {user}</h1>
+          <div id="msg-slot">{message}</div>
+          {sessions_section}
           <section>
             <div class="sec-head">
               <h2>Environment secrets</h2>
@@ -1754,7 +1790,8 @@ in
 
         def render_sessions():
             entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
-            base = html.escape(BASE)
+            base = html.escape(SESS_BASE)
+            user = urllib.parse.quote(USER, safe="")
             if not entries:
                 body = '<li class="empty">No sessions defined.</li>'
             else:
@@ -1765,7 +1802,11 @@ in
                     agent = html.escape(str(entries[name].get("agent") or "?"))
                     state = "live" if name in live else "starting"
                     items.append(
-                        f'<li><span class="nm"><code>{safe}</code>'
+                        # The name deep-links into the terminal via ttyd's
+                        # ?arg= session selector. No userinfo in the href
+                        # (issue 56). SESSION_RE names are URL-safe as-is.
+                        f'<li><span class="nm">'
+                        f'<a class="sess" href="/{user}/?arg={safe}"><code>{safe}</code></a>'
                         f'<span class="meta">{agent}</span>'
                         f'<span class="state" data-state="{state}">{state}</span></span>'
                         f'<span class="acts">'
@@ -1809,22 +1850,45 @@ in
             return " Currently at " + label + "."
 
 
+        def render_sessions_section():
+            return SESSIONS_SECTION_TPL.format(
+                action_base=html.escape(SESS_BASE),
+                agents=render_agent_options(),
+                sessions=render_sessions(),
+            )
+
+
         def render_page(message=""):
             msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
             return (
-                HEAD_TPL.format(user=html.escape(USER))
+                HEAD_TPL.format(title="Settings &mdash; " + html.escape(USER))
                 + STYLE
                 + BODY.format(
                     user=html.escape(USER),
                     base=html.escape(BASE),
                     keys=render_keys(read_keys()),
-                    sessions=render_sessions(),
-                    agents=render_agent_options(),
+                    # HOME moves the session manager to the root page; keep it
+                    # here for every other user.
+                    sessions_section="" if HOME else render_sessions_section(),
                     message=msg_html,
                     update_row=(
                         UPDATE_ROW.format(base=html.escape(BASE), rev_line=render_rev_line())
                         if UPDATE_CMD else ""
                     ),
+                )
+                + SCRIPT
+            )
+
+
+        def render_home(message=""):
+            msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
+            return (
+                HEAD_TPL.format(title="Sessions &mdash; " + html.escape(USER))
+                + STYLE
+                + HOME_BODY.format(
+                    base=html.escape(BASE),
+                    sessions_section=render_sessions_section(),
+                    message=msg_html,
                 )
                 + SCRIPT
             )
@@ -1848,52 +1912,36 @@ in
                 self.end_headers()
                 self.wfile.write(data)
 
-            def _redirect(self, query=""):
-                target = BASE + "/" + (("?" + query) if query else "")
+            def _redirect(self, query="", page=None):
+                target = (page or BASE + "/") + (("?" + query) if query else "")
                 self.send_response(303)
                 self.send_header("Location", target)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
-            def _send_json(self, obj):
-                data = (json.dumps(obj) + "\n").encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.end_headers()
-                self.wfile.write(data)
+            OK_MESSAGES = {
+                "saved": "Key saved. Restart the sessions to apply.",
+                "deleted": "Key deleted. Restart the sessions to apply.",
+                "restarted": "Restart of all sessions requested.",
+                "session_added": "Session added — it starts within a few seconds.",
+                "session_deleted": "Session deleted.",
+                "session_restarted": "Session restart requested.",
+                "update": "Box update started — the system rebuilds in the "
+                          "background and this page may briefly go away.",
+            }
 
             def do_GET(self):
                 parsed = urllib.parse.urlparse(self.path)
-                if SESSIONS_PUBLIC and parsed.path == SESSIONS_PUBLIC:
-                    # Names+agents only — deliberately unauthenticated (Caddy
-                    # routes it outside the auth block): it feeds the flat
-                    # session picker, same public stance as user names there.
-                    # Never include argv/cwd/env — those may hold secrets.
-                    self._send_json([
-                        {"name": n, "agent": str(v.get("agent") or "")}
-                        for n, v in sorted(read_sessions().items())
-                        if SESSION_RE.match(n)
-                    ])
+                params = urllib.parse.parse_qs(parsed.query)
+                message = ""
+                if "ok" in params:
+                    message = self.OK_MESSAGES.get(params["ok"][0], "")
+                if HOME and parsed.path == "/":
+                    self._send_html(render_home(message))
                     return
                 if not self._under_base(parsed.path):
                     self._send_html("<h1>404</h1>", status=404)
                     return
-                params = urllib.parse.parse_qs(parsed.query)
-                message = ""
-                if "ok" in params:
-                    message = {
-                        "saved": "Key saved. Restart the sessions to apply.",
-                        "deleted": "Key deleted. Restart the sessions to apply.",
-                        "restarted": "Restart of all sessions requested.",
-                        "session_added": "Session added — it starts within a few seconds.",
-                        "session_deleted": "Session deleted.",
-                        "session_restarted": "Session restart requested.",
-                        "update": "Box update started — the system rebuilds in the "
-                                  "background and this page may briefly go away.",
-                    }.get(params["ok"][0], "")
                 self._send_html(render_page(message))
 
             def _read_form(self):
@@ -1922,19 +1970,20 @@ in
                     if KEY_RE.match(key):
                         delete_key(key)
                     self._redirect("ok=deleted")
-                elif path == BASE + "/sessions/add":
+                elif path == SESS_BASE + "/sessions/add":
+                    render = render_home if HOME else render_page
                     name = (form.get("name", [""])[0]).strip()
                     agent = (form.get("agent", [""])[0]).strip() or DEFAULT_AGENT
                     if not SESSION_RE.match(name):
                         self._send_html(
-                            render_page("Invalid session name. Use letters, digits, "
-                                        "dash and underscore (max 32 chars)."),
+                            render("Invalid session name. Use letters, digits, "
+                                   "dash and underscore (max 32 chars)."),
                             status=400,
                         )
                         return
                     if agent not in AGENTS:
                         self._send_html(
-                            render_page("Unknown agent. Installed: " + ", ".join(AGENTS)),
+                            render("Unknown agent. Installed: " + ", ".join(AGENTS)),
                             status=400,
                         )
                         return
@@ -1948,20 +1997,20 @@ in
                         "extraArgs": [],
                     }
                     write_sessions(sessions)
-                    self._redirect("ok=session_added")
-                elif path == BASE + "/sessions/delete":
+                    self._redirect("ok=session_added", SESS_PAGE)
+                elif path == SESS_BASE + "/sessions/delete":
                     name = (form.get("name", [""])[0]).strip()
                     if SESSION_RE.match(name):
                         sessions = read_sessions()
                         sessions.pop(name, None)
                         write_sessions(sessions)
                         kill_session(name)
-                    self._redirect("ok=session_deleted")
-                elif path == BASE + "/sessions/restart":
+                    self._redirect("ok=session_deleted", SESS_PAGE)
+                elif path == SESS_BASE + "/sessions/restart":
                     name = (form.get("name", [""])[0]).strip()
                     if SESSION_RE.match(name):
                         kill_session(name)
-                    self._redirect("ok=session_restarted")
+                    self._redirect("ok=session_restarted", SESS_PAGE)
                 elif path == BASE + "/restart":
                     # Bounce every listed session so all agents reload the env
                     # file; the supervisor brings them back within ~2s.
@@ -2067,13 +2116,6 @@ in
         # auth credentials to WebSocket upgrades — then basic auth with the
         # linux user name as the login name.
         redir /${name} /${name}/
-        # ${name}'s session list (issue #59): session names + agent kinds
-        # only, no secrets — same public stance as the user names on the
-        # picker, which this feeds. Served by the settings daemon over its
-        # unix socket, deliberately OUTSIDE the auth block.
-        handle /${name}/sessions.json {
-          reverse_proxy unix/${settingsSocketOf name}
-        }
         # ${name}'s settings page (issue #36). Same auth surface as the
         # terminal (cookie-or-basic-auth, same user name), just a different
         # upstream — the settings daemon over its user+caddy-only unix socket
@@ -2111,85 +2153,32 @@ in
         }
       '';
 
-      pickerBlock = ''
-        # Anything else, including /: unauthenticated picker listing this
-        # box's agent SESSIONS (issue #59), flat — the users->sessions
-        # hierarchy survives only in the URL and the auth realm. Fetched
-        # client-side from each user's public names-only sessions.json;
-        # session and user names are not secrets, the passwords are. The
-        # <noscript> fallback keeps per-user links. No userinfo in any href
-        # (issue 56): Chrome answers the basic-auth challenge with URL
+      rootBlock = name: ''
+        # Anything else, including /: ${name}'s session manager (list / open /
+        # add / restart / delete, plus the /sessions/* CRUD routes), served by
+        # the settings daemon behind the SAME cookie-or-basic auth as the
+        # terminal — session CRUD must never be reachable unauthenticated.
+        # This replaces the old unauthenticated picker (single-user boxes are
+        # the norm now); with it gone — and the public sessions.json it fed
+        # removed — nothing on this vhost is served without auth. Other
+        # users' terminals stay at /<user>/ as before. No userinfo in any
+        # href (issue 56): Chrome answers the basic-auth challenge with URL
         # userinfo + an EMPTY password, and credentials typed into the
         # prompt cannot override the URL-embedded identity.
         handle {
-          header Content-Type "text/html; charset=utf-8"
-          respond <<PICKER_HTML
-            <!doctype html>
-            <html lang="en">
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <meta name="robots" content="noindex">
-            <title>Sessions — ${cfg.web.domain}</title>
-            <style>
-              body { margin: 0; min-height: 100vh; display: grid; place-items: center;
-                     background: #0d1117; color: #e6edf3; font: 16px/1.6 system-ui, sans-serif; }
-              main { text-align: center; }
-              main .row { display: flex; gap: 8px; margin: 10px 0; align-items: stretch; }
-              main a { display: flex; align-items: center; justify-content: center;
-                       padding: 12px 36px;
-                       border: 1px solid #30363d; border-radius: 10px; background: #161b22;
-                       color: #e8a087; font-size: 20px; text-decoration: none; }
-              main a.term { flex: 1; flex-direction: column; }
-              main a.gear { padding: 12px 18px; text-decoration: none; }
-              main a:hover { border-color: #e8a087; }
-              main .sub { display: block; font-size: 13px; color: #8b949e; }
-            </style>
-            <main>
-              <h1>Sessions</h1>
-              <div id="list"><noscript>
-              ${lib.concatMapStringsSep "\n      " (n: ''<div class="row"><a class="term" href="https://${cfg.web.domain}/${n}/">${n}</a><a class="gear" href="https://${cfg.web.domain}/${n}/settings/" title="${n} settings" aria-label="${n} settings">&#9881;</a></div>'') terminalUsers}
-              </noscript></div>
-            </main>
-            <script>
-              var users = [${lib.concatMapStringsSep ", " (n: "\"${n}\"") terminalUsers}];
-              var list = document.getElementById("list");
-              function card(user, session, agent) {
-                var row = document.createElement("div");
-                row.className = "row";
-                var a = document.createElement("a");
-                a.className = "term";
-                if (session === null) {
-                  a.href = "/" + user + "/";
-                  a.textContent = user;
-                } else {
-                  a.href = "/" + user + "/?arg=" + encodeURIComponent(session);
-                  a.textContent = session;
-                  var sub = document.createElement("span");
-                  sub.className = "sub";
-                  sub.textContent = agent + (users.length > 1 ? " · " + user : "");
-                  a.appendChild(sub);
-                }
-                var gear = document.createElement("a");
-                gear.className = "gear";
-                gear.href = "/" + user + "/settings/";
-                gear.title = user + " settings";
-                gear.setAttribute("aria-label", user + " settings");
-                gear.innerHTML = "&#9881;";
-                row.appendChild(a);
-                row.appendChild(gear);
-                list.appendChild(row);
+          @cookie_root header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
+          handle @cookie_root {
+            reverse_proxy unix/${settingsSocketOf name}
+          }
+          handle {
+            route {
+              basic_auth bcrypt ${name} {
+                ${name} {$WEB_PASSWORD_HASH_${envName name}}
               }
-              users.forEach(function (u) {
-                fetch("/" + u + "/sessions.json").then(function (r) {
-                  if (!r.ok) { throw new Error("http " + r.status); }
-                  return r.json();
-                }).then(function (sessions) {
-                  if (!sessions.length) { card(u, null, null); return; }
-                  sessions.forEach(function (s) { card(u, s.name, s.agent); });
-                }).catch(function () { card(u, null, null); });
-              });
-            </script>
-            PICKER_HTML 200
+              header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              reverse_proxy unix/${settingsSocketOf name}
+            }
+          }
         }
       '';
 
@@ -2248,7 +2237,7 @@ in
       ''
       + lib.concatMapStringsSep "\n" (name: indent "  " (terminalCaddyBlock name)) terminalUsers
       + "\n"
-      + indent "  " pickerBlock
+      + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
       + "}\n\n"
       + ''
         # Per-user snippet directories. Each agent user's ~/sites/ symlinks
@@ -2401,7 +2390,7 @@ in
             "${pkgs.ttyd}/bin/ttyd"
             "--writable"
             # ?arg=<session> in the URL becomes $1 of the attach wrapper —
-            # session-level deep links from the picker (issue #59).
+            # session-level deep links from the root sessions page (issue #59).
             "--url-arg"
             "-p" (toString portOf.${name})
             "-i" "127.0.0.1"
@@ -2435,9 +2424,13 @@ in
           AGENT_BOX_TMUX_TMPDIR = "/run/${runtimeDirectory name}";
           AGENT_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
           AGENT_BOX_SESSIONS_FILE = userSessionsFile name;
-          AGENT_BOX_SESSIONS_PUBLIC = "/${name}/sessions.json";
           AGENT_BOX_AGENTS = lib.concatStringsSep "," cfg.installAgents;
           AGENT_BOX_DEFAULT_AGENT = cfg.agent;
+        } // lib.optionalAttrs (name == rootUser) {
+          # This daemon also serves the vhost root: GET / is the session
+          # manager (Caddy proxies it here behind the user's auth) and the
+          # session CRUD routes move to /sessions/*.
+          AGENT_BOX_HOME = "1";
         } // lib.optionalAttrs cfg.selfUpdate.enable {
           # --no-block so the daemon's HTTP response goes out before the
           # rebuild (possibly) restarts the daemon itself.

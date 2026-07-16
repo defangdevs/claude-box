@@ -317,22 +317,31 @@ jobs:
             exit 1
           fi
 
-      - name: Smoke test — unauthenticated root serves the terminal picker
+      - name: Smoke test — root serves the session manager behind auth
         if: matrix.public_ipv4 == 'true'
+        env:
+          WEB_PASSWORD: ${{ steps.pw.outputs.value }}
         run: |
           url='${{ steps.outputs.outputs.web_url }}'
           terminal_url="$url"
           root_url="${terminal_url%agent/}"
-          body=$(curl -sS --max-time 10 "$root_url" || true)
+          # The root sessions page must never be public: session CRUD lives
+          # there now (it replaced the unauthenticated picker).
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$root_url" || true)
+          if [ "$code" != "401" ]; then
+            echo "::error::Expected 401 at $root_url without credentials, got $code."
+            exit 1
+          fi
+          body=$(curl -sS --max-time 10 -u "agent:${WEB_PASSWORD}" "$root_url" || true)
           if echo "$body" | grep -q 'href="https://[^/"]*@'; then
-            echo "::error::Picker at $root_url embeds URL userinfo (user@) in an href — Chrome auto-sends an empty password and typed credentials can't override it (issue 56):"
+            echo "::error::Sessions page at $root_url embeds URL userinfo (user@) in an href — Chrome auto-sends an empty password and typed credentials can't override it (issue 56):"
             echo "$body" | head -20
             exit 1
           fi
-          if echo "$body" | grep -q 'href="https://[^"]*/agent/"'; then
-            echo "::notice::Root picker links the agent terminal (no credentials in the URL)."
+          if echo "$body" | grep -q 'href="/agent/?arg='; then
+            echo "::notice::Root sessions page deep-links the agent terminal sessions (no credentials in the URL)."
           else
-            echo "::error::Picker at $root_url doesn't link to https://<host>/agent/:"
+            echo "::error::Sessions page at $root_url doesn't deep-link /agent/?arg=<session>:"
             echo "$body" | head -20
             exit 1
           fi

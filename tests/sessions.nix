@@ -11,14 +11,16 @@
 #     and NOT recreating a delisted one (destroy semantics),
 #   - both agent CLIs installed regardless of what sessions run
 #     (installAgents default),
-#   - the settings daemon's session CRUD over HTTP (behind auth) and the
-#     public names-only /<user>/sessions.json (no auth) that feeds the flat
-#     picker,
+#   - the root session manager page (the settings daemon in AGENT_BOX_HOME
+#     mode for the primary web user) and its /sessions/* CRUD routes, all
+#     behind auth — nothing on the vhost is served unauthenticated anymore
+#     (the old picker and its public sessions.json are gone),
 #   - ttyd running with --url-arg so /<user>/?arg=<session> deep links work.
 #
 # Like the other tests, lib.mkForce-swaps the module Caddyfile for a minimal
 # `tls internal` one (no ACME in the sandbox) that keeps the same routing
-# shape: sessions.json outside the auth block, settings inside it.
+# shape: /agent/settings* and the root catch-all both inside the auth gate,
+# proxied to the settings daemon's unix socket.
 { agent-box }:
 {
   name = "agent-box-sessions";
@@ -59,9 +61,6 @@
       box.test {
         log
         tls internal
-        handle /agent/sessions.json {
-          reverse_proxy unix//run/agent-box-settings/agent.sock
-        }
         handle /agent/settings* {
           route {
             basic_auth bcrypt agent {
@@ -71,7 +70,12 @@
           }
         }
         handle {
-          respond "ok" 200
+          route {
+            basic_auth bcrypt agent {
+              agent {$WEB_PASSWORD_HASH_AGENT}
+            }
+            reverse_proxy unix//run/agent-box-settings/agent.sock
+          }
         }
       }
     '');
@@ -162,17 +166,29 @@
     machine_ip = machine.succeed("ip -4 -o addr show eth1 | head -1").split()[3].split("/")[0]
     curl = f"curl -sk --resolve box.test:443:{machine_ip}"
 
-    # Public names-only session list: 200 WITHOUT credentials, names+agents
-    # only (never argv/cwd/env).
-    sessions_json = client.succeed(f"{curl} https://box.test/agent/sessions.json")
-    assert '"main"' in sessions_json, sessions_json
-    assert "workingDirectory" not in sessions_json, sessions_json
+    # NOTHING on the vhost is public anymore: the root session manager
+    # challenges for auth, and the old public sessions.json is gone (its
+    # path now falls into the auth-gated catch-all).
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' https://box.test/ | grep -x 401"
+    )
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' "
+        "https://box.test/agent/sessions.json | grep -x 401"
+    )
 
-    # The settings page (behind auth) can add a session...
+    # The root page (behind auth) lists the sessions with terminal deep
+    # links, never a session's argv/cwd/env (those may hold secrets).
+    root_page = client.succeed(f"{curl} -u agent:testpassword https://box.test/")
+    assert "main" in root_page, root_page
+    assert "/agent/?arg=main" in root_page, root_page
+    assert "workingDirectory" not in root_page, root_page
+
+    # The root page's CRUD routes (behind auth) can add a session...
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
         "-d 'name=web&agent=claude' "
-        "https://box.test/agent/settings/sessions/add | grep -x 303"
+        "https://box.test/sessions/add | grep -x 303"
     )
     machine.wait_until_succeeds(tmux("has-session -t =web"), timeout=60)
 
@@ -180,7 +196,7 @@
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
         "-d 'name=web' "
-        "https://box.test/agent/settings/sessions/delete | grep -x 303"
+        "https://box.test/sessions/delete | grep -x 303"
     )
     machine.succeed("sleep 6")
     machine.fail(tmux("has-session -t =web"))
@@ -189,8 +205,21 @@
     client.succeed(
         f"{curl} -o /dev/null -w '%{{http_code}}' "
         "-d 'name=pwn&agent=claude' "
-        "https://box.test/agent/settings/sessions/add | grep -x 401"
+        "https://box.test/sessions/add | grep -x 401"
     )
+
+    # The sessions moved OFF the settings page (they live at / now): the
+    # old settings-page CRUD routes are gone for the primary user...
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "-d 'name=web2&agent=claude' "
+        "https://box.test/agent/settings/sessions/add | grep -x 404"
+    )
+    # ...and the page itself no longer renders the session manager.
+    settings_page = client.succeed(
+        f"{curl} -u agent:testpassword https://box.test/agent/settings/"
+    )
+    assert "Add session" not in settings_page, settings_page
 
     # ttyd serves per-session deep links: the unit runs with --url-arg.
     machine.succeed("systemctl cat agent-web-terminal-agent | grep -q -- --url-arg")

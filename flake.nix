@@ -101,8 +101,8 @@
           # seeded "main" session starts, `agent-box-session add/rm` brings a
           # second agent up and down as the user (no sudo, no rebuild), the
           # runtime session lives inside the hardened unit's cgroup, and the
-          # settings daemon serves session CRUD plus the public names-only
-          # sessions.json that feeds the flat picker.
+          # settings daemon serves the root session manager page plus its
+          # CRUD routes, all behind the web auth gate.
           sessions = pkgs.testers.runNixOSTest
             (import ./tests/sessions.nix { agent-box = self.nixosModules.agent-box; });
 

@@ -204,13 +204,14 @@ agent-box-session restart review
 agent-box-session rm review                 # delist + kill
 ```
 
-The settings page (web setups) has the same controls, and agents can spawn
-sibling sessions themselves (it's just a file edit on their own account —
-handy for "have Codex cross-check this").
+The site root (web setups) has the same controls — `https://<domain>/` is
+the session manager, behind the same login as the terminal — and agents can
+spawn sibling sessions themselves (it's just a file edit on their own
+account — handy for "have Codex cross-check this").
 
 Attach locally with `tmux -L agent-box attach -t <session>` (see
-`TMUX_TMPDIR` note above). In the browser, the front page lists every
-session flat — one card per session — and deep-links via
+`TMUX_TMPDIR` note above). In the browser, each session on the root page
+deep-links into its terminal via
 `https://<domain>/<user>/?arg=<session>`. Killed-on-error sessions keep a
 post-mortem shell open instead of being respawned over; delisted sessions
 stay gone.

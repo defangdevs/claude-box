@@ -87,6 +87,6 @@ jobs:
       # Interactive VM test (issue 59): runtime session CRUD — seeded main
       # session, agent-box-session add/rm as the user with no sudo and no
       # rebuild, cgroup containment of runtime-created sessions, and the
-      # public names-only sessions.json feeding the flat picker.
+      # root session manager page (with its /sessions/* routes) behind auth.
       - name: Run sessions VM test
         run: nix build -L .#checks.x86_64-linux.sessions
