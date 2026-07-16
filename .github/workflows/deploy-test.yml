@@ -22,9 +22,11 @@ on:
           - eu-west-1
         default: us-west-2
       instance_type:
-        description: EC2 instance type
+        # Must be one of the template's annotated AllowedValues (comma-free,
+        # so the ParameterKey=...,ParameterValue=... shorthand still parses).
+        description: EC2 instance type (template AllowedValues form)
         type: string
-        default: t4g.small
+        default: t4g.small (2 vCPU / 2 GiB)
       destroy:
         description: Delete the stack at the end (uncheck to keep it up for debugging)
         type: boolean
@@ -116,7 +118,7 @@ jobs:
               "ParameterKey=PublicIpv4,ParameterValue=${{ matrix.public_ipv4 }}" \
               "ParameterKey=UseSpot,ParameterValue=${{ matrix.use_spot }}" \
               "ParameterKey=WebPassword,ParameterValue=${{ steps.pw.outputs.value }}" \
-              "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small' }}" \
+              "ParameterKey=InstanceType,ParameterValue=${{ inputs.instance_type || 't4g.small (2 vCPU / 2 GiB)' }}" \
               "ParameterKey=AgentBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
               "ParameterKey=AgentBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
             --on-failure DO_NOTHING \

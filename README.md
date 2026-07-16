@@ -55,10 +55,12 @@ in NA/EU do; corporate/coffee-shop nets often don't). If IPv6 isn't reachable
 for you, set `PublicIpv4: true` at launch — allocates an EIP, adds $3.60/mo,
 works everywhere.
 
-Costs: ~$0.017/hr for `t4g.small` (Graviton/aarch64) on-demand + ~$2.40/mo
-for the default 30 GiB gp3 root volume (`RootVolumeSize`) + $0/hr for
-the Elastic IP while attached (~$3.60/mo if you keep it up). Terminate the
-stack to stop billing.
+Costs: ~$0.034/hr for the default `t4g.medium` (Graviton/aarch64, 2 vCPU /
+4 GiB) on-demand — the picker lists vCPU/RAM per size, and `t4g.small`
+(~$0.017/hr) works for a single light agent though its 2 GiB is tight during
+self-update rebuilds — + ~$2.40/mo for the default 30 GiB gp3 root volume
+(`RootVolumeSize`) + $0/hr for the Elastic IP while attached (~$3.60/mo if
+you keep it up). Terminate the stack to stop billing.
 
 Out of disk anyway? Enlarge the volume from the EC2 console (Volumes ->
 Modify) and reboot the instance — NixOS grows the partition and filesystem
