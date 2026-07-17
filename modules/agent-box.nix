@@ -444,8 +444,9 @@ let
         example = "/var/lib/agent-box-web/password-hash-${name}";
         description = ''
           Give this user a browser terminal (requires
-          services.agent-box.web.enable). Path to a file containing a bcrypt
-          hash produced by `caddy hash-password`; the terminal is served at
+          services.agent-box.web.enable). Path to a file containing an
+          Argon2id (recommended) or legacy bcrypt hash produced by `caddy
+          hash-password`; the terminal is served at
           https://<web.domain>/${name}/ behind basic auth whose username is
           this linux user name and whose password is the one behind this
           hash. Root-owned, 0600, outside the Nix store so the plaintext
@@ -1286,14 +1287,17 @@ in
       # hash (or any other path).
       passwordHelperOf = name:
         pkgs.writers.writePython3Bin "agent-box-password-${name}" {
-          libraries = [ pkgs.python3Packages.bcrypt ];
+          libraries = [
+            pkgs.python3Packages.argon2-cffi
+            pkgs.python3Packages.bcrypt
+          ];
           flakeIgnore = [ "E501" "E302" "E305" ];
         } ''
+          import argon2
           import bcrypt
           import fcntl
           import json
           import os
-          import re
           import secrets
           import subprocess
           import sys
@@ -1304,8 +1308,9 @@ in
           AUTH_ENV_FILE = "/run/agent-box-web/env"
           AUTH_ENV_LOCK = "/run/agent-box-web/password-change.lock"
           ENV_SUFFIX = ${builtins.toJSON (envName name)}
+          CADDY = ${builtins.toJSON "${pkgs.caddy}/bin/caddy"}
           SYSTEMCTL = "/run/current-system/sw/bin/systemctl"
-          PASSWORD_RE = re.compile(r"^[A-Za-z0-9._~-]{16,64}$")
+          NEW_HASH_ALGORITHM = "argon2id"
 
 
           def fail(code, message):
@@ -1340,9 +1345,57 @@ in
                   raise
 
 
+          def valid_password(password):
+              return 16 <= len(password) <= 64 and not any(
+                  char in password for char in "\r\n"
+              )
+
+
+          def password_matches(password, encoded):
+              """Verify both legacy bcrypt and current Argon2id hashes."""
+              if encoded.startswith(b"$argon2id$"):
+                  try:
+                      return argon2.PasswordHasher().verify(
+                          encoded.decode("ascii"), password
+                      )
+                  except argon2.exceptions.VerifyMismatchError:
+                      return False
+                  except (
+                      argon2.exceptions.InvalidHashError,
+                      argon2.exceptions.VerificationError,
+                      UnicodeError,
+                  ):
+                      fail(5, "could not validate current password")
+              if encoded.startswith((b"$2a$", b"$2b$", b"$2y$")):
+                  try:
+                      return bcrypt.checkpw(password.encode("utf-8"), encoded)
+                  except (UnicodeError, ValueError):
+                      fail(5, "could not validate current password")
+              fail(5, "unsupported current password hash")
+
+
+          def hash_password(password):
+              """Use Caddy's recommended algorithm and parameter defaults."""
+              try:
+                  proc = subprocess.run(
+                      [CADDY, "hash-password", "--algorithm", NEW_HASH_ALGORITHM],
+                      input=(password + "\n").encode("utf-8"),
+                      check=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.DEVNULL,
+                  )
+                  encoded = proc.stdout.decode("ascii").strip()
+              except (OSError, UnicodeError, subprocess.CalledProcessError):
+                  fail(5, "could not hash new password")
+              if not encoded.startswith("$argon2id$"):
+                  fail(5, "password hash used an unexpected algorithm")
+              return encoded
+
+
           def update_auth_env(new_hash, new_cookie):
-              """Replace this user's two values in Caddy's runtime env."""
+              """Replace this user's values in Caddy's runtime env."""
               replacements = {
+                  "WEB_PASSWORD_ALGORITHM_" + ENV_SUFFIX: NEW_HASH_ALGORITHM,
                   "WEB_PASSWORD_HASH_" + ENV_SUFFIX: new_hash,
                   "WEB_COOKIE_SECRET_" + ENV_SUFFIX: new_cookie,
               }
@@ -1376,21 +1429,19 @@ in
               new = request["new"]
               if not isinstance(previous, str) or not isinstance(new, str):
                   fail(4, "invalid request")
-              if not PASSWORD_RE.fullmatch(new) or new == previous:
+              if not valid_password(new) or new == previous:
                   fail(4, "invalid new password")
 
               try:
                   with open(HASH_FILE, "rb") as fh:
                       current_hash = fh.read().strip()
-                  matches = bcrypt.checkpw(previous.encode("utf-8"), current_hash)
-              except (OSError, UnicodeError, ValueError):
+                  matches = password_matches(previous, current_hash)
+              except OSError:
                   fail(5, "could not validate current password")
               if not matches:
                   fail(2, "current password is incorrect")
 
-              new_hash = bcrypt.hashpw(
-                  new.encode("utf-8"), bcrypt.gensalt(rounds=14)
-              ).decode("ascii")
+              new_hash = hash_password(new)
               new_cookie = secrets.token_hex(32)
 
               # Serialize password changes across users while updating the two
@@ -1406,8 +1457,8 @@ in
                       update_auth_env(new_hash, new_cookie)
 
                       # systemd re-reads EnvironmentFile for ExecReload, so the
-                      # running listener adopts both values without a restart or
-                      # dropping the in-flight settings response.
+                      # running listener adopts the new credentials without a
+                      # restart or dropping the in-flight settings response.
                       subprocess.run(
                           [SYSTEMCTL, "reload", "caddy.service"],
                           check=True,
@@ -1553,9 +1604,13 @@ in
         # Session names: same charset the supervisor and CLI enforce (they
         # land in tmux -t targets and URLs).
         SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
-        # Keep password changes consistent with the CloudFormation launch-time
-        # contract (and below bcrypt's 72-byte input ceiling).
-        PASSWORD_RE = re.compile(r"^[A-Za-z0-9._~-]{16,64}$")
+
+
+        def valid_password(password):
+            """Accept password-manager symbols; form fields cannot contain LF/CR."""
+            return 16 <= len(password) <= 64 and not any(
+                char in password for char in "\r\n"
+            )
 
 
         def read_keys():
@@ -2066,16 +2121,14 @@ in
                   </label>
                   <label class="field">New password
                     <input type="password" name="new_password"
-                           autocomplete="new-password" minlength="16" maxlength="64"
-                           pattern="[A-Za-z0-9._~-]{{16,64}}" required>
+                           autocomplete="new-password" minlength="16" maxlength="64" required>
                   </label>
                   <label class="field">Confirm new password
                     <input type="password" name="confirm_password"
-                           autocomplete="new-password" minlength="16" maxlength="64"
-                           pattern="[A-Za-z0-9._~-]{{16,64}}" required>
+                           autocomplete="new-password" minlength="16" maxlength="64" required>
                   </label>
-                  <p class="note">Use 16&ndash;64 characters from
-                  <code>A&ndash;Z a&ndash;z 0&ndash;9 . _ ~ -</code>.</p>
+                  <p class="note">Use 16&ndash;64 characters. Symbols generated
+                  by password managers are supported.</p>
                   <div><button type="submit" class="btn">Update password</button></div>
                 </div>
               </form>
@@ -2684,11 +2737,10 @@ in
                             status=400,
                         )
                         return
-                    if not PASSWORD_RE.fullmatch(new):
+                    if not valid_password(new):
                         self._send_html(
-                            render_page("New password must be 16–64 characters using "
-                                        "only letters, digits, dot, underscore, tilde "
-                                        "and dash."),
+                            render_page("New password must be 16–64 characters and "
+                                        "cannot contain a line break."),
                             status=400,
                         )
                         return
@@ -2904,7 +2956,7 @@ in
           }
           handle {
             route {
-              basic_auth bcrypt ${name} {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
                 ${name} {$WEB_PASSWORD_HASH_${envName name}}
               }
               header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -2919,7 +2971,7 @@ in
           }
           handle {
             route {
-              basic_auth bcrypt ${name} {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
                 ${name} {$WEB_PASSWORD_HASH_${envName name}}
               }
               header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -2949,7 +3001,7 @@ in
           }
           handle {
             route {
-              basic_auth bcrypt ${name} {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
                 ${name} {$WEB_PASSWORD_HASH_${envName name}}
               }
               header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -3028,8 +3080,9 @@ in
       # Reads each terminal user's (already-hashed) password from their
       # passwordHashFile, mints a persistent per-user cookie secret if
       # absent, and writes everything into /run/agent-box-web/env for Caddy
-      # to consume as environment variables (WEB_PASSWORD_HASH_<USER> /
-      # WEB_COOKIE_SECRET_<USER>). Runs BEFORE caddy every boot.
+      # to consume as environment variables (WEB_PASSWORD_ALGORITHM_<USER> /
+      # WEB_PASSWORD_HASH_<USER> / WEB_COOKIE_SECRET_<USER>). Runs BEFORE
+      # caddy every boot.
       webAuthSecretsService = {
         description = "Prepare browser terminal auth env for Caddy";
         before = [ "caddy.service" ];
@@ -3047,9 +3100,16 @@ in
           if [ ! -s /var/lib/agent-box-web/cookie-secret-${name} ]; then
             openssl rand -hex 32 > /var/lib/agent-box-web/cookie-secret-${name}
           fi
+          hash="$(cat ${lib.escapeShellArg (hashFileOf name)})"
+          case "$hash" in
+            '$argon2id$'*) algorithm=argon2id ;;
+            '$2a$'*|'$2b$'*|'$2y$'*) algorithm=bcrypt ;;
+            *) echo "unsupported password hash for ${name}" >&2; exit 1 ;;
+          esac
           {
             printf 'WEB_COOKIE_SECRET_${envName name}=%s\n' "$(cat /var/lib/agent-box-web/cookie-secret-${name})"
-            printf 'WEB_PASSWORD_HASH_${envName name}=%s\n' "$(cat ${lib.escapeShellArg (hashFileOf name)})"
+            printf 'WEB_PASSWORD_ALGORITHM_${envName name}=%s\n' "$algorithm"
+            printf 'WEB_PASSWORD_HASH_${envName name}=%s\n' "$hash"
           } >> "$tmp"
         '') terminalUsers + ''
           chmod 0600 "$tmp"

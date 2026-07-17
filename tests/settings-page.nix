@@ -79,7 +79,7 @@
           }
           handle {
             route {
-              basic_auth bcrypt agent {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
                 agent {$WEB_PASSWORD_HASH_AGENT}
               }
               header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -97,7 +97,7 @@
           }
           handle {
             route {
-              basic_auth bcrypt agent {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
                 agent {$WEB_PASSWORD_HASH_AGENT}
               }
               header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -351,7 +351,9 @@
     )
 
     # Issue 91: validation failures must leave the old credential untouched.
-    new_password = "newtestpassword123"
+    # Include symbols outside the old URL-safe allowlist: password-manager
+    # output should work unchanged.
+    new_password = "new!test@password#123"
     client.succeed(
         f"{curl} -u agent:testpassword -o /tmp/mismatch -w '%{{http_code}}' "
         "-d 'previous_password=testpassword' "
@@ -390,7 +392,9 @@
         "https://box.test/agent/settings/password | grep -x 303"
     )
     machine.wait_for_unit("caddy.service")
-    assert machine.succeed("cat /var/lib/agent-box-web/password-hash") != old_hash
+    new_hash = machine.succeed("cat /var/lib/agent-box-web/password-hash")
+    assert new_hash != old_hash
+    assert new_hash.startswith("$argon2id$"), "new hashes should use Argon2id"
     assert machine.succeed("cat /var/lib/agent-box-web/cookie-secret-agent") != old_cookie
     machine.succeed(
         "stat -c '%U %G %a' /var/lib/agent-box-web/password-hash "
@@ -408,7 +412,7 @@
         "https://box.test/agent/settings/ | grep -x 401"
     )
     client.succeed(
-        f"{curl} -u agent:{new_password} -o /tmp/changed -w '%{{http_code}}' "
+        f"{curl} -u 'agent:{new_password}' -o /tmp/changed -w '%{{http_code}}' "
         "https://box.test/agent/settings/?ok=password_changed | grep -x 200"
     )
     client.succeed("grep -q 'Password changed' /tmp/changed")

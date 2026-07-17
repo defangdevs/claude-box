@@ -169,17 +169,17 @@ Parameters:
     NoEcho: true
     MinLength: 16
     MaxLength: 64
-    AllowedPattern: ^[A-Za-z0-9._~-]{16,64}$
+    AllowedPattern: ^.{16,64}$
     Description: >-
       Shared secret for the browser terminal. Log in with the UserName chosen
       above (default "agent") and this password; Caddy then sets an HttpOnly
       Secure cookie so the WebSocket upgrade can authenticate without putting
-      the secret in the URL. Use 16-64
-      chars from [A-Za-z0-9._~-]. AWS masks this field with dots after you type
-      it and never emits it in stack outputs, so save it somewhere before you
-      launch — there is no way to recover it later. Even Claude Code stacks
-      that plan to drive the box via Remote Control need this the first time,
-      to complete `claude login` in the browser terminal.
+      the secret in the URL. Use any 16-64 characters; password-manager symbols
+      are supported. AWS masks this field with dots after you type it and never
+      emits it in stack outputs, so save it somewhere before you launch — there
+      is no way to recover it later. Even Claude Code stacks that plan to drive
+      the box via Remote Control need this the first time, to complete `claude
+      login` in the browser terminal.
 
   AgentsMd:
     Type: String
@@ -605,7 +605,11 @@ Resources:
                   sha256 = pin.sha256;
                 };
                 hostname = "${WebHostname}";
-                webPassword = "${WebPassword}";
+                # Fn::Sub receives a base64 projection of WebPassword so every
+                # password-manager symbol remains inert Nix source. The
+                # activation script decodes it only into a shell variable and
+                # pipes it to Caddy over stdin.
+                webPasswordBase64 = "${WebPasswordBase64}";
               in {
                 imports = [
                   "${!modulesPath}/virtualisation/amazon-image.nix"
@@ -667,8 +671,14 @@ Resources:
                   if [ ! -s /var/lib/agent-box-web/password-hash ]; then
                     (
                       umask 077
-                      ${!pkgs.caddy}/bin/caddy hash-password --plaintext ${!lib.escapeShellArg webPassword} \
-                        > /var/lib/agent-box-web/password-hash
+                      webPassword="$(
+                        ${!pkgs.coreutils}/bin/printf '%s' ${!lib.escapeShellArg webPasswordBase64} \
+                          | ${!pkgs.coreutils}/bin/base64 --decode
+                      )"
+                      ${!pkgs.coreutils}/bin/printf '%s\n' "$webPassword" \
+                        | ${!pkgs.caddy}/bin/caddy hash-password --algorithm argon2id \
+                          > /var/lib/agent-box-web/password-hash
+                      unset webPassword
                     )
                     chmod 0600 /var/lib/agent-box-web/password-hash
                   fi
@@ -701,6 +711,8 @@ Resources:
                   - IpDashed: !Join
                       - '-'
                       - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
+              WebPasswordBase64:
+                Fn::Base64: !Ref WebPassword
               StackName: !Ref AWS::StackName
               # First-boot health signal (issue 106): tell CloudFormation the
               # user-data config actually APPLIED. This unit only exists once
