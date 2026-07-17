@@ -149,17 +149,20 @@ band — the launch page copy leads with this.
 
 `WebPassword` is marked `NoEcho` and is not emitted in stack Outputs. It still
 exists as plaintext in the substituted EC2 user-data, and the current
-implementation interpolates it into first-boot Nix/systemd material so Caddy can
-derive its Basic Auth hash. Treat principals that can read instance user-data or
-the instance's local system configuration as inside the web terminal trust
+implementation interpolates a reversible base64 projection into first-boot
+Nix/systemd material, then decodes it in the activation script so Caddy can
+derive its Basic Auth hash. Treat principals that can read instance user-data
+or the instance's local system configuration as inside the web terminal trust
 boundary.
 
 Caddy does not compare the plaintext password at request time. On first boot an
-activation script runs `caddy hash-password` and stores only the bcrypt hash at
+activation script runs `caddy hash-password --algorithm argon2id` and stores
+only the Argon2id hash at
 `/var/lib/agent-box-web/password-hash` (the file the module's
 `users.agent.web.passwordHashFile` points at). On every boot
-`agent-web-auth-secrets.service` writes that hash (`WEB_PASSWORD_HASH_AGENT`)
-plus a random cookie secret (`WEB_COOKIE_SECRET_AGENT`) to
+`agent-web-auth-secrets.service` writes that hash and its detected algorithm
+(`WEB_PASSWORD_HASH_AGENT` / `WEB_PASSWORD_ALGORITHM_AGENT`) plus a random
+cookie secret (`WEB_COOKIE_SECRET_AGENT`) to
 `/run/agent-box-web/env` (`0600`), and Caddy reads that environment file. The
 cookie secret is generated on the instance and stored separately at
 `/var/lib/agent-box-web/cookie-secret-agent` (`0700` parent directory).

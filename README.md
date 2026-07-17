@@ -30,8 +30,9 @@ Let's Encrypt cert against `<eip>.sslip.io`.
 | eu-central-1 (Frankfurt) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-central-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
 | eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
 
-Choose `Agent` (`claude` or `codex`), set a `WebPassword` (16+ chars from
-`[A-Za-z0-9._~-]`), pick an instance size, launch. The stack reports
+Choose `Agent` (`claude` or `codex`), set a `WebPassword` (any 16&ndash;64
+characters, including password-manager symbols), pick an instance size,
+launch. The stack reports
 CREATE_COMPLETE only after the box phones home from its first successful
 rebuild — a first boot that goes wrong (issue 106 has one way) rolls the
 stack back visibly instead of leaving a green stack with a dead URL. The agent runs as the
@@ -85,6 +86,13 @@ one CAPABILITY_IAM checkbox to the Launch Stack form; opt out with
 `EnableSsm=false` to skip it. See
 [aws/README.md](./aws/README.md#root-access-via-ssm-session-manager) for
 details.
+
+**Changing the web password.** Open the settings page (the gear icon next to
+the terminal), choose **Change password**, and enter the current password plus
+the new password twice. The new password follows the launch-time 16&ndash;64
+character policy. Saving replaces the root-owned password hash using Caddy's
+recommended Argon2id algorithm, reloads Caddy,
+and signs out every browser by rotating the authentication-cookie secret.
 
 **Updating the box.** Click "Update box" on the settings page (the gear icon
 next to your terminal; the card also shows the running agent-box rev, linked
@@ -330,10 +338,12 @@ arbitrary command execution as the agent user.
 - **Tight sudo:** whatever's in `sudoAllowlist` is the entire root-capable
   surface. `NOPASSWD` only - no `SETENV`, no blanket sudo, no ALL.
 - **Nothing anonymous, brute-force damping (web deployments):** every path
-  on the vhost — terminal workspace, per-session terminals, settings — sits behind the
-  login (the CI tests assert the 401s), the password hash is bcrypt via
-  Caddy, and a fail2ban jail bans IPs that repeatedly fail it (default on,
-  `web.fail2ban`; it only counts requests that actually carried
+  on the vhost — terminal workspace, per-session terminals, settings — sits
+  behind the
+  login (the CI tests assert the 401s), new password hashes use Caddy's
+  recommended Argon2id algorithm (legacy bcrypt hashes remain accepted until
+  the password changes), and a fail2ban jail bans IPs that repeatedly fail it
+  (default on, `web.fail2ban`; it only counts requests that actually carried
   credentials). Discovery isn't assumed to be hard — the ACME cert for
   `<ip>.sslip.io` lands in public CT logs minutes after launch — auth is
   simply required everywhere.

@@ -1,12 +1,13 @@
-# VM test for issue #36: the per-user settings page lets an end user add and
-# remove agent secrets through the browser (behind the same basic-auth as the
-# terminal) without a nixos-rebuild and without typing the secret into the
-# agent chat. Exercises:
+# VM test for issues #36 and #91: the per-user settings page lets an end user
+# manage agent secrets and change the web password through the browser (behind
+# the same basic-auth as the terminal) without a nixos-rebuild. Exercises:
 #   - the agent-box-settings-<user> daemon unit (runs as the agent user),
 #   - the Caddy /<user>/settings* route inside the basic-auth block,
 #   - writing ~/.config/agent-box/env atomically at 0600,
 #   - the page listing key NAMES only (never values),
-#   - the agent unit's optional EnvironmentFile picking the file up on restart.
+#   - the agent unit's optional EnvironmentFile picking the file up on restart,
+#   - previous/new/confirm password validation, root-owned atomic hash rotation,
+#     cookie invalidation, and live Caddy reload.
 #
 # Like the other tests, lib.mkForce-swaps the module Caddyfile for a minimal
 # `tls internal` one (no ACME in the sandbox) that keeps the same
@@ -72,22 +73,36 @@
         log
         tls internal
         handle /agent/settings* {
-          route {
-            basic_auth bcrypt agent {
-              agent {$WEB_PASSWORD_HASH_AGENT}
-            }
+          @cookie_settings header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+          handle @cookie_settings {
             reverse_proxy unix//run/agent-box-settings/agent.sock
+          }
+          handle {
+            route {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+                agent {$WEB_PASSWORD_HASH_AGENT}
+              }
+              header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              reverse_proxy unix//run/agent-box-settings/agent.sock
+            }
           }
         }
         # Root catch-all: the session manager and its /sessions/* CRUD
         # routes (the daemon runs in AGENT_BOX_HOME mode for web.user) —
         # same auth gate, same upstream, mirroring the module Caddyfile.
         handle {
-          route {
-            basic_auth bcrypt agent {
-              agent {$WEB_PASSWORD_HASH_AGENT}
-            }
+          @cookie_root header_regexp Cookie "(^|; )__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}(;|$)"
+          handle @cookie_root {
             reverse_proxy unix//run/agent-box-settings/agent.sock
+          }
+          handle {
+            route {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_AGENT} agent {
+                agent {$WEB_PASSWORD_HASH_AGENT}
+              }
+              header >Set-Cookie "__Host-agent_box_auth_agent={$WEB_COOKIE_SECRET_AGENT}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              reverse_proxy unix//run/agent-box-settings/agent.sock
+            }
           }
         }
       }
@@ -208,6 +223,9 @@
     page = client.succeed(f"{curl} -u agent:testpassword https://box.test/agent/settings/")
     assert "GH_TOKEN" in page, "key name should be listed"
     assert "ghp_supersecret" not in page, "value must never be rendered"
+    assert 'action="/agent/settings/password"' in page, "password form should be rendered"
+    for field in ["previous_password", "new_password", "confirm_password"]:
+        assert f'name="{field}"' in page, f"password form should contain {field}"
 
     # Delete the key.
     client.succeed(
@@ -331,5 +349,72 @@
         "su -s /bin/sh mallory -c '/run/wrappers/bin/sudo -n "
         "/run/current-system/sw/bin/systemctl start --no-block agent-box-update.service'"
     )
+
+    # Issue 91: validation failures must leave the old credential untouched.
+    # Include symbols outside the old URL-safe allowlist: password-manager
+    # output should work unchanged.
+    new_password = "new!test@password#123"
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /tmp/mismatch -w '%{{http_code}}' "
+        "-d 'previous_password=testpassword' "
+        f"-d 'new_password={new_password}' -d 'confirm_password=doesnotmatch123' "
+        "https://box.test/agent/settings/password | grep -x 400"
+    )
+    client.succeed("grep -q 'do not match' /tmp/mismatch")
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /tmp/wrong -w '%{{http_code}}' "
+        "-d 'previous_password=wrongpassword' "
+        f"-d 'new_password={new_password}' -d 'confirm_password={new_password}' "
+        "https://box.test/agent/settings/password | grep -x 403"
+    )
+    client.succeed("grep -q 'Current password is incorrect' /tmp/wrong")
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "https://box.test/agent/settings/ | grep -x 200"
+    )
+
+    old_hash = machine.succeed("cat /var/lib/agent-box-web/password-hash")
+    old_cookie = machine.succeed("cat /var/lib/agent-box-web/cookie-secret-agent")
+    # Capture a real cookie authenticated under the old secret; it must stop
+    # working even though cookies normally bypass basic auth for WebSockets.
+    client.succeed(
+        f"{curl} -u agent:testpassword -c /tmp/old-cookie -o /dev/null "
+        "https://box.test/agent/settings/"
+    )
+    client.succeed(
+        f"{curl} -b /tmp/old-cookie -o /dev/null -w '%{{http_code}}' "
+        "https://box.test/agent/settings/ | grep -x 200"
+    )
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "-d 'previous_password=testpassword' "
+        f"-d 'new_password={new_password}' -d 'confirm_password={new_password}' "
+        "https://box.test/agent/settings/password | grep -x 303"
+    )
+    machine.wait_for_unit("caddy.service")
+    new_hash = machine.succeed("cat /var/lib/agent-box-web/password-hash")
+    assert new_hash != old_hash
+    assert new_hash.startswith("$argon2id$"), "new hashes should use Argon2id"
+    assert machine.succeed("cat /var/lib/agent-box-web/cookie-secret-agent") != old_cookie
+    machine.succeed(
+        "stat -c '%U %G %a' /var/lib/agent-box-web/password-hash "
+        "| grep -x 'root root 600'"
+    )
+
+    # The live Caddy config must accept only the new password; no rebuild or
+    # service restart by the test is allowed to paper over a stale env snapshot.
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "https://box.test/agent/settings/ | grep -x 401"
+    )
+    client.succeed(
+        f"{curl} -b /tmp/old-cookie -o /dev/null -w '%{{http_code}}' "
+        "https://box.test/agent/settings/ | grep -x 401"
+    )
+    client.succeed(
+        f"{curl} -u 'agent:{new_password}' -o /tmp/changed -w '%{{http_code}}' "
+        "https://box.test/agent/settings/?ok=password_changed | grep -x 200"
+    )
+    client.succeed("grep -q 'Password changed' /tmp/changed")
   '';
 }

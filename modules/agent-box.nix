@@ -444,8 +444,9 @@ let
         example = "/var/lib/agent-box-web/password-hash-${name}";
         description = ''
           Give this user a browser terminal (requires
-          services.agent-box.web.enable). Path to a file containing a bcrypt
-          hash produced by `caddy hash-password`; the terminal is served at
+          services.agent-box.web.enable). Path to a file containing an
+          Argon2id (recommended) or legacy bcrypt hash produced by `caddy
+          hash-password`; the terminal is served at
           https://<web.domain>/${name}/ behind basic auth whose username is
           this linux user name and whose password is the one behind this
           hash. Root-owned, 0600, outside the Nix store so the plaintext
@@ -1278,6 +1279,201 @@ in
       # a prefix, so the daemon matches this full path).
       settingsBaseOf = n: "/${n}/settings";
       hashFileOf = n: toString cfg.users.${n}.web.passwordHashFile;
+      # Root-only password rotator for one terminal user (issue #91). The
+      # settings daemon deliberately remains unprivileged, so it invokes this
+      # no-argument helper through a per-user sudo rule and sends the old/new
+      # passwords over stdin. User and file paths are compiled into the store
+      # script: callers cannot redirect the root write toward another user's
+      # hash (or any other path).
+      passwordHelperOf = name:
+        pkgs.writers.writePython3Bin "agent-box-password-${name}" {
+          libraries = [
+            pkgs.python3Packages.argon2-cffi
+            pkgs.python3Packages.bcrypt
+          ];
+          flakeIgnore = [ "E501" "E302" "E305" ];
+        } ''
+          import argon2
+          import bcrypt
+          import fcntl
+          import json
+          import os
+          import secrets
+          import subprocess
+          import sys
+          import tempfile
+
+          HASH_FILE = ${builtins.toJSON (hashFileOf name)}
+          COOKIE_FILE = ${builtins.toJSON "/var/lib/agent-box-web/cookie-secret-${name}"}
+          AUTH_ENV_FILE = "/run/agent-box-web/env"
+          AUTH_ENV_LOCK = "/run/agent-box-web/password-change.lock"
+          ENV_SUFFIX = ${builtins.toJSON (envName name)}
+          CADDY = ${builtins.toJSON "${pkgs.caddy}/bin/caddy"}
+          SYSTEMCTL = "/run/current-system/sw/bin/systemctl"
+          NEW_HASH_ALGORITHM = "argon2id"
+
+
+          def fail(code, message):
+              # Never include supplied passwords in output. The daemon logs only
+              # the return code, but this also keeps direct invocations safe.
+              sys.stderr.write("agent-box password helper: " + message + "\n")
+              raise SystemExit(code)
+
+
+          def atomic_replace(path, data):
+              """Atomically replace a root secret, preserving owner and mode."""
+              directory = os.path.dirname(path)
+              try:
+                  st = os.stat(path)
+                  uid, gid, mode = st.st_uid, st.st_gid, st.st_mode & 0o777
+              except FileNotFoundError:
+                  uid, gid, mode = 0, 0, 0o600
+              fd, tmp = tempfile.mkstemp(dir=directory, prefix=".password.")
+              try:
+                  os.fchmod(fd, mode)
+                  os.fchown(fd, uid, gid)
+                  with os.fdopen(fd, "wb") as fh:
+                      fh.write(data)
+                      fh.flush()
+                      os.fsync(fh.fileno())
+                  os.replace(tmp, path)
+              except BaseException:
+                  try:
+                      os.unlink(tmp)
+                  except OSError:
+                      pass
+                  raise
+
+
+          def valid_password(password):
+              return 16 <= len(password) <= 64 and not any(
+                  char in password for char in "\r\n"
+              )
+
+
+          def password_matches(password, encoded):
+              """Verify both legacy bcrypt and current Argon2id hashes."""
+              if encoded.startswith(b"$argon2id$"):
+                  try:
+                      return argon2.PasswordHasher().verify(
+                          encoded.decode("ascii"), password
+                      )
+                  except argon2.exceptions.VerifyMismatchError:
+                      return False
+                  except (
+                      argon2.exceptions.InvalidHashError,
+                      argon2.exceptions.VerificationError,
+                      UnicodeError,
+                  ):
+                      fail(5, "could not validate current password")
+              if encoded.startswith((b"$2a$", b"$2b$", b"$2y$")):
+                  try:
+                      return bcrypt.checkpw(password.encode("utf-8"), encoded)
+                  except (UnicodeError, ValueError):
+                      fail(5, "could not validate current password")
+              fail(5, "unsupported current password hash")
+
+
+          def hash_password(password):
+              """Use Caddy's recommended algorithm and parameter defaults."""
+              try:
+                  proc = subprocess.run(
+                      [CADDY, "hash-password", "--algorithm", NEW_HASH_ALGORITHM],
+                      input=(password + "\n").encode("utf-8"),
+                      check=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.DEVNULL,
+                  )
+                  encoded = proc.stdout.decode("ascii").strip()
+              except (OSError, UnicodeError, subprocess.CalledProcessError):
+                  fail(5, "could not hash new password")
+              if not encoded.startswith("$argon2id$"):
+                  fail(5, "password hash used an unexpected algorithm")
+              return encoded
+
+
+          def update_auth_env(new_hash, new_cookie):
+              """Replace this user's values in Caddy's runtime env."""
+              replacements = {
+                  "WEB_PASSWORD_ALGORITHM_" + ENV_SUFFIX: NEW_HASH_ALGORITHM,
+                  "WEB_PASSWORD_HASH_" + ENV_SUFFIX: new_hash,
+                  "WEB_COOKIE_SECRET_" + ENV_SUFFIX: new_cookie,
+              }
+              try:
+                  with open(AUTH_ENV_FILE, "r", encoding="utf-8") as fh:
+                      lines = fh.read().splitlines()
+              except OSError:
+                  fail(5, "could not read web authentication environment")
+              output = []
+              seen = set()
+              for line in lines:
+                  key = line.split("=", 1)[0]
+                  if key in replacements:
+                      output.append(key + "=" + replacements[key])
+                      seen.add(key)
+                  else:
+                      output.append(line)
+              for key in sorted(set(replacements) - seen):
+                  output.append(key + "=" + replacements[key])
+              atomic_replace(AUTH_ENV_FILE, ("\n".join(output) + "\n").encode("utf-8"))
+
+
+          def main():
+              try:
+                  request = json.load(sys.stdin)
+              except (UnicodeError, ValueError):
+                  fail(4, "invalid request")
+              if not isinstance(request, dict) or set(request) != {"previous", "new"}:
+                  fail(4, "invalid request")
+              previous = request["previous"]
+              new = request["new"]
+              if not isinstance(previous, str) or not isinstance(new, str):
+                  fail(4, "invalid request")
+              if not valid_password(new) or new == previous:
+                  fail(4, "invalid new password")
+
+              try:
+                  with open(HASH_FILE, "rb") as fh:
+                      current_hash = fh.read().strip()
+                  matches = password_matches(previous, current_hash)
+              except OSError:
+                  fail(5, "could not validate current password")
+              if not matches:
+                  fail(2, "current password is incorrect")
+
+              new_hash = hash_password(new)
+              new_cookie = secrets.token_hex(32)
+
+              # Serialize password changes across users while updating the two
+              # persistent secrets and their root-owned runtime projection.
+              # Cookie auth bypasses basic auth after the first login, so rotating
+              # the cookie secret signs out every browser.
+              try:
+                  lock_fd = os.open(AUTH_ENV_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+                  with os.fdopen(lock_fd, "w") as lock:
+                      fcntl.flock(lock, fcntl.LOCK_EX)
+                      atomic_replace(HASH_FILE, (new_hash + "\n").encode("ascii"))
+                      atomic_replace(COOKIE_FILE, (new_cookie + "\n").encode("ascii"))
+                      update_auth_env(new_hash, new_cookie)
+
+                      # systemd re-reads EnvironmentFile for ExecReload, so the
+                      # running listener adopts the new credentials without a
+                      # restart or dropping the in-flight settings response.
+                      subprocess.run(
+                          [SYSTEMCTL, "reload", "caddy.service"],
+                          check=True,
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL,
+                      )
+              except (OSError, subprocess.CalledProcessError):
+                  fail(5, "password saved but web authentication reload failed")
+
+
+          if __name__ == "__main__":
+              main()
+        '';
+      passwordHelperCmdOf = name:
+        "${passwordHelperOf name}/bin/agent-box-password-${name}";
       # The settings daemon script (issue #36). Python-3-stdlib only — no
       # third-party deps — so it stays tiny and auditable. Runs as the agent
       # user; writes ~/.config/agent-box/env (0600) and restarts the agent by
@@ -1350,6 +1546,8 @@ in
         #                                 workspace at / (primary web user)
         #   AGENT_BOX_AGENTS             comma-separated installed agent CLIs
         #   AGENT_BOX_DEFAULT_AGENT      agent preselected in the add form
+        #   AGENT_BOX_PASSWORD_CMD       no-argument sudo command that verifies
+        #                                 and replaces this user's web password
 
         import html
         import http.server
@@ -1394,6 +1592,10 @@ in
         # used by its non-blocking GitHub update check.
         REPO = os.environ.get("AGENT_BOX_REPO", "")
         REV = os.environ.get("AGENT_BOX_REV", "")
+        # Per-user, no-argument privileged helper (issue 91). Passwords are sent
+        # as JSON on stdin, never argv or environment, and helper output is never
+        # reflected into HTTP responses.
+        PASSWORD_CMD = os.environ.get("AGENT_BOX_PASSWORD_CMD", "")
 
         # Env var names: POSIX-ish. Must start with a letter or underscore and
         # contain only letters, digits, underscores. This is what a shell / systemd
@@ -1402,6 +1604,13 @@ in
         # Session names: same charset the supervisor and CLI enforce (they
         # land in tmux -t targets and URLs).
         SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+        def valid_password(password):
+            """Accept password-manager symbols; form fields cannot contain LF/CR."""
+            return 16 <= len(password) <= 64 and not any(
+                char in password for char in "\r\n"
+            )
 
 
         def read_keys():
@@ -1623,6 +1832,28 @@ in
                 sys.stderr.write("update_box: %s\n" % exc)
 
 
+        def change_password(previous, new):
+            """Ask the root helper to verify and rotate the web credentials.
+
+            Return 0 on success, 2 for a wrong current password, and another
+            nonzero value for an operational failure. Passwords cross sudo on
+            stdin only; neither argv, the environment nor the journal sees them.
+            """
+            try:
+                proc = subprocess.run(
+                    PASSWORD_CMD.split(),
+                    input=json.dumps({"previous": previous, "new": new}),
+                    text=True,
+                    check=False,
+                    capture_output=True,
+                )
+                sys.stderr.write("change_password: helper rc=%d\n" % proc.returncode)
+                return proc.returncode
+            except OSError as exc:
+                sys.stderr.write("change_password: %s\n" % exc)
+                return 5
+
+
         # Page skeleton. HEAD_TPL and BODY go through str.format (hence no
         # literal braces in them); STYLE and SCRIPT are plain strings so CSS/JS
         # braces need no doubling. The layout mirrors GitHub's environment-
@@ -1707,6 +1938,10 @@ in
           input[type=text] { width: 200px; max-width: 100%; }
           input[type=password] { width: 280px; max-width: 100%; }
           .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+          .fields { display: grid; grid-template-columns: 1fr; gap: 12px; }
+          .field { display: flex; flex-direction: column; align-items: flex-start;
+                   gap: 4px; color: #8b949e; font-size: 13px; }
+          .field input { box-sizing: border-box; width: 100%; }
           form.inline { display: inline; }
           .msg { padding: 10px 14px; border-radius: 8px; margin: 12px 0;
                  border: 1px solid rgba(63,185,80,.4); background: #10251a;
@@ -1849,6 +2084,7 @@ in
             </div>
             <div id="secrets-list">{keys}</div>
           </section>
+          {password_section}
           <section>
             <h2>Danger zone</h2>
             <ul class="tbl danger">
@@ -1868,6 +2104,36 @@ in
         </main>
         </html>
         """
+
+        PASSWORD_SECTION = """<section>
+            <div class="sec-head">
+              <h2>Account</h2>
+              <button type="button" class="btn" data-toggle="password-editor">Change password</button>
+            </div>
+            <p class="note">Change the password used to sign in to this browser
+            terminal. All signed-in browsers will be logged out.</p>
+            <div id="password-editor" class="editor">
+              <form method="post" action="{base}/password" data-native>
+                <div class="fields">
+                  <label class="field">Current password
+                    <input type="password" name="previous_password"
+                           autocomplete="current-password" required>
+                  </label>
+                  <label class="field">New password
+                    <input type="password" name="new_password"
+                           autocomplete="new-password" minlength="16" maxlength="64" required>
+                  </label>
+                  <label class="field">Confirm new password
+                    <input type="password" name="confirm_password"
+                           autocomplete="new-password" minlength="16" maxlength="64" required>
+                  </label>
+                  <p class="note">Use 16&ndash;64 characters. Symbols generated
+                  by password managers are supported.</p>
+                  <div><button type="submit" class="btn">Update password</button></div>
+                </div>
+              </form>
+            </div>
+          </section>"""
 
         UPDATE_ROW = """<li>
                 <span class="dz"><strong>Update box</strong>
@@ -2095,7 +2361,7 @@ in
 
           // The editors render expanded (no-JS fallback); collapse them once
           // JS is live so the page opens in list-only, GitHub-style form.
-          ["secret-editor", "session-editor"].forEach(function (id) {
+          ["secret-editor", "session-editor", "password-editor"].forEach(function (id) {
             var el = document.getElementById(id);
             if (el) { el.hidden = true; }
           });
@@ -2127,6 +2393,10 @@ in
           document.addEventListener("submit", function (e) {
             var f = e.target;
             if (e.defaultPrevented || !f || (f.method || "").toLowerCase() !== "post") { return; }
+            // Password rotation invalidates the current cookie and cached basic
+            // credentials. Let the browser follow its native 303/401 flow so it
+            // can prompt for the new password; fetch() suppresses that UX.
+            if (f.hasAttribute("data-native")) { return; }
             e.preventDefault();
             var body = new URLSearchParams();
             new FormData(f).forEach(function (v, k) { body.append(k, v); });
@@ -2315,6 +2585,10 @@ in
                     # terminal workspace, so session CRUD lives here.
                     sessions_section=render_sessions_section(),
                     message=msg_html,
+                    password_section=(
+                        PASSWORD_SECTION.format(base=html.escape(BASE))
+                        if PASSWORD_CMD else ""
+                    ),
                     update_row=(
                         UPDATE_ROW.format(base=html.escape(BASE), update_line=render_update_line())
                         if UPDATE_CMD else ""
@@ -2381,6 +2655,7 @@ in
                 "session_restarted": "Session restart requested.",
                 "update": "Box update started — the system rebuilds in the "
                           "background and this page may briefly go away.",
+                "password_changed": "Password changed. Sign in with your new password.",
             }
 
             def do_GET(self):
@@ -2452,7 +2727,44 @@ in
                     )
                     return
                 form = self._read_form()
-                if path == BASE + "/set":
+                if path == BASE + "/password" and PASSWORD_CMD:
+                    previous = form.get("previous_password", [""])[0]
+                    new = form.get("new_password", [""])[0]
+                    confirm = form.get("confirm_password", [""])[0]
+                    if new != confirm:
+                        self._send_html(
+                            render_page("New password and confirmation do not match."),
+                            status=400,
+                        )
+                        return
+                    if not valid_password(new):
+                        self._send_html(
+                            render_page("New password must be 16–64 characters and "
+                                        "cannot contain a line break."),
+                            status=400,
+                        )
+                        return
+                    if new == previous:
+                        self._send_html(
+                            render_page("New password must differ from the current password."),
+                            status=400,
+                        )
+                        return
+                    result = change_password(previous, new)
+                    if result == 2:
+                        self._send_html(
+                            render_page("Current password is incorrect."), status=403
+                        )
+                        return
+                    if result != 0:
+                        self._send_html(
+                            render_page("Could not update the password. Try again or "
+                                        "check the settings service journal."),
+                            status=500,
+                        )
+                        return
+                    self._redirect("ok=password_changed")
+                elif path == BASE + "/set":
                     key = (form.get("key", [""])[0]).strip()
                     value = form.get("value", [""])[0]
                     if not KEY_RE.match(key):
@@ -2644,7 +2956,7 @@ in
           }
           handle {
             route {
-              basic_auth bcrypt ${name} {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
                 ${name} {$WEB_PASSWORD_HASH_${envName name}}
               }
               header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -2659,7 +2971,7 @@ in
           }
           handle {
             route {
-              basic_auth bcrypt ${name} {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
                 ${name} {$WEB_PASSWORD_HASH_${envName name}}
               }
               header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -2689,7 +3001,7 @@ in
           }
           handle {
             route {
-              basic_auth bcrypt ${name} {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
                 ${name} {$WEB_PASSWORD_HASH_${envName name}}
               }
               header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
@@ -2768,8 +3080,9 @@ in
       # Reads each terminal user's (already-hashed) password from their
       # passwordHashFile, mints a persistent per-user cookie secret if
       # absent, and writes everything into /run/agent-box-web/env for Caddy
-      # to consume as environment variables (WEB_PASSWORD_HASH_<USER> /
-      # WEB_COOKIE_SECRET_<USER>). Runs BEFORE caddy every boot.
+      # to consume as environment variables (WEB_PASSWORD_ALGORITHM_<USER> /
+      # WEB_PASSWORD_HASH_<USER> / WEB_COOKIE_SECRET_<USER>). Runs BEFORE
+      # caddy every boot.
       webAuthSecretsService = {
         description = "Prepare browser terminal auth env for Caddy";
         before = [ "caddy.service" ];
@@ -2787,9 +3100,16 @@ in
           if [ ! -s /var/lib/agent-box-web/cookie-secret-${name} ]; then
             openssl rand -hex 32 > /var/lib/agent-box-web/cookie-secret-${name}
           fi
+          hash="$(cat ${lib.escapeShellArg (hashFileOf name)})"
+          case "$hash" in
+            '$argon2id$'*) algorithm=argon2id ;;
+            '$2a$'*|'$2b$'*|'$2y$'*) algorithm=bcrypt ;;
+            *) echo "unsupported password hash for ${name}" >&2; exit 1 ;;
+          esac
           {
             printf 'WEB_COOKIE_SECRET_${envName name}=%s\n' "$(cat /var/lib/agent-box-web/cookie-secret-${name})"
-            printf 'WEB_PASSWORD_HASH_${envName name}=%s\n' "$(cat ${lib.escapeShellArg (hashFileOf name)})"
+            printf 'WEB_PASSWORD_ALGORITHM_${envName name}=%s\n' "$algorithm"
+            printf 'WEB_PASSWORD_HASH_${envName name}=%s\n' "$hash"
           } >> "$tmp"
         '') terminalUsers + ''
           chmod 0600 "$tmp"
@@ -2863,6 +3183,20 @@ in
         # `import /var/lib/agent-box-sites/*/*.caddy`.
         configFile = managedCaddyfile;
       };
+
+      # The settings daemon for each terminal user may invoke only that user's
+      # argument-free password helper as root. Keeping these as separate rules
+      # (instead of the global agent sudoAllowlist) prevents one agent user from
+      # rotating another user's web credentials on a multi-user box.
+      security.sudo.extraRules = map (name: {
+        users = [ name ];
+        commands = [{
+          # In sudoers, a literal empty argument string means the command may
+          # only be run with no arguments (omitting it would allow any argv).
+          command = "${passwordHelperCmdOf name} \"\"";
+          options = [ "NOPASSWD" ];
+        }];
+      }) terminalUsers;
 
       # Brute-force protection: count 401s on the terminal vhost that carried
       # an Authorization header (Caddy logs it as ["REDACTED"] when present),
@@ -2944,6 +3278,8 @@ in
           AGENT_BOX_SESSIONS_FILE = userSessionsFile name;
           AGENT_BOX_AGENTS = lib.concatStringsSep "," (sessionKinds cfg.installAgents);
           AGENT_BOX_DEFAULT_AGENT = cfg.agent;
+          AGENT_BOX_PASSWORD_CMD =
+            "/run/wrappers/bin/sudo -n ${passwordHelperCmdOf name}";
         } // lib.optionalAttrs (name == rootUser) {
           # This daemon also serves the vhost root: GET / is the session
           # manager (Caddy proxies it here behind the user's auth) and the
@@ -2963,10 +3299,17 @@ in
           Restart = "always";
           RestartSec = "5s";
           ExecStart = "${settingsDaemon}/bin/agent-box-settings";
-          # Hardening: the daemon needs to write ~/.config/agent-box and run
-          # tmux against the /run socket dir, nothing else.
+          # Hardening: the daemon itself remains unable to read the root-owned
+          # web secrets. /var/lib/agent-box-web is writable in the mount
+          # namespace only so the sudo'd password helper can atomically replace
+          # this user's hash and cookie; normal Unix permissions still deny the
+          # unprivileged daemon.
           ProtectSystem = "strict";
-          ReadWritePaths = [ "/home/${name}" "/run/${runtimeDirectory name}" ];
+          ReadWritePaths = [
+            "/home/${name}"
+            "/run/${runtimeDirectory name}"
+            "/var/lib/agent-box-web"
+          ];
           ProtectHome = false;
           PrivateDevices = true;
           ProtectKernelTunables = true;
@@ -2975,12 +3318,10 @@ in
           RestrictSUIDSGID = true;
           RestrictRealtime = true;
           LockPersonality = true;
-          # Setuid sudo needs privilege escalation, which NNP vetoes — same
-          # tradeoff the agent unit makes for its sudoAllowlist. The only
-          # extra power gained is the daemon user's own allowlist (the
-          # argument-free update trigger), so relax NNP only when selfUpdate
-          # is on.
-          NoNewPrivileges = !cfg.selfUpdate.enable;
+          # Setuid sudo needs privilege escalation, which NNP vetoes. The
+          # daemon always has its per-user, argument-free password helper; with
+          # selfUpdate enabled it also has the argument-free update trigger.
+          NoNewPrivileges = false;
         };
       }) terminalUsers);
 
