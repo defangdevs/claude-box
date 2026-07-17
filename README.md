@@ -240,6 +240,8 @@ terminal (add sessions from the tab bar; restart/delete on the settings
 page) — and agents can spawn sibling sessions themselves (it's just a file
 edit on their own account — handy for "have Codex cross-check this").
 
+![Tabbed terminal workspace: one tab per session](docs/workspace-tabs.png)
+
 Attach locally with `tmux -L agent-box attach -t <session>` (see
 `TMUX_TMPDIR` note above). In the browser, every tab is also a
 deep-linkable standalone terminal at

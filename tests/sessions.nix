@@ -287,12 +287,15 @@
     assert "workingDirectory" not in root_page, root_page
 
     # The root page's CRUD routes (behind auth) can add a session; the
-    # workspace redirect lands on the new session's tab.
+    # workspace redirect lands on the new session's tab. Assert the raw
+    # Location header (h2 lowercases it, CRLF line ends — no grep -x):
+    # what the daemon EMITS is the contract, curl's %{redirect_url}
+    # resolution is not.
     client.succeed(
-        f"{curl} -u agent:testpassword -o /dev/null -w '%{{redirect_url}}' "
+        f"{curl} -u agent:testpassword -o /dev/null -D - "
         "-d 'name=web&agent=claude' "
         "https://box.test/sessions/add "
-        "| grep -xF 'https://box.test/?ok=session_added&tab=web'"
+        "| grep -i '^location: /?ok=session_added&tab=web'"
     )
     machine.wait_until_succeeds(tmux("has-session -t =web"), timeout=60)
 
@@ -348,10 +351,10 @@
     assert "Add session" in settings_page, settings_page
     assert 'name="back" value="settings"' in settings_page, settings_page
     client.succeed(
-        f"{curl} -u agent:testpassword -o /dev/null -w '%{{redirect_url}}' "
+        f"{curl} -u agent:testpassword -o /dev/null -D - "
         "-d 'name=main&back=settings' "
         "https://box.test/sessions/restart "
-        "| grep -x 'https://box.test/agent/settings/?ok=session_restarted'"
+        "| grep -i '^location: /agent/settings/?ok=session_restarted'"
     )
     # (that restart killed main; the supervisor brings it back)
     machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=60)
