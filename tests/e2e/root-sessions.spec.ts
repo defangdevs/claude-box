@@ -57,6 +57,7 @@ test('the old public sessions.json is gone (now behind the auth gate)', async ({
 test('authenticated root lists sessions with ?arg= terminal deep links', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1, name: 'Agent Box' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Sessions', exact: true })).toBeVisible();
   const link = page.locator(`#sessions-list a.sess[href*="/${USER}/?arg="]`).first();
   await expect(link).toBeVisible();
