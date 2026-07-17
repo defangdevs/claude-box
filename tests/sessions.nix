@@ -128,6 +128,16 @@
         "/home/agent/.config/agent-box/sessions.json"
     )
 
+    # Re-adding an existing name errors out and must not clobber the stored
+    # config (issue 100): helper keeps its codex agent.
+    machine.fail(
+        "su -s /bin/sh agent -c 'agent-box-session add helper --agent claude'"
+    )
+    machine.succeed(
+        "jq -e '.sessions.helper.agent == \"codex\"' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
+
     # The runtime-created session runs INSIDE the hardened agent unit's
     # cgroup: the tmux server is a child of the supervisor, so systemd
     # sandboxing covers sessions added long after boot.
@@ -193,6 +203,18 @@
         "https://box.test/sessions/add | grep -x 303"
     )
     machine.wait_until_succeeds(tmux("has-session -t =web"), timeout=60)
+
+    # A duplicate add via the web is a 409 and the stored config survives
+    # (a silent overwrite would reset it to defaults — issue 100).
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "-d 'name=web&agent=codex' "
+        "https://box.test/sessions/add | grep -x 409"
+    )
+    machine.succeed(
+        "jq -e '.sessions.web.agent == \"claude\"' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
 
     # ...and delete it again (delist + kill).
     client.succeed(

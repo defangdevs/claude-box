@@ -212,6 +212,10 @@ let
           (*) echo "agent '$agent' is not installed (installed: $AGENTS)" >&2; exit 2 ;;
         esac
         ensure_file
+        if "$JQ" -e --arg n "$name" '.sessions | has($n)' "$FILE" >/dev/null; then
+          echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
+          exit 2
+        fi
         # `--` after --args: jq otherwise still option-parses positional
         # args, so a dashed extra arg like --model would error out.
         jq_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
@@ -2088,6 +2092,15 @@ in
                         )
                         return
                     sessions = read_sessions()
+                    if name in sessions:
+                        # Silently overwriting would reset the stored config
+                        # (agent, cwd, extraArgs) to defaults — issue 100.
+                        self._send_html(
+                            render("Session '%s' already exists. Delete it "
+                                   "first, or use Restart to bounce it." % name),
+                            status=409,
+                        )
+                        return
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,
