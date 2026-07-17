@@ -1682,7 +1682,7 @@ in
         # settings page holds everything else.
         HOME_BODY = """<main>
           <a class="back" href="{base}/">&#9881; Settings</a>
-          <h1>Sessions</h1>
+          <h1>Agent Box</h1>
           <div id="msg-slot">{message}</div>
           {sessions_section}
         </main>
@@ -1983,7 +1983,7 @@ in
         def render_home(message=""):
             msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
             return (
-                HEAD_TPL.format(title="Sessions &mdash; " + html.escape(USER))
+                HEAD_TPL.format(title="Agent Box &mdash; " + html.escape(USER))
                 + STYLE
                 + HOME_BODY.format(
                     base=html.escape(BASE),
