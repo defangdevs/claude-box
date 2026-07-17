@@ -1388,7 +1388,8 @@ in
         # when selfUpdate is off, which hides the Update card and 404s the route.
         UPDATE_CMD = os.environ.get("AGENT_BOX_UPDATE_CMD", "")
         # Running agent-box git rev + GitHub owner/repo (set alongside
-        # UPDATE_CMD when selfUpdate is on) — shown on the Update card.
+        # UPDATE_CMD when selfUpdate is on) — shown on the Update card and
+        # used by its non-blocking GitHub update check.
         REPO = os.environ.get("AGENT_BOX_REPO", "")
         REV = os.environ.get("AGENT_BOX_REV", "")
 
@@ -1692,6 +1693,10 @@ in
           .dz { display: flex; flex-direction: column; min-width: 0; }
           .dz strong { font-size: 14px; }
           .dz .note { margin: 2px 0 0; }
+          .update-state { color: #8b949e; }
+          .update-state[data-state=available] { color: #d29922; }
+          .update-state[data-state=current] { color: #3fb950; }
+          .update-state[data-state=blocked] { color: #f85149; }
           .editor { border: 1px solid #30363d; border-radius: 8px; background: #161b22;
                     padding: 14px 16px; margin: 12px 0 0; }
           input, select { font: inherit; font-size: 13px; padding: 6px 10px;
@@ -1811,7 +1816,7 @@ in
                 <span class="dz"><strong>Update box</strong>
                 <span class="note">Fetches the latest agent-box release and agent
                 CLI versions, then rebuilds the system. Takes a few minutes; sessions
-                restart if their software changed.{rev_line}</span></span>
+                restart if their software changed.{update_line}</span></span>
                 <form method="post" action="{base}/update"
                       onsubmit="return confirm('Update the box now? This rebuilds the system and may restart the agent sessions.');">
                   <button type="submit" class="btn danger-btn">Update box</button>
@@ -1862,6 +1867,68 @@ in
           }
           function parseHTML(text) {
             return new DOMParser().parseFromString(text, "text/html");
+          }
+
+          // The page itself never waits on GitHub. Once it is visible, make a
+          // single compare request: GitHub reports whether repository HEAD is
+          // ahead of the running revision and provides the commit count. The
+          // rendered compare link remains useful if the request is blocked or
+          // rate-limited.
+          function checkForUpdate() {
+            var el = document.getElementById("update-status");
+            if (!el) { return; }
+            var repo = el.getAttribute("data-repo");
+            var rev = el.getAttribute("data-rev");
+            var fallback = el.getAttribute("data-compare-url");
+            if (!repo || !rev || !fallback) { return; }
+
+            function show(state, text, linkText, href) {
+              el.setAttribute("data-state", state);
+              el.textContent = text;
+              if (linkText && href) {
+                var link = document.createElement("a");
+                link.href = href;
+                link.textContent = linkText;
+                link.rel = "noreferrer";
+                el.appendChild(document.createTextNode(" "));
+                el.appendChild(link);
+              }
+            }
+
+            var repoPath = repo.split("/").map(encodeURIComponent).join("/");
+            var api = "https://api.github.com/repos/" + repoPath +
+                      "/compare/" + encodeURIComponent(rev) + "...HEAD";
+            show("checking", "Checking GitHub for agent-box updates…");
+            fetch(api, {
+              credentials: "omit",
+              headers: { "Accept": "application/vnd.github+json" },
+              referrerPolicy: "no-referrer"
+            })
+              .then(function (r) {
+                if (!r.ok) { throw new Error("GitHub returned " + r.status); }
+                return r.json();
+              })
+              .then(function (result) {
+                if (result.status === "identical") {
+                  show("current", "No agent-box code update.");
+                  return;
+                }
+                if (result.status === "ahead") {
+                  var count = Number(result.ahead_by) || 0;
+                  var commits = count ? count + " commit" + (count === 1 ? "" : "s") : "new commits";
+                  var head = result.head_commit && result.head_commit.sha;
+                  var href = head
+                    ? "https://github.com/" + repoPath + "/compare/" +
+                      encodeURIComponent(rev) + "..." + encodeURIComponent(head)
+                    : fallback;
+                  show("available", "agent-box update available — " + commits + ".", "View changes", href);
+                  return;
+                }
+                show("blocked", "Automatic agent-box update unavailable.", "Compare revisions", fallback);
+              })
+              .catch(function () {
+                show("unknown", "Couldn’t check agent-box updates.", "Check GitHub", fallback);
+              });
           }
 
           var pollLeft = 0;
@@ -1929,6 +1996,7 @@ in
               });
           });
 
+          checkForUpdate();
           startPolling(8);
         })();
         </script>
@@ -2002,12 +2070,13 @@ in
             return "".join(items)
 
 
-        def render_rev_line():
-            """The running agent-box rev as a GitHub commit link (Update card).
+        def render_update_line():
+            """Running rev plus a progressively enhanced GitHub update status.
 
             REV is a full git sha; the label shows the usual short form. Empty
             when the module didn't pass a rev (selfUpdate off — but then the
-            whole Update card is hidden anyway).
+            whole Update card is hidden anyway). Without JavaScript, the user
+            still gets a direct GitHub comparison link.
             """
             if not REV:
                 return ""
@@ -2015,7 +2084,18 @@ in
             if REPO:
                 url = html.escape(f"https://github.com/{REPO}/commit/{REV}")
                 label = f'<a href="{url}">{label}</a>'
-            return " Currently at " + label + "."
+            line = " Currently at " + label + "."
+            if not REPO:
+                return line
+            repo = html.escape(REPO)
+            rev = html.escape(REV)
+            compare_url = html.escape(f"https://github.com/{REPO}/compare/{REV}...HEAD")
+            return (
+                line
+                + f' <span id="update-status" class="update-state" aria-live="polite" '
+                  f'data-repo="{repo}" data-rev="{rev}" data-compare-url="{compare_url}">'
+                  f'<a href="{compare_url}">Check GitHub for changes</a>.</span>'
+            )
 
 
         def render_sessions_section():
@@ -2040,7 +2120,7 @@ in
                     sessions_section="" if HOME else render_sessions_section(),
                     message=msg_html,
                     update_row=(
-                        UPDATE_ROW.format(base=html.escape(BASE), rev_line=render_rev_line())
+                        UPDATE_ROW.format(base=html.escape(BASE), update_line=render_update_line())
                         if UPDATE_CMD else ""
                     ),
                 )
@@ -2615,7 +2695,7 @@ in
           # rebuild (possibly) restarts the daemon itself.
           AGENT_BOX_UPDATE_CMD = "/run/wrappers/bin/sudo -n ${updateStartNoBlockCmd}";
           # Running rev + repo, rendered on the Update card as a GitHub
-          # commit link so the page answers "what version is this box on".
+          # commit link and used for its non-blocking compare request.
           AGENT_BOX_REPO = cfg.selfUpdate.repo;
           AGENT_BOX_REV = cfg.selfUpdate.rev;
         };

@@ -276,6 +276,15 @@
         "0000000000000000000000000000000000000000" in page
     ), "Update card should link the running rev to its GitHub commit"
     assert "<code>000000000000</code>" in page, "Update card should show the short rev"
+    # Without JavaScript the card still links to GitHub's comparison. In a
+    # browser the progressive update check replaces this fallback with either
+    # a current or an "update available" status linking the same changes.
+    assert 'id="update-status"' in page, "Update card should include its status target"
+    assert (
+        "github.com/defangdevs/agent-box/compare/"
+        "0000000000000000000000000000000000000000...HEAD" in page
+    ), "Update status should fall back to a GitHub changes link"
+    assert "Check GitHub for changes" in page, "Update status should have a no-JS fallback"
 
     # ...and POSTing to /update triggers agent-box-update.service through the
     # daemon's sudo -n systemctl start --no-block. The unit was inactive

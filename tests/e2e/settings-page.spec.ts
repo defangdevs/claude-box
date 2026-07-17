@@ -122,6 +122,28 @@ test('basic auth renders the page and sets the auth cookie; cookie alone then su
   await expect(cookiePage.getByRole('heading', { name: `Settings for ${USER}` })).toBeVisible();
 });
 
+test('update status reports available commits and links to the GitHub changes', async ({ browser }) => {
+  const page = await authedPage(browser);
+  const head = '1111111111111111111111111111111111111111';
+  await page.route('https://api.github.com/repos/**/compare/**', async (route) => {
+    await route.fulfill({
+      contentType: 'application/json',
+      body: JSON.stringify({
+        status: 'ahead',
+        ahead_by: 3,
+        head_commit: { sha: head },
+      }),
+    });
+  });
+
+  await page.goto(SETTINGS_PATH);
+  const status = page.locator('#update-status');
+  await expect(status).toHaveAttribute('data-state', 'available');
+  await expect(status).toContainText('agent-box update available — 3 commits.');
+  const changes = status.getByRole('link', { name: 'View changes' });
+  await expect(changes).toHaveAttribute('href', new RegExp(`/compare/.+\\.\\.\\.${head}$`));
+});
+
 test('secret value input is a password field', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto(SETTINGS_PATH);
