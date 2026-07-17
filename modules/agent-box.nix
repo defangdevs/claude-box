@@ -6,11 +6,16 @@
 # against the lone store file, fails first-boot amazon-init *silently*
 # (journal-only), and bricks self-update on every already-deployed box
 # (issue #51). The `module-single-file` flake check enforces this in CI.
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, utils, ... }:
 
 let
   cfg = config.services.agent-box;
   supportedAgents = [ "claude" "codex" ];
+  # Everything a session's `agent` field may name: the agent CLIs plus the
+  # pseudo-agent "shell" (issue #113) — a plain login shell in a supervised
+  # tmux session, for manual investigation/clean-up. "shell" is always
+  # available (nothing to install), so it is appended, never filtered.
+  sessionKinds = agents: agents ++ [ "shell" ];
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
   # ttyd port base; ports are assigned in sorted user-name order (see
@@ -142,7 +147,7 @@ let
     set -eu
     JQ=${pkgs.jq}/bin/jq
     FILE="$HOME/.config/agent-box/sessions.json"
-    AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " cfg.installAgents)}
+    AGENTS=${lib.escapeShellArg (lib.concatStringsSep " " (sessionKinds cfg.installAgents))}
     DEFAULT_AGENT=${lib.escapeShellArg cfg.agent}
     export TMUX_TMPDIR="''${TMUX_TMPDIR:-/run/agent-box-$USER}"
 
@@ -209,7 +214,7 @@ let
         done
         case " $AGENTS " in
           (*" $agent "*) ;;
-          (*) echo "agent '$agent' is not installed (installed: $AGENTS)" >&2; exit 2 ;;
+          (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
         esac
         ensure_file
         if "$JQ" -e --arg n "$name" '.sessions | has($n)' "$FILE" >/dev/null; then
@@ -253,12 +258,18 @@ let
   sessionOpts = {
     options = {
       agent = lib.mkOption {
-        type = lib.types.nullOr (lib.types.enum supportedAgents);
+        type = lib.types.nullOr (lib.types.enum (sessionKinds supportedAgents));
         default = null;
         description = ''
           Agent CLI this session runs. When null, uses
           services.agent-box.agent. Must be listed in
           services.agent-box.installAgents.
+
+          The special value "shell" runs the user's login shell
+          (users.users.<name>.shell) instead of an agent CLI — a
+          supervised terminal for manual investigation or clean-up.
+          skipPermissions and remoteControl* are ignored for shell
+          sessions; extraArgs still applies (e.g. [ "-l" ]).
         '';
       };
       skipPermissions = lib.mkOption {
@@ -298,10 +309,11 @@ let
       sessions = lib.mkOption {
         type = lib.types.attrsOf (lib.types.submodule sessionOpts);
         default = { };
-        example = lib.literalExpression ''{ main = { }; review = { agent = "codex"; }; }'';
+        example = lib.literalExpression ''{ main = { }; review = { agent = "codex"; }; scratch = { agent = "shell"; }; }'';
         description = ''
-          Seed sessions for this user — each is an agent CLI running in its
-          own tmux session under the user's single supervised service.
+          Seed sessions for this user — each is an agent CLI (or a plain
+          login shell, agent = "shell") running in its own tmux session
+          under the user's single supervised service.
           Session names must match [A-Za-z0-9_-]+.
 
           Sessions are RUNTIME data: this option is written to
@@ -317,10 +329,11 @@ let
         '';
       };
       agent = lib.mkOption {
-        type = lib.types.nullOr (lib.types.enum supportedAgents);
+        type = lib.types.nullOr (lib.types.enum (sessionKinds supportedAgents));
         default = null;
         description = ''
-          Agent CLI to run for this user's default "main" session. When
+          Agent CLI to run for this user's default "main" session ("shell"
+          for a plain login shell — see sessions.<name>.agent). When
           null, uses services.agent-box.agent. Ignored when
           users.<name>.sessions is set (set the agent per session there).
         '';
@@ -412,7 +425,8 @@ let
           Content seeded to <workingDirectory>/AGENTS.md on agent start,
           IFF that file does not already exist — so the agent's own
           edits or a repo checkout in workingDirectory never get
-          clobbered. Null (default) writes nothing.
+          clobbered. Null (default) writes nothing. Sessions with
+          agent = "shell" are never seeded (no agent reads it there).
 
           AGENTS.md is the cross-vendor agent-instructions convention
           read natively by codex and opencode, and by claude-code as a
@@ -460,7 +474,10 @@ let
       fqdn = config.networking.fqdnOrHostName;
       agentBinCases = lib.concatMapStrings (a:
         "          ${a}) printf '%s\\n' ${lib.escapeShellArg (lib.getExe (agentPackage a))} ;;\n"
-      ) cfg.installAgents;
+      ) cfg.installAgents
+      # "shell" (issue #113): the user's login shell as a pseudo-agent —
+      # always resolvable, independent of installAgents.
+      + "          shell) printf '%s\\n' ${lib.escapeShellArg (utils.toShellPath config.users.users.${name}.shell)} ;;\n";
       # AGENTS.md — cross-vendor agent-instructions file (codex, opencode
       # native; claude-code as CLAUDE.md fallback). Content lives in the Nix
       # store so no in-shell quoting; $AGENT_BOX_URL and other $refs in the
@@ -586,7 +603,9 @@ ${agentBinCases}          *) return 1 ;;
 ${lib.optionalString (agentsMdFile != null) ''
         # Seed AGENTS.md into the session's working directory IFF absent, so
         # the agent's own edits or a repo checkout there never get clobbered.
-        if [ ! -e "$wd/AGENTS.md" ]; then
+        # Not for shell sessions: no agent reads it there, and scratch dirs
+        # shouldn't get littered.
+        if [ "$agent" != shell ] && [ ! -e "$wd/AGENTS.md" ]; then
           mkdir -p "$wd"
           install -m 0644 ${agentsMdFile} "$wd/AGENTS.md"
         fi
@@ -597,9 +616,14 @@ ${lib.optionalString (agentsMdFile != null) ''
         # exit — the dead session stays attachable for inspection and is NOT
         # respawned over (the wrapper execs the agent, so the exit status
         # is the agent's). A clean exit lets the session die; the reconcile
-        # loop below then starts a fresh agent within ~2s.
+        # loop below then starts a fresh agent within ~2s. Shell sessions
+        # get no post-mortem fallback — the command IS a shell, and exiting
+        # it should hand you a fresh one (via the reconcile loop), not a
+        # nested inspection bash.
+        postmortem=" || exec ${pkgs.bashInteractive}/bin/bash"
+        [ "$agent" = shell ] && postmortem=""
         $TMUX new-session -d -s "$sname" -c "$wd" \
-          "${envExecWrapper name} $cmd || exec ${pkgs.bashInteractive}/bin/bash"
+          "${envExecWrapper name} $cmd$postmortem"
       }
 
       # Reconcile forever; systemd stop tears the whole tree down (ExecStop
@@ -915,7 +939,13 @@ in
       home = "/home/${name}";
       createHome = true;
       extraGroups = u.extraGroups;
-      shell = pkgs.bashInteractive;
+      # Overridable so a host config can pick another shell (e.g. pkgs.zsh) —
+      # "shell" sessions (issue #113) run whatever this resolves to. Priority
+      # 900: mkDefault would TIE with the isNormalUser->useDefaultShell
+      # mkDefault from users-groups.nix (the option merges uniquely, so a tie
+      # is an eval error); 900 beats that default, a plain host definition
+      # (priority 100) still beats us.
+      shell = lib.mkOverride 900 pkgs.bashInteractive;
     }) cfg.users;
 
     environment.systemPackages = agentRuntimePackages;
@@ -2120,7 +2150,7 @@ in
                         return
                     if agent not in AGENTS:
                         self._send_html(
-                            render("Unknown agent. Installed: " + ", ".join(AGENTS)),
+                            render("Unknown agent. Available: " + ", ".join(AGENTS)),
                             status=400,
                         )
                         return
@@ -2569,7 +2599,7 @@ in
           AGENT_BOX_TMUX_TMPDIR = "/run/${runtimeDirectory name}";
           AGENT_BOX_TMUX_BIN = "${pkgs.tmux}/bin/tmux";
           AGENT_BOX_SESSIONS_FILE = userSessionsFile name;
-          AGENT_BOX_AGENTS = lib.concatStringsSep "," cfg.installAgents;
+          AGENT_BOX_AGENTS = lib.concatStringsSep "," (sessionKinds cfg.installAgents);
           AGENT_BOX_DEFAULT_AGENT = cfg.agent;
         } // lib.optionalAttrs (name == rootUser) {
           # This daemon also serves the vhost root: GET / is the session

@@ -210,7 +210,10 @@ A linux user account and an agent CLI are decoupled: each user runs one or
 more **sessions**, and each session is one agent (Claude Code or Codex) in
 its own tmux session, all supervised by that user's single hardened
 `agent-box-<name>.service`. All supported agent CLIs are installed
-regardless of what any session runs (`installAgents`).
+regardless of what any session runs (`installAgents`). The pseudo-agent
+`shell` runs the user's login shell instead — a supervised plain terminal
+for manual investigation or clean-up that respawns on exit and shows up in
+the web session manager like any other session.
 
 Sessions are **runtime data**. The Nix config above only seeds
 `~/.config/agent-box/sessions.json` on first boot; after that the file is
@@ -221,6 +224,7 @@ destroy sessions as the user — no sudo, no `nixos-rebuild`:
 agent-box-session ls                        # NAME AGENT STATE
 agent-box-session add review --agent codex  # starts within ~2s
 agent-box-session add scratch --cwd ~/proj -- --model opus
+agent-box-session add tidy --agent shell    # plain login shell, no agent
 agent-box-session restart review
 agent-box-session rm review                 # delist + kill
 ```

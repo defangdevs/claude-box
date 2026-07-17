@@ -160,6 +160,35 @@
     assert "main" in listing and "helper" in listing, listing
     assert "codex" in listing, listing
 
+    # --- shell pseudo-agent (issue 113): supervised plain login shell ------
+    machine.succeed(
+        "su -s /bin/sh agent -c 'agent-box-session add scratch --agent shell'"
+    )
+    machine.wait_until_succeeds(tmux("has-session -t =scratch"), timeout=60)
+    machine.succeed(
+        "jq -e '.sessions.scratch.agent == \"shell\"' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
+    # The pane runs the user's login shell (bash on this box), not an agent.
+    machine.wait_until_succeeds(
+        tmux('display -p -t "=scratch:" "#{pane_current_command}"')
+        + " | grep -x bash",
+        timeout=60,
+    )
+    # A clean `exit` must NOT land in the post-mortem bash (that fallback is
+    # for agents only — for a shell it would be a confusing nested shell):
+    # the session dies and the reconcile loop respawns a fresh login shell.
+    old_shell_pane = machine.succeed(
+        tmux('display -p -t "=scratch:" "#{pane_pid}"')
+    ).strip()
+    machine.succeed(tmux('send-keys -t "=scratch:" exit Enter'))
+    machine.wait_until_succeeds(
+        tmux('display -p -t "=scratch:" "#{pane_pid}"')
+        + f" | grep . | grep -vx '{old_shell_pane}'",
+        timeout=60,
+    )
+    machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm scratch'")
+
     # --- restart semantics: killed listed sessions come back --------------
     # Compare pane PIDs, not session ids: killing the LAST session also ends
     # the tmux server, and a fresh server restarts session-id numbering, so
