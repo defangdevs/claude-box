@@ -287,6 +287,11 @@ Conditions:
   UseNat64: !And
     - !Not [!Condition UseIpv4]
     - !Equals [!Ref Nat64, 'true']
+  # The first-boot WaitCondition handle is a presigned S3 URL — an
+  # IPv4-only endpoint. A box that has neither a public IPv4 nor the NAT64
+  # path could never signal it, so the health gate must not exist there:
+  # a healthy Nat64=false IPv6-only box would otherwise always "fail".
+  CanSignal: !Or [!Condition UseIpv4, !Condition UseNat64]
   UseSsm: !Equals [!Ref EnableSsm, 'true']
 
 Mappings:
@@ -491,6 +496,26 @@ Resources:
             SpotInstanceType: persistent
             InstanceInterruptionBehavior: stop
 
+  # First-boot health gate (issue 106). The presigned handle URL needs no
+  # IAM: the box PUTs a success signal after its first nixos-rebuild switch
+  # completes (see agent-box-first-boot-signal in the user-data config). If
+  # user-data is never applied — e.g. the IMDS 401 race that leaves the box
+  # on the vanilla AMI config while everything reports success — no signal
+  # arrives and the stack goes CREATE_FAILED + rollback after 15 minutes,
+  # instead of handing the user a black-holed WebURL.
+  FirstBootHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Condition: CanSignal
+
+  FirstBootDone:
+    Type: AWS::CloudFormation::WaitCondition
+    Condition: CanSignal
+    DependsOn: Instance
+    Properties:
+      Handle: !Ref FirstBootHandle
+      Count: 1
+      Timeout: '900'
+
   Instance:
     Type: AWS::EC2::Instance
     # Routing must exist before boot so egress works. The module tarball and
@@ -624,6 +649,7 @@ Resources:
                 };
 
               ${Nat64Config}
+              ${FirstBootSignalConfig}
                 # Materialize passwordHashFile from the plaintext CFN parameter
                 # BEFORE any service reads it. Activation scripts run at
                 # nixos-rebuild switch time (first boot from user-data), before
@@ -676,6 +702,34 @@ Resources:
                       - '-'
                       - !Split [':', !GetAtt NetworkInterface.PrimaryIpv6Address]
               StackName: !Ref AWS::StackName
+              # First-boot health signal (issue 106): tell CloudFormation the
+              # user-data config actually APPLIED. This unit only exists once
+              # the rebuild switched into this config, which is exactly the
+              # fact worth signaling; no signal -> the stack's FirstBootDone
+              # WaitCondition times out -> visible CREATE_FAILED instead of a
+              # silent vanilla-AMI brick. The marker keeps later reboots from
+              # re-PUTting. curl retries cover transient egress hiccups.
+              # Conditional (CanSignal) because the handle is an IPv4-only S3
+              # URL — see the CanSignal condition. Inner Fn::Sub resolves the
+              # handle ref only when the resource exists.
+              FirstBootSignalConfig: !If
+                - CanSignal
+                - !Sub |
+                    systemd.services.agent-box-first-boot-signal = {
+                      wantedBy = [ "multi-user.target" ];
+                      after = [ "network-online.target" ];
+                      wants = [ "network-online.target" ];
+                      serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+                      script = ''
+                        marker=/var/lib/agent-box-web/first-boot-signaled
+                        [ -e "$marker" ] && exit 0
+                        ${!pkgs.curl}/bin/curl -s -X PUT -H 'Content-Type:' \
+                          --retry 10 --retry-delay 15 --retry-all-errors \
+                          --data-binary '{"Status":"SUCCESS","Reason":"first nixos-rebuild switch complete","UniqueId":"first-boot","Data":"ok"}' \
+                          "${FirstBootHandle}" && touch "$marker" || true
+                      '';
+                    };
+                - ''
               # Spliced at column 0 (the placeholder's leading 14 spaces are
               # the YAML block-scalar indent) — Nix ignores indentation.
               Nat64Config: !If

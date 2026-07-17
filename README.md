@@ -31,7 +31,10 @@ Let's Encrypt cert against `<eip>.sslip.io`.
 | eu-west-1 (Ireland) | [Launch stack →](https://console.aws.amazon.com/cloudformation/home?region=eu-west-1#/stacks/quickcreate?stackName=agent-box&templateURL=https%3A%2F%2Fdefang-agent-box.s3.us-west-2.amazonaws.com%2Ftemplate.yaml) |
 
 Choose `Agent` (`claude` or `codex`), set a `WebPassword` (16+ chars from
-`[A-Za-z0-9._~-]`), pick an instance size, launch. The agent runs as the
+`[A-Za-z0-9._~-]`), pick an instance size, launch. The stack reports
+CREATE_COMPLETE only after the box phones home from its first successful
+rebuild — a first boot that goes wrong (issue 106 has one way) rolls the
+stack back visibly instead of leaving a green stack with a dead URL. The agent runs as the
 `UserName` linux user (default `agent`). The template creates its own
 IPv6-enabled VPC/subnet so nothing on the account has to be pre-configured. The
 stack Outputs show `https://<v6-or-v4>.sslip.io/<UserName>/` - open it, sign in
