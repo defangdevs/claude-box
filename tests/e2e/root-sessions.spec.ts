@@ -63,6 +63,14 @@ test('authenticated root lists sessions with ?arg= terminal deep links', async (
   await expect(link).toBeVisible();
 });
 
+test('authenticated root links to the agent-box repository', async ({ browser }) => {
+  const page = await authedPage(browser);
+  await page.goto('/');
+  const repo = page.getByRole('link', { name: 'agent-box on GitHub' });
+  await expect(repo).toBeVisible();
+  await expect(repo).toHaveAttribute('href', 'https://github.com/defangdevs/agent-box');
+});
+
 test('no root-page href embeds URL userinfo (user@host)', async ({ browser }) => {
   const page = await authedPage(browser);
   await page.goto('/');
