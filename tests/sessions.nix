@@ -11,6 +11,8 @@
 #     and NOT recreating a delisted one (destroy semantics),
 #   - both agent CLIs installed regardless of what sessions run
 #     (installAgents default),
+#   - browser tmux clients advertise OSC 8 support, preserving a long hidden
+#     hyperlink target when its visible URL wraps across terminal rows (#18),
 #   - the root session manager page (the settings daemon in AGENT_BOX_HOME
 #     mode for the primary web user) and its /sessions/* CRUD routes, all
 #     behind auth — nothing on the vhost is served unauthenticated anymore
@@ -86,18 +88,25 @@
   };
 
   testScript = ''
+    import base64
+    import re
+    import shlex
+
     start_all()
     machine.wait_for_unit("agent-box-agent.service")
     machine.wait_for_unit("agent-box-settings-agent.service")
     machine.wait_for_unit("caddy.service")
     client.wait_for_unit("multi-user.target")
 
+    def as_agent(cmd):
+        return "su -s /bin/sh agent -c " + shlex.quote(cmd)
+
     def tmux(cmd):
         # Run a tmux command as the agent user against its own server (the
         # socket lives under the agent unit's RuntimeDirectory, not /tmp).
-        return (
-            "su -s /bin/sh agent -c 'env TMUX_TMPDIR=/run/agent-box-agent "
-            "tmux -L agent-box " + cmd + "'"
+        return as_agent(
+            "env TMUX_TMPDIR=/run/agent-box-agent "
+            "tmux -L agent-box " + cmd
         )
 
     # --- first boot: legacy options seeded a "main" session --------------
@@ -125,6 +134,45 @@
         "'git config --get credential.https://github.com.helper' | grep -q 'gh auth git-credential'"
     )
     machine.succeed("systemctl cat agent-box-agent | grep -q -- '-gh-'")
+
+    # Claude emits its long OAuth URL inside one complete OSC 8 sequence.
+    # tmux stores that metadata, but redraws plain text unless the attaching
+    # xterm-256color client explicitly advertises hyperlink support. Emit a
+    # 450-byte wrapped link before attach, like opening ttyd after Claude has
+    # printed it, and assert tmux sends the full hidden target to the client.
+    link_prefix = "https://httpbin.invalid/anything?state="
+    link_suffix = "&sentinel=END_OF_FULL_URL"
+    link_url = link_prefix + "a" * (450 - len(link_prefix) - len(link_suffix)) + link_suffix
+    link_sequence = (
+        "\x1b]8;;" + link_url + "\x1b\\"
+        + link_url
+        + "\x1b]8;;\x1b\\"
+    )
+    tmux_browser_command = "printf %s " + shlex.quote(link_sequence) + "; sleep 5"
+    machine.succeed(
+        tmux(
+            "new-session -d -s browser-link-test "
+            + shlex.quote(tmux_browser_command)
+        )
+    )
+    tmux_attach_command = (
+        "env TMUX_TMPDIR=/run/agent-box-agent "
+        "tmux -T hyperlinks -L agent-box attach -t =browser-link-test"
+    )
+    machine.succeed(
+        as_agent(
+            f"TERM=xterm-256color script -q -c {shlex.quote(tmux_attach_command)} /dev/null "
+            "> /tmp/tmux-browser-link"
+        )
+    )
+    tmux_browser_output = base64.b64decode(
+        machine.succeed("base64 -w0 /tmp/tmux-browser-link").strip()
+    )
+    hyperlink_targets = re.findall(
+        rb"\x1b]8;[^;]*;([^\x1b]*)\x1b\\", tmux_browser_output
+    )
+    assert link_url.encode() in hyperlink_targets, tmux_browser_output
+    assert b"END_OF_FULL_URL" in tmux_browser_output, tmux_browser_output
 
     # --- runtime add: no sudo, no rebuild ---------------------------------
     machine.succeed(
@@ -284,6 +332,11 @@
 
     # ttyd serves per-session deep links: the unit runs with --url-arg.
     machine.succeed("systemctl cat agent-web-terminal-agent | grep -q -- --url-arg")
+    machine.succeed(
+        "grep -q -- '-T hyperlinks' "
+        "$(systemctl show agent-web-terminal-agent --property=ExecStart --value "
+        "| grep -o '/nix/store/[^ ]*agent-box-agent-attach')"
+    )
 
     # Rename migration (issue 70): re-running activation moves old-name
     # (claude-box) state to the agent-box paths exactly once, and never

@@ -102,6 +102,7 @@ let
     else agentPkgs.codex;
   installedAgentPackages = map agentPackage cfg.installAgents;
   installedCodexPackage = lib.optional (builtins.elem "codex" cfg.installAgents) (agentPackage "codex");
+
   agentRuntimePackages = lib.unique (
     installedAgentPackages
     ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli ]
@@ -2248,9 +2249,12 @@ in
       # Strict allowlist on the client-supplied argument: session-name
       # charset AND an existing tmux session; anything else prints the live
       # list and exits (ttyd spawns a fresh instance per connection).
+      # ttyd/xterm supports OSC 8, but xterm-256color cannot advertise that
+      # through terminfo. Tell tmux explicitly so it forwards stored
+      # hyperlinks instead of redrawing only their visible labels.
       attachScript = name: pkgs.writeShellScript "agent-box-${name}-attach" ''
         set -u
-        T="${pkgs.tmux}/bin/tmux -L ${tmuxSocketName}"
+        T="${pkgs.tmux}/bin/tmux -T hyperlinks -L ${tmuxSocketName}"
         want="''${1:-}"
         case "$want" in (*[!A-Za-z0-9_-]*) want="" ;; esac
         if [ -n "$want" ]; then

@@ -189,16 +189,21 @@ by seeding the acceptance flags into `~/.claude.json` and
 `~/.claude/settings.json` before each start. Without that, a fresh box parks
 the session on a dialog that Remote Control can't answer.
 
-**Claude Code first login in the browser terminal:** Claude Code 2.1.113
-made long URLs clickable across terminal rows using OSC 8 hyperlinks, and
-2.1.126 added terminal code paste when a browser cannot reach a local OAuth
-callback (see the
-[Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)).
-Current agent-box builds resolve Claude Code from the pinned nixos-unstable
-snapshot and include both fixes; no resize or callback-relay workaround is
-needed. If an older deployed box still shows the legacy flow, update it from
-the settings page or run `sudo systemctl start agent-box-update.service`, then
-retry `claude auth login`.
+**Claude Code first login in the browser terminal:** Claude emits its OAuth URL
+as an OSC 8 hyperlink with the complete URL in a hidden target. The terminal's
+`xterm-256color` terminfo cannot advertise OSC 8, so agent-box explicitly
+enables tmux's `hyperlinks` client feature. Without it tmux redraws only the
+visible text; Safari then detects just the first wrapped row as a plain URL and
+opens that truncated fragment. With the native OSC 8 target forwarded, clicking
+the first row opens the complete URL even when the visible text wraps.
+
+Claude Code 2.1.126 and later accepts the returned OAuth code in the terminal
+when the browser cannot reach a local callback (see the
+[Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md)),
+so no callback relay is needed. If an older deployed box still shows the
+legacy flow, update it from the settings page or run
+`sudo systemctl start agent-box-update.service`, then retry
+`claude auth login`.
 
 The auth code input is hidden like a password, so pasting gives no visible
 feedback. Paste the code, press Enter, and Claude Code should print
