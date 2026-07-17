@@ -13,10 +13,13 @@
 #     (installAgents default),
 #   - browser tmux clients advertise OSC 8 support, preserving a long hidden
 #     hyperlink target when its visible URL wraps across terminal rows (#18),
-#   - the root session manager page (the settings daemon in AGENT_BOX_HOME
-#     mode for the primary web user) and its /sessions/* CRUD routes, all
-#     behind auth — nothing on the vhost is served unauthenticated anymore
-#     (the old picker and its public sessions.json are gone),
+#   - the root tabbed terminal workspace (the settings daemon in
+#     AGENT_BOX_HOME mode for the primary web user; issue 119) — one tab per
+#     session, panes iframing the per-session ttyd URLs, server-side ?tab=
+#     selection — and its /sessions/* CRUD routes, all behind auth — nothing
+#     on the vhost is served unauthenticated anymore (the old picker and its
+#     public sessions.json are gone),
+#   - session CRUD on the settings page (back=settings redirects there),
 #   - ttyd running with --url-arg so /<user>/?arg=<session> deep links work.
 #
 # Like the other tests, lib.mkForce-swaps the module Caddyfile for a minimal
@@ -274,18 +277,22 @@
         "https://box.test/agent/sessions.json | grep -x 401"
     )
 
-    # The root page (behind auth) lists the sessions with terminal deep
-    # links, never a session's argv/cwd/env (those may hold secrets).
+    # The root page (behind auth) is the tabbed terminal workspace (issue
+    # 119): a tab per session, the selected (live) session's pane iframing
+    # its ttyd deep link. Never a session's argv/cwd/env (may hold secrets).
     root_page = client.succeed(f"{curl} -u agent:testpassword https://box.test/")
-    assert "main" in root_page, root_page
-    assert "/agent/?arg=main" in root_page, root_page
+    assert 'id="tab-bar"' in root_page, root_page
+    assert 'data-tab="main" href="/?tab=main" aria-current="page"' in root_page, root_page
+    assert 'src="/agent/?arg=main"' in root_page, root_page
     assert "workingDirectory" not in root_page, root_page
 
-    # The root page's CRUD routes (behind auth) can add a session...
+    # The root page's CRUD routes (behind auth) can add a session; the
+    # workspace redirect lands on the new session's tab.
     client.succeed(
-        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{redirect_url}}' "
         "-d 'name=web&agent=claude' "
-        "https://box.test/sessions/add | grep -x 303"
+        "https://box.test/sessions/add "
+        "| grep -xF 'https://box.test/?ok=session_added&tab=web'"
     )
     machine.wait_until_succeeds(tmux("has-session -t =web"), timeout=60)
 
@@ -300,6 +307,14 @@
         "jq -e '.sessions.web.agent == \"claude\"' "
         "/home/agent/.config/agent-box/sessions.json"
     )
+
+    # ?tab= selects a tab server-side (the no-JS switching path): the web
+    # tab is current and its live pane iframes its ttyd URL.
+    tab_page = client.succeed(f"{curl} -u agent:testpassword 'https://box.test/?tab=web'")
+    assert 'data-tab="web" href="/?tab=web" aria-current="page"' in tab_page, tab_page
+    assert 'src="/agent/?arg=web"' in tab_page, tab_page
+    # main is still a tab, just not the current one.
+    assert 'data-tab="main" href="/?tab=main">' in tab_page, tab_page
 
     # ...and delete it again (delist + kill).
     client.succeed(
@@ -317,18 +332,29 @@
         "https://box.test/sessions/add | grep -x 401"
     )
 
-    # The sessions moved OFF the settings page (they live at / now): the
-    # old settings-page CRUD routes are gone for the primary user...
+    # The session CRUD routes stay at the root for the primary user (the
+    # old settings-path routes remain gone)...
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
         "-d 'name=web2&agent=claude' "
         "https://box.test/agent/settings/sessions/add | grep -x 404"
     )
-    # ...and the page itself no longer renders the session manager.
+    # ...but the settings page renders the session manager again (the root
+    # page is the workspace now, issue 119), with back=settings so its forms
+    # redirect back to the settings page rather than to the workspace.
     settings_page = client.succeed(
         f"{curl} -u agent:testpassword https://box.test/agent/settings/"
     )
-    assert "Add session" not in settings_page, settings_page
+    assert "Add session" in settings_page, settings_page
+    assert 'name="back" value="settings"' in settings_page, settings_page
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{redirect_url}}' "
+        "-d 'name=main&back=settings' "
+        "https://box.test/sessions/restart "
+        "| grep -x 'https://box.test/agent/settings/?ok=session_restarted'"
+    )
+    # (that restart killed main; the supervisor brings it back)
+    machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=60)
 
     # ttyd serves per-session deep links: the unit runs with --url-arg.
     machine.succeed("systemctl cat agent-web-terminal-agent | grep -q -- --url-arg")

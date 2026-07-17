@@ -739,9 +739,9 @@ in
         browser terminals (one ttyd per user with web.passwordHashFile set)
         fronted by Caddy with basic-auth-to-cookie web auth — the basic-auth
         username is the linux user name, so logging in picks the terminal.
-        The vhost root (/) serves the primary user's (web.user) session
-        manager behind that same auth; other users' terminals live at
-        /<user>/. The top-level
+        The vhost root (/) serves the primary user's (web.user) terminal
+        workspace — one tab per tmux session — behind that same auth; other
+        users' terminals live at /<user>/. The top-level
         Caddyfile is module-managed (regenerated every rebuild); each agent
         user's own virtual hosts live in ~/sites/*.caddy (a symlink to
         /var/lib/agent-box-sites/<user>/, which caddy can read) and land
@@ -1266,8 +1266,8 @@ in
       # Users that get a browser terminal, in sorted order (attrNames sorts) —
       # port assignment below depends on that order being deterministic.
       terminalUsers = lib.filter (n: cfg.users.${n}.web.passwordHashFile != null) (lib.attrNames cfg.users);
-      # Whose session manager the vhost ROOT serves (the / page): web.user if
-      # it has a terminal, else the first terminal user. Null only when no
+      # Whose terminal workspace the vhost ROOT serves (the / page): web.user
+      # if it has a terminal, else the first terminal user. Null only when no
       # user has a terminal at all (then the vhost serves nothing anyway).
       rootUser =
         if lib.elem webUser terminalUsers then webUser
@@ -1317,10 +1317,11 @@ in
         # back with the fresh environment.
         #
         # Sessions (issue 59): the daemon is also the web CRUD surface for the
-        # user-owned sessions.json — add/delete/restart sessions. For the
-        # primary web user (AGENT_BOX_HOME=1) that session manager is served
-        # at the vhost root (/), replacing the old unauthenticated picker;
-        # other users keep it on their settings page. The reconcile/respawn
+        # user-owned sessions.json — add/delete/restart sessions, managed on
+        # every user's settings page. For the primary web user
+        # (AGENT_BOX_HOME=1) the vhost root (/) additionally serves a tabbed
+        # terminal workspace (issue 119): one tab per session, each pane an
+        # iframe onto the per-session ttyd URL. The reconcile/respawn
         # logic deliberately does NOT live here (a daemon crash or restart
         # must never take the agent sessions down): the daemon only writes the
         # file and kills the user's own tmux sessions; the supervisor in the
@@ -1345,8 +1346,8 @@ in
         #   AGENT_BOX_TMUX_TMPDIR        TMUX_TMPDIR the agent's socket lives under
         #   AGENT_BOX_TMUX_BIN           absolute path to the tmux binary
         #   AGENT_BOX_SESSIONS_FILE      path to the user's sessions.json
-        #   AGENT_BOX_HOME               "1" = also serve the session manager
-        #                                 at / (the primary web user's daemon)
+        #   AGENT_BOX_HOME               "1" = also serve the tabbed terminal
+        #                                 workspace at / (primary web user)
         #   AGENT_BOX_AGENTS             comma-separated installed agent CLIs
         #   AGENT_BOX_DEFAULT_AGENT      agent preselected in the add form
 
@@ -1376,8 +1377,9 @@ in
         SESSIONS_FILE = os.environ.get("AGENT_BOX_SESSIONS_FILE", "")
         # Primary web user's daemon (Caddy proxies the vhost root here, behind
         # the same cookie-or-basic auth as the terminal): GET / renders the
-        # session manager and session CRUD moves to /sessions/*. The settings
-        # page then keeps only secrets + danger zone.
+        # tabbed terminal workspace and session CRUD lives at /sessions/*.
+        # The settings page keeps the session manager list plus secrets +
+        # danger zone.
         HOME = os.environ.get("AGENT_BOX_HOME", "") == "1"
         # Where session CRUD routes live, and the page they redirect back to.
         SESS_BASE = "" if HOME else BASE
@@ -1709,23 +1711,56 @@ in
           .msg { padding: 10px 14px; border-radius: 8px; margin: 12px 0;
                  border: 1px solid rgba(63,185,80,.4); background: #10251a;
                  color: #7ee787; font-size: 13px; }
+          /* Tabbed terminal workspace (the HOME root page, issue #119). The
+             page is a fixed-viewport column: tab bar on top, terminal panes
+             filling the rest. Panes are stacked and toggled with visibility
+             (NOT display) so a hidden terminal keeps its layout size — xterm
+             would otherwise re-measure a 0x0 box on every tab switch. */
+          body.ws { display: flex; flex-direction: column; height: 100vh;
+                    height: 100dvh; min-height: 0; overflow: hidden; }
+          .tabs { display: flex; align-items: flex-end; gap: 2px; flex: none;
+                  padding: 8px 8px 0; background: #010409;
+                  border-bottom: 1px solid #30363d; overflow-x: auto; }
+          .tab { display: inline-flex; align-items: center; padding: 6px 14px 8px;
+                 font-size: 13px; color: #8b949e; text-decoration: none;
+                 border: 1px solid transparent; border-bottom: 0;
+                 border-radius: 8px 8px 0 0; white-space: nowrap; }
+          .tab:hover { color: #e6edf3; }
+          .tab[aria-current] { background: #0d1117; border-color: #30363d;
+                               color: #e6edf3; }
+          .tab-empty { color: #8b949e; font-size: 13px; padding: 6px 8px 8px; }
+          .tabs .btn.add { margin: 0 4px 6px; padding: 2px 9px; }
+          .tabs .spacer { flex: 1; }
+          .tabs a.gear { color: #8b949e; text-decoration: none; font-size: 15px;
+                         padding: 2px 8px 8px; }
+          .tabs a.gear:hover { color: #e6edf3; }
+          .ws .editor, .ws .msg { margin: 8px; flex: none; }
+          .panes { position: relative; flex: 1; min-height: 0; }
+          .pane { position: absolute; inset: 0; width: 100%; height: 100%;
+                  border: 0; visibility: hidden; }
+          .pane.active { visibility: visible; }
+          .pane.placeholder { display: flex; align-items: center;
+                              justify-content: center; color: #8b949e; }
         </style>
         """
 
-        # The session manager, one <section> shared by the two pages that can
-        # host it: the root page (primary user, HOME) and the settings page
-        # (everyone else). {action_base} is SESS_BASE, so the forms post to
-        # wherever the session routes actually live.
+        # The session manager <section> on the settings page (every user,
+        # including the primary one — the HOME root page is the tabbed
+        # terminal workspace, not a manager). {action_base} is SESS_BASE, so
+        # the forms post to wherever the session routes actually live; the
+        # hidden back=settings field makes their redirects land back here
+        # rather than on SESS_PAGE (issue #119).
         SESSIONS_SECTION_TPL = """<section>
             <div class="sec-head">
               <h2>Sessions</h2>
               <button type="button" class="btn" data-toggle="session-editor">Add session</button>
             </div>
-            <p class="note">Each session is one agent CLI in its own terminal.
-            New sessions start within a few seconds &mdash; no rebuild, no sudo.
-            Click a session to open its terminal.</p>
+            <p class="note">Each session is one agent CLI in its own terminal
+            tab. New sessions start within a few seconds &mdash; no rebuild,
+            no sudo. Click a session to open its terminal.</p>
             <div id="session-editor" class="editor">
               <form method="post" action="{action_base}/sessions/add">
+                <input type="hidden" name="back" value="settings">
                 <div class="row">
                   <input type="text" name="name" placeholder="session-name"
                          pattern="[A-Za-z0-9_-]+" required
@@ -1738,9 +1773,40 @@ in
             <div id="sessions-list">{sessions}</div>
           </section>"""
 
-        # Root page (HOME mode): the session manager IS the front page; the
-        # settings page holds everything else.
-        HOME_BODY = """<main>
+        # Root page (HOME mode): a tabbed terminal workspace (issue #119) —
+        # one tab per session, the active one shown in an iframe onto the
+        # existing per-session ttyd URL (/<user>/?arg=<session>; same origin,
+        # so the auth cookie and its WebSocket upgrade work unchanged). Tabs
+        # are plain ?tab= links so the page works without JS (each click
+        # re-renders with the other terminal); SCRIPT upgrades that to
+        # client-side switching with background tabs kept attached. Session
+        # CRUD beyond "add" lives on the settings page.
+        HOME_BODY = """<body class="ws">
+        <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}">
+          {tabs}
+          <button type="button" class="btn add" data-toggle="session-editor"
+                  title="New session" aria-label="New session">+</button>
+          <span class="spacer"></span>
+          <a class="gear" href="{base}/" title="Settings" aria-label="Settings">&#9881;</a>
+        </nav>
+        <div id="session-editor" class="editor">
+          <form method="post" action="{action_base}/sessions/add">
+            <div class="row">
+              <input type="text" name="name" placeholder="session-name"
+                     pattern="[A-Za-z0-9_-]+" required
+                     title="Letters, digits, dash and underscore">
+              <select name="agent">{agents}</select>
+              <button type="submit" class="btn">Add session</button>
+            </div>
+          </form>
+        </div>
+        <div id="msg-slot">{message}</div>
+        <div class="panes" id="panes">{pane}</div>
+        </body>
+        </html>
+        """
+
+        BODY = """<main>
           <a class="repo" href="https://github.com/defangdevs/agent-box" title="agent-box on GitHub" aria-label="agent-box on GitHub">
             <svg viewBox="0 0 16 16" aria-hidden="true">
               <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
@@ -1754,16 +1820,7 @@ in
             </svg>
             GitHub
           </a>
-          <a class="back" href="{base}/">&#9881; Settings</a>
-          <h1>Agent Box</h1>
-          <div id="msg-slot">{message}</div>
-          {sessions_section}
-        </main>
-        </html>
-        """
-
-        BODY = """<main>
-          <a class="back" href="/">&larr; sessions</a>
+          <a class="back" href="/">&larr; terminal</a>
           <h1>Settings for {user}</h1>
           <div id="msg-slot">{message}</div>
           {sessions_section}
@@ -1935,19 +1992,106 @@ in
           var pollTimer = null;
           function schedulePoll() {
             if (pollTimer || pollLeft <= 0) { return; }
-            if (!document.querySelector("#sessions-list [data-state=starting]")) { return; }
+            if (!document.querySelector(
+                  "#sessions-list [data-state=starting], #tab-bar [data-state=starting]")) { return; }
             pollLeft -= 1;
             pollTimer = window.setTimeout(function () {
               pollTimer = null;
-              fetch(window.location.pathname)
+              // Keep the query string: on the workspace it carries ?tab=, so
+              // the fetched tab bar marks the same tab current.
+              fetch(window.location.pathname + window.location.search)
                 .then(function (r) { return r.text(); })
                 .then(function (t) {
-                  applyDoc(parseHTML(t), ["sessions-list"]);
+                  applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+                  wsSync();
                   schedulePoll();
                 });
             }, 2500);
           }
           function startPolling(n) { pollLeft = n; schedulePoll(); }
+
+          // Tabbed terminal workspace (the HOME root page, issue #119). The
+          // server renders tabs as plain ?tab= links and only the selected
+          // pane; this upgrades clicks to client-side switching, creating
+          // panes lazily on first activation and keeping them mounted after,
+          // so background sessions stay attached like a terminal app's tabs.
+          // Everything re-queries the DOM — polling replaces #tab-bar
+          // wholesale, and a pane may be a placeholder until its session is
+          // live (the ttyd attach wrapper errors out on a session that does
+          // not exist yet).
+          function tabBar() { return document.getElementById("tab-bar"); }
+          function tabEl(name) {
+            var bar = tabBar();
+            return bar ? bar.querySelector('.tab[data-tab="' + name + '"]') : null;
+          }
+          function tabLive(name) {
+            var t = tabEl(name);
+            return !!(t && t.querySelector("[data-state=live]"));
+          }
+          function ensurePane(name) {
+            var cur = document.querySelector('#panes .pane[data-pane="' + name + '"]');
+            if (cur && (cur.tagName === "IFRAME" || !tabLive(name))) { return cur; }
+            var el;
+            if (tabLive(name)) {
+              el = document.createElement("iframe");
+              el.src = tabBar().getAttribute("data-term-base") +
+                       "?arg=" + encodeURIComponent(name);
+              el.title = name + " terminal";
+              el.setAttribute("allow", "clipboard-read; clipboard-write");
+              el.className = "pane";
+            } else {
+              el = document.createElement("div");
+              el.textContent = name + " is starting…";
+              el.className = "pane placeholder";
+            }
+            el.setAttribute("data-pane", name);
+            if (cur) {
+              if (cur.classList.contains("active")) { el.classList.add("active"); }
+              cur.replaceWith(el);
+            } else {
+              document.getElementById("panes").appendChild(el);
+            }
+            return el;
+          }
+          function wsSelect(name, focus) {
+            var bar = tabBar();
+            if (!bar || !tabEl(name)) { return; }
+            bar.querySelectorAll(".tab").forEach(function (t) {
+              if (t.getAttribute("data-tab") === name) { t.setAttribute("aria-current", "page"); }
+              else { t.removeAttribute("aria-current"); }
+            });
+            var pane = ensurePane(name);
+            document.querySelectorAll("#panes .pane").forEach(function (p) {
+              p.classList.toggle("active", p === pane);
+            });
+            history.replaceState(null, "", "/?tab=" + encodeURIComponent(name));
+            if (focus && pane.tagName === "IFRAME") {
+              try { pane.contentWindow.focus(); } catch (err) { /* cross-origin never happens; be safe */ }
+            }
+          }
+          function wsActive() {
+            var bar = tabBar();
+            var t = bar ? bar.querySelector(".tab[aria-current]") : null;
+            return t ? t.getAttribute("data-tab") : null;
+          }
+          function wsSync() {
+            if (!tabBar()) { return; }
+            // Drop panes whose sessions are gone; upgrade placeholders whose
+            // sessions came live. No focus steal — the user may be typing.
+            document.querySelectorAll("#panes .pane[data-pane]").forEach(function (p) {
+              var name = p.getAttribute("data-pane");
+              if (!tabEl(name)) { p.remove(); return; }
+              ensurePane(name);
+            });
+            var cur = wsActive();
+            if (cur) { wsSelect(cur, false); }
+          }
+          document.addEventListener("click", function (e) {
+            var t = e.target && e.target.closest ? e.target.closest("#tab-bar .tab[data-tab]") : null;
+            if (!t) { return; }
+            e.preventDefault();
+            wsSelect(t.getAttribute("data-tab"), true);
+          });
 
           // The editors render expanded (no-JS fallback); collapse them once
           // JS is live so the page opens in list-only, GitHub-style form.
@@ -1986,17 +2130,29 @@ in
             e.preventDefault();
             var body = new URLSearchParams();
             new FormData(f).forEach(function (v, k) { body.append(k, v); });
+            // On the workspace, adding a session should focus its new tab —
+            // and a FAILED add (the fetched error page defaults aria-current)
+            // must not yank the user off the tab they were on.
+            var addedSession =
+              (f.getAttribute("action") || "").endsWith("/sessions/add") && tabBar()
+                ? body.get("name") : null;
+            var wasActive = wsActive();
             fetch(f.getAttribute("action"), { method: "POST", body: body })
               .then(function (r) { return r.text(); })
               .then(function (t) {
-                applyDoc(parseHTML(t), ["msg-slot", "secrets-list", "sessions-list"]);
+                applyDoc(parseHTML(t), ["msg-slot", "secrets-list", "sessions-list", "tab-bar"]);
                 var ed = f.closest(".editor");
                 if (ed) { f.reset(); ed.hidden = true; }
+                if (addedSession && tabEl(addedSession)) { wsSelect(addedSession, true); }
+                else if (wasActive && tabEl(wasActive)) { wsSelect(wasActive, false); }
+                wsSync();
                 startPolling(8);
               });
           });
 
           checkForUpdate();
+          // Land in the terminal: focus the server-selected tab's pane.
+          if (wsActive()) { wsSelect(wsActive(), true); }
           startPolling(8);
         })();
         </script>
@@ -2049,10 +2205,12 @@ in
                         f'<form class="inline" method="post" action="{base}/sessions/restart" '
                         f'onsubmit="return confirm(\'Restart {safe}? Unsaved in-flight work is lost.\');">'
                         f'<input type="hidden" name="name" value="{safe}">'
+                        f'<input type="hidden" name="back" value="settings">'
                         f'<button type="submit" class="btn small">Restart</button></form>'
                         f'<form class="inline" method="post" action="{base}/sessions/delete" '
                         f'onsubmit="return confirm(\'Delete session {safe}? Its live agent is killed.\');">'
                         f'<input type="hidden" name="name" value="{safe}">'
+                        f'<input type="hidden" name="back" value="settings">'
                         f'<button type="submit" class="icon idanger" aria-label="Delete" '
                         f'title="Delete {safe}">{ICON_TRASH}</button></form>'
                         f'</span></li>'
@@ -2106,6 +2264,44 @@ in
             )
 
 
+        def render_tabs(names, live, selected):
+            """The workspace tab bar. File order, not sorted: sessions.json
+            preserves insertion order, so a new session appears as the
+            rightmost tab, like any terminal app. The dot-only .state span
+            reuses the list styling (its ::before is the dot)."""
+            items = []
+            for name in names:
+                safe = html.escape(name)
+                cur = ' aria-current="page"' if name == selected else ""
+                state = "live" if name in live else "starting"
+                items.append(
+                    f'<a class="tab" data-tab="{safe}" href="/?tab={safe}"{cur}>'
+                    f'<span class="state" data-state="{state}"></span>{safe}</a>'
+                )
+            if not items:
+                items.append('<span class="tab-empty">No sessions yet.</span>')
+            return "".join(items)
+
+
+        def render_pane(selected, live):
+            """The server-rendered pane: only the SELECTED session, and only
+            when its tmux session is already live — the ttyd attach wrapper
+            greets a not-yet-started session with an error and exits, so a
+            starting session gets a placeholder instead (SCRIPT swaps in the
+            iframe once the state flips; without JS, reloading does)."""
+            if selected is None:
+                return '<div class="pane placeholder active">No session selected.</div>'
+            safe = html.escape(selected)
+            if selected not in live:
+                return (f'<div class="pane placeholder active" data-pane="{safe}">'
+                        f'{safe} is starting&hellip; reload in a few seconds.</div>')
+            user = urllib.parse.quote(USER, safe="")
+            # SESSION_RE names are URL-safe as-is.
+            return (f'<iframe class="pane active" data-pane="{safe}" '
+                    f'src="/{user}/?arg={safe}" title="{safe} terminal" '
+                    f'allow="clipboard-read; clipboard-write"></iframe>')
+
+
         def render_page(message=""):
             msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
             return (
@@ -2115,9 +2311,9 @@ in
                     user=html.escape(USER),
                     base=html.escape(BASE),
                     keys=render_keys(read_keys()),
-                    # HOME moves the session manager to the root page; keep it
-                    # here for every other user.
-                    sessions_section="" if HOME else render_sessions_section(),
+                    # Every user, primary included: the HOME root page is the
+                    # terminal workspace, so session CRUD lives here.
+                    sessions_section=render_sessions_section(),
                     message=msg_html,
                     update_row=(
                         UPDATE_ROW.format(base=html.escape(BASE), update_line=render_update_line())
@@ -2128,14 +2324,23 @@ in
             )
 
 
-        def render_home(message=""):
+        def render_home(message="", selected=None):
+            entries = {n: v for n, v in read_sessions().items() if SESSION_RE.match(n)}
+            names = list(entries)
+            if selected not in entries:
+                selected = "main" if "main" in entries else (names[0] if names else None)
+            live = live_sessions()
             msg_html = f'<div class="msg">{html.escape(message)}</div>' if message else ""
             return (
                 HEAD_TPL.format(title="Agent Box &mdash; " + html.escape(USER))
                 + STYLE
                 + HOME_BODY.format(
                     base=html.escape(BASE),
-                    sessions_section=render_sessions_section(),
+                    action_base=html.escape(SESS_BASE),
+                    term_base="/%s/" % urllib.parse.quote(USER, safe=""),
+                    tabs=render_tabs(names, live, selected),
+                    pane=render_pane(selected, live),
+                    agents=render_agent_options(),
                     message=msg_html,
                 )
                 + SCRIPT
@@ -2185,7 +2390,11 @@ in
                 if "ok" in params:
                     message = self.OK_MESSAGES.get(params["ok"][0], "")
                 if HOME and parsed.path == "/":
-                    self._send_html(render_home(message))
+                    # ?tab=<session> selects the rendered tab (also the no-JS
+                    # switching mechanism); anything invalid falls back to the
+                    # default selection inside render_home.
+                    tab = (params.get("tab", [""])[0]).strip()
+                    self._send_html(render_home(message, tab if SESSION_RE.match(tab) else None))
                     return
                 if not self._under_base(parsed.path):
                     self._send_html("<h1>404</h1>", status=404)
@@ -2225,6 +2434,14 @@ in
                     return origin in ("https://" + host, "http://" + host)
                 return True
 
+            def _sess_page(self, form):
+                """Where a /sessions/* POST redirects back to: the settings
+                page when the form carried back=settings (the session manager
+                section lives there for every user now), else SESS_PAGE (the
+                HOME workspace's own add form)."""
+                back = form.get("back", [""])[0]
+                return BASE + "/" if back == "settings" else SESS_PAGE
+
             def do_POST(self):
                 parsed = urllib.parse.urlparse(self.path)
                 path = parsed.path.rstrip("/")
@@ -2253,7 +2470,9 @@ in
                         delete_key(key)
                     self._redirect("ok=deleted")
                 elif path == SESS_BASE + "/sessions/add":
-                    render = render_home if HOME else render_page
+                    back_page = self._sess_page(form)
+                    # Error pages re-render the page the form came from.
+                    render = render_home if (HOME and back_page == SESS_PAGE) else render_page
                     name = (form.get("name", [""])[0]).strip()
                     agent = (form.get("agent", [""])[0]).strip() or DEFAULT_AGENT
                     if not SESSION_RE.match(name):
@@ -2288,7 +2507,12 @@ in
                         "extraArgs": [],
                     }
                     write_sessions(sessions)
-                    self._redirect("ok=session_added", SESS_PAGE)
+                    # On the workspace, land on the new session's tab (name is
+                    # SESSION_RE-validated, so URL-safe as-is).
+                    query = "ok=session_added"
+                    if HOME and back_page == SESS_PAGE:
+                        query += "&tab=" + name
+                    self._redirect(query, back_page)
                 elif path == SESS_BASE + "/sessions/delete":
                     name = (form.get("name", [""])[0]).strip()
                     if SESSION_RE.match(name):
@@ -2296,12 +2520,12 @@ in
                         sessions.pop(name, None)
                         write_sessions(sessions)
                         kill_session(name)
-                    self._redirect("ok=session_deleted", SESS_PAGE)
+                    self._redirect("ok=session_deleted", self._sess_page(form))
                 elif path == SESS_BASE + "/sessions/restart":
                     name = (form.get("name", [""])[0]).strip()
                     if SESSION_RE.match(name):
                         kill_session(name)
-                    self._redirect("ok=session_restarted", SESS_PAGE)
+                    self._redirect("ok=session_restarted", self._sess_page(form))
                 elif path == BASE + "/restart":
                     # Full unit bounce (see restart_all): re-reads unit-level
                     # EnvironmentFiles, which per-session restarts can't.
@@ -2446,10 +2670,11 @@ in
       '';
 
       rootBlock = name: ''
-        # Anything else, including /: ${name}'s session manager (list / open /
-        # add / restart / delete, plus the /sessions/* CRUD routes), served by
-        # the settings daemon behind the SAME cookie-or-basic auth as the
-        # terminal — session CRUD must never be reachable unauthenticated.
+        # Anything else, including /: ${name}'s tabbed terminal workspace
+        # (one tab per session, panes iframing /${name}/?arg=<session>; plus
+        # the /sessions/* CRUD routes), served by the settings daemon behind
+        # the SAME cookie-or-basic auth as the terminal — session CRUD must
+        # never be reachable unauthenticated.
         # This replaces the old unauthenticated picker (single-user boxes are
         # the norm now); with it gone — and the public sessions.json it fed
         # removed — nothing on this vhost is served without auth. Other

@@ -217,8 +217,8 @@ its own tmux session, all supervised by that user's single hardened
 `agent-box-<name>.service`. All supported agent CLIs are installed
 regardless of what any session runs (`installAgents`). The pseudo-agent
 `shell` runs the user's login shell instead — a supervised plain terminal
-for manual investigation or clean-up that respawns on exit and shows up in
-the web session manager like any other session.
+for manual investigation or clean-up that respawns on exit and gets a
+terminal tab in the web workspace like any other session.
 
 Sessions are **runtime data**. The Nix config above only seeds
 `~/.config/agent-box/sessions.json` on first boot; after that the file is
@@ -234,14 +234,15 @@ agent-box-session restart review
 agent-box-session rm review                 # delist + kill
 ```
 
-The site root (web setups) has the same controls — `https://<domain>/` is
-the session manager, behind the same login as the terminal — and agents can
-spawn sibling sessions themselves (it's just a file edit on their own
-account — handy for "have Codex cross-check this").
+The site root (web setups) is the terminal itself — `https://<domain>/` is
+a tabbed workspace, one tab per session, behind the same login as the
+terminal (add sessions from the tab bar; restart/delete on the settings
+page) — and agents can spawn sibling sessions themselves (it's just a file
+edit on their own account — handy for "have Codex cross-check this").
 
 Attach locally with `tmux -L agent-box attach -t <session>` (see
-`TMUX_TMPDIR` note above). In the browser, each session on the root page
-deep-links into its terminal via
+`TMUX_TMPDIR` note above). In the browser, every tab is also a
+deep-linkable standalone terminal at
 `https://<domain>/<user>/?arg=<session>`. Killed-on-error sessions keep a
 post-mortem shell open instead of being respawned over; delisted sessions
 stay gone.
@@ -327,7 +328,7 @@ arbitrary command execution as the agent user.
 - **Tight sudo:** whatever's in `sudoAllowlist` is the entire root-capable
   surface. `NOPASSWD` only - no `SETENV`, no blanket sudo, no ALL.
 - **Nothing anonymous, brute-force damping (web deployments):** every path
-  on the vhost — terminal, session manager, settings — sits behind the
+  on the vhost — terminal workspace, per-session terminals, settings — sits behind the
   login (the CI tests assert the 401s), the password hash is bcrypt via
   Caddy, and a fail2ban jail bans IPs that repeatedly fail it (default on,
   `web.fail2ban`; it only counts requests that actually carried
