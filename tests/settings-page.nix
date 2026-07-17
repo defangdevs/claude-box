@@ -164,6 +164,33 @@
     # No env file exists yet.
     machine.fail("test -e /home/agent/.config/agent-box/env")
 
+    # Issue 117: a browser cross-site POST (valid basic auth, but the browser
+    # marks the request cross-site / carries a foreign Origin) is refused 403,
+    # so CSRF cannot inject a secret even though auth succeeds.
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "-H 'Sec-Fetch-Site: cross-site' -d 'key=PWNED&value=x' "
+        "https://box.test/agent/settings/set | grep -x 403"
+    )
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "-H 'Origin: https://evil.example' -d 'key=PWNED&value=x' "
+        "https://box.test/agent/settings/set | grep -x 403"
+    )
+    # A same-origin marker with matching Origin is accepted (the real page).
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "-H 'Sec-Fetch-Site: same-origin' -H 'Origin: https://box.test' "
+        "-d 'key=OKKEY&value=x' https://box.test/agent/settings/set | grep -x 303"
+    )
+    # The blocked posts wrote nothing; the accepted one did.
+    machine.fail("grep -q PWNED /home/agent/.config/agent-box/env")
+    machine.succeed("grep -q '^OKKEY=x$' /home/agent/.config/agent-box/env")
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null "
+        "-d 'key=OKKEY' https://box.test/agent/settings/delete"
+    )
+
     # POST a secret through the page (never touches the terminal/chat).
     client.succeed(
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "

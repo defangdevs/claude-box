@@ -2117,9 +2117,43 @@ in
                 raw = self.rfile.read(length).decode("utf-8") if length else ""
                 return urllib.parse.parse_qs(raw)
 
+            def _same_origin(self):
+                """Reject cross-site state-changing POSTs (issue #117).
+
+                Every POST route here mutates state (secrets, sessions, the
+                box update). Auth alone does not stop CSRF: the __Host- cookie
+                is SameSite=Strict, but the basic-auth fallback has no SameSite
+                equivalent, and browsers reattach cached basic credentials to
+                cross-site requests — so a lured, basic-authenticated operator
+                could be forced to e.g. inject a GH_TOKEN via /set.
+
+                Browsers always send Sec-Fetch-Site; a genuine form post from
+                our own page is "same-origin". Anything a browser labels
+                cross-site or same-site (sibling *.sslip.io hosts are
+                same-site but different owners) is refused. Older browsers
+                that omit Sec-Fetch-Site still send Origin, which we compare
+                against the target Host (Caddy forwards both unchanged). A
+                request with neither header is not a browser navigation and
+                carries no ambient victim credentials (curl, the e2e harness),
+                so it is allowed."""
+                site = self.headers.get("Sec-Fetch-Site")
+                if site is not None:
+                    return site == "same-origin"
+                origin = self.headers.get("Origin")
+                if origin:
+                    host = self.headers.get("Host", "")
+                    return origin in ("https://" + host, "http://" + host)
+                return True
+
             def do_POST(self):
                 parsed = urllib.parse.urlparse(self.path)
                 path = parsed.path.rstrip("/")
+                if not self._same_origin():
+                    self._send_html(
+                        "<h1>403</h1><p>Cross-site request blocked.</p>",
+                        status=403,
+                    )
+                    return
                 form = self._read_form()
                 if path == BASE + "/set":
                     key = (form.get("key", [""])[0]).strip()
