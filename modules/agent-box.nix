@@ -27,14 +27,57 @@ let
   defaultAgentsMd = ''
     # agent-box
 
-    You are running inside an agent-box deployment. Your browser terminal is
-    reachable at $AGENT_BOX_URL (run `echo $AGENT_BOX_URL` to print it).
-    Share that URL with anyone who needs to view or take over your session;
-    the sign-in username is your own login name (`whoami`) and the password
-    was set at deploy time.
+    You are running inside an agent-box deployment: a coding agent in a
+    persistent tmux session on a locked-down NixOS host. Your browser
+    terminal is reachable at $AGENT_BOX_URL (run `echo $AGENT_BOX_URL` to
+    print it). Share that URL with anyone who needs to view or take over your
+    session; the sign-in username is your own login name (`whoami`) and the
+    password was set at deploy time.
 
-    Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
-    (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
+    ## Your environment
+
+    - Only your home directory is writable — the rest of the filesystem is
+      read-only (systemd ProtectSystem=strict). Do all work under $HOME;
+      writes elsewhere fail with a read-only-filesystem error.
+    - $HOME is SHARED by every one of your tmux sessions (they all run as the
+      same user and start in $HOME). For parallel work in one repo use
+      `git worktree` or separate subdirectories, so concurrent sessions don't
+      clobber each other's checkout.
+    - Sessions live in RAM: a reboot loses them, so persist anything worth
+      keeping to disk under $HOME. If an agent exits with an error you land in
+      a shell for inspection; a clean exit is respawned within ~2s.
+    - sudo is a tight allowlist (essentially caddy reload + self-update), not
+      general root — don't plan around arbitrary sudo.
+
+    ## Tools, secrets, and sibling sessions
+
+    - Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
+      (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
+    - Secrets go in ~/.config/agent-box/env (KEY=value, one per line) or the
+      settings page, and load on the next session (re)start. GH_TOKEN is read
+      automatically, so `git clone https://github.com/...` just works.
+    - Manage your own sessions without a rebuild:
+      `agent-box-session ls|add|rm|restart`. `add` takes an optional name plus
+      `--agent claude|codex|shell` and `--cwd DIR` — handy for fanning out
+      work, spinning up a second reviewer agent, or opening a plain shell for
+      investigation. Listed sessions start within ~2s.
+
+    ## Serving a web app publicly
+
+    Drop a snippet into ~/sites/NAME.caddy that reverse-proxies to a local
+    port, then reload caddy — no rebuild:
+
+        NAME.example.com {
+          import acme_alpn_only
+          reverse_proxy 127.0.0.1:3000
+        }
+
+    `sudo systemctl reload caddy.service` picks it up and Caddy gets a Let's
+    Encrypt cert on first request if DNS for that name points at this box.
+    Reverse-proxy to your process; don't `file_server` from $HOME (caddy
+    can't read /home).
+
+    ## Updating
 
     Update the box's software with:
     `sudo systemctl start agent-box-update.service`
