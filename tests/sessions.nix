@@ -211,6 +211,30 @@
     assert "main" in listing and "helper" in listing, listing
     assert "codex" in listing, listing
 
+    # --- auto-named add: no NAME → derived from the agent -----------------
+    # First codex-derived name is the bare agent name (no session is literally
+    # "codex" yet — "helper" runs codex but under its own name).
+    machine.succeed("su -s /bin/sh agent -c 'agent-box-session add --agent codex'")
+    machine.wait_until_succeeds(tmux("has-session -t =codex"), timeout=60)
+    machine.succeed(
+        "jq -e '.sessions.codex.agent == \"codex\"' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
+    # A second codex-derived name collides with "codex", so it gets a short
+    # random suffix ("codex-XXXX") — a distinct, valid session name.
+    machine.succeed("su -s /bin/sh agent -c 'agent-box-session add --agent codex'")
+    machine.succeed(
+        "jq -e '[.sessions | keys[] | select(test(\"^codex-[0-9a-f]+$\"))] | length == 1' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
+    suffixed = machine.succeed(
+        "jq -r '.sessions | keys[] | select(test(\"^codex-[0-9a-f]+$\"))' "
+        "/home/agent/.config/agent-box/sessions.json"
+    ).strip()
+    machine.wait_until_succeeds(tmux(f'has-session -t "={suffixed}"'), timeout=60)
+    machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm codex'")
+    machine.succeed(f"su -s /bin/sh agent -c 'agent-box-session rm {suffixed}'")
+
     # --- shell pseudo-agent (issue 113): supervised plain login shell ------
     machine.succeed(
         "su -s /bin/sh agent -c 'agent-box-session add scratch --agent shell'"
@@ -318,6 +342,21 @@
     assert 'src="/agent/?arg=web"' in tab_page, tab_page
     # main is still a tab, just not the current one.
     assert 'data-tab="main" href="/?tab=main">' in tab_page, tab_page
+
+    # A blank name auto-derives from the agent: no session is literally
+    # "claude" yet, so the new one lands on the bare-agent-name tab.
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -D - "
+        "-d 'name=&agent=claude' "
+        "https://box.test/sessions/add "
+        "| grep -i '^location: /?ok=session_added&tab=claude'"
+    )
+    machine.wait_until_succeeds(tmux("has-session -t =claude"), timeout=60)
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "-d 'name=claude' "
+        "https://box.test/sessions/delete | grep -x 303"
+    )
 
     # ...and delete it again (delist + kill).
     client.succeed(

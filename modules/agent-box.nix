@@ -179,7 +179,7 @@ let
     t() { ${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} "$@"; }
     usage() {
       echo "usage: agent-box-session ls"
-      echo "       agent-box-session add NAME [--agent AGENT] [--cwd DIR] [-- EXTRA_ARGS...]"
+      echo "       agent-box-session add [NAME] [--agent AGENT] [--cwd DIR] [-- EXTRA_ARGS...]"
       echo "       agent-box-session rm NAME"
       echo "       agent-box-session restart NAME"
       echo "agents: $AGENTS (default: $DEFAULT_AGENT)"
@@ -202,6 +202,18 @@ let
         rm -f "$tmp"
         exit 1
       fi
+    }
+    taken() { "$JQ" -e --arg n "$1" '.sessions | has($n)' "$FILE" >/dev/null; }
+    gen_name() {
+      # gen_name AGENT — echo a unique session name derived from AGENT: the
+      # bare name when free ("claude"), else a short random suffix
+      # ("claude-a3f9"). Callers pass a validated agent, itself a valid name.
+      a="$1"
+      taken "$a" || { printf '%s' "$a"; return; }
+      while :; do
+        cand="$a-$(printf '%04x' $((RANDOM % 65536)))"
+        taken "$cand" || { printf '%s' "$cand"; return; }
+      done
     }
 
     cmd="''${1:-}"; shift || true
@@ -226,8 +238,13 @@ let
         done
         ;;
       add)
-        name="''${1:-}"; shift || true
-        valid_name "$name" || { usage >&2; exit 2; }
+        # NAME is optional and positional: a leading non-flag arg is the name,
+        # otherwise the name is auto-derived from the agent below.
+        name=""
+        case "''${1:-}" in
+          ""|-*) ;;
+          *) name="$1"; shift; valid_name "$name" || { usage >&2; exit 2; } ;;
+        esac
         agent="$DEFAULT_AGENT"; cwd=""
         while [ $# -gt 0 ]; do
           case "$1" in
@@ -242,7 +259,8 @@ let
           (*) echo "agent '$agent' is not available (available: $AGENTS)" >&2; exit 2 ;;
         esac
         ensure_file
-        if "$JQ" -e --arg n "$name" '.sessions | has($n)' "$FILE" >/dev/null; then
+        [ -n "$name" ] || name="$(gen_name "$agent")"
+        if taken "$name"; then
           echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
           exit 2
         fi
@@ -1613,6 +1631,7 @@ in
         import json
         import os
         import re
+        import secrets
         import signal
         import socket
         import subprocess
@@ -1772,6 +1791,26 @@ in
                 if isinstance(k, str) and isinstance(v, dict):
                     result[k] = v
             return result
+
+
+        def gen_session_name(agent, sessions):
+            """Auto-generate a unique session name from the agent CLI name.
+
+            The first session for an agent gets the bare name ("claude"); a
+            later one that would collide gets a short random suffix
+            ("claude-a3f9") to stay unique yet readable. Users rarely care what
+            a session is called (rename at runtime via /rename), so this spares
+            them inventing one. `agent` is always one of AGENTS (or "shell"),
+            so it already matches SESSION_RE.
+            """
+            if agent not in sessions:
+                return agent
+            for _ in range(1000):
+                candidate = "%s-%s" % (agent, secrets.token_hex(2))
+                if candidate not in sessions:
+                    return candidate
+            # Astronomically unlikely fallback: a longer token can't be taken.
+            return ("%s-%s" % (agent, secrets.token_hex(8)))[:32]
 
 
         def write_sessions(sessions):
@@ -2056,9 +2095,9 @@ in
               <form method="post" action="{action_base}/sessions/add">
                 <input type="hidden" name="back" value="settings">
                 <div class="row">
-                  <input type="text" name="name" placeholder="session-name"
-                         pattern="[A-Za-z0-9_-]+" required
-                         title="Letters, digits, dash and underscore">
+                  <input type="text" name="name" placeholder="name (optional — auto from agent)"
+                         pattern="[A-Za-z0-9_-]+"
+                         title="Optional. Letters, digits, dash and underscore; blank auto-names from the agent">
                   <select name="agent">{agents}</select>
                   <button type="submit" class="btn">Add session</button>
                 </div>
@@ -2086,9 +2125,9 @@ in
         <div id="session-editor" class="editor">
           <form method="post" action="{action_base}/sessions/add">
             <div class="row">
-              <input type="text" name="name" placeholder="session-name"
-                     pattern="[A-Za-z0-9_-]+" required
-                     title="Letters, digits, dash and underscore">
+              <input type="text" name="name" placeholder="name (optional — auto from agent)"
+                     pattern="[A-Za-z0-9_-]+"
+                     title="Optional. Letters, digits, dash and underscore; blank auto-names from the agent">
               <select name="agent">{agents}</select>
               <button type="submit" class="btn">Add session</button>
             </div>
@@ -2846,20 +2885,23 @@ in
                     render = render_home if (HOME and back_page == SESS_PAGE) else render_page
                     name = (form.get("name", [""])[0]).strip()
                     agent = (form.get("agent", [""])[0]).strip() or DEFAULT_AGENT
-                    if not SESSION_RE.match(name):
-                        self._send_html(
-                            render("Invalid session name. Use letters, digits, "
-                                   "dash and underscore (max 32 chars)."),
-                            status=400,
-                        )
-                        return
                     if agent not in AGENTS:
                         self._send_html(
                             render("Unknown agent. Available: " + ", ".join(AGENTS)),
                             status=400,
                         )
                         return
+                    if name and not SESSION_RE.match(name):
+                        self._send_html(
+                            render("Invalid session name. Use letters, digits, "
+                                   "dash and underscore (max 32 chars)."),
+                            status=400,
+                        )
+                        return
                     sessions = read_sessions()
+                    # Blank name → derive one from the agent (issue: autogen names).
+                    if not name:
+                        name = gen_session_name(agent, sessions)
                     if name in sessions:
                         # Silently overwriting would reset the stored config
                         # (agent, cwd, extraArgs) to defaults — issue 100.

@@ -235,7 +235,8 @@ destroy sessions as the user — no sudo, no `nixos-rebuild`:
 
 ```bash
 agent-box-session ls                        # NAME AGENT STATE
-agent-box-session add review --agent codex  # starts within ~2s
+agent-box-session add --agent codex         # auto-named "codex" (or "codex-XXXX")
+agent-box-session add review --agent codex  # or name it yourself; starts within ~2s
 agent-box-session add scratch --cwd ~/proj -- --model opus
 agent-box-session add tidy --agent shell    # plain login shell, no agent
 agent-box-session restart review
