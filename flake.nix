@@ -106,6 +106,51 @@
           sessions = pkgs.testers.runNixOSTest
             (import ./tests/sessions.nix { agent-box = self.nixosModules.agent-box; });
 
+          # Interactive VM test (issue #132): each web user's ~/downloads
+          # file-drop dir is served behind the terminal's basic auth at
+          # /<user>/downloads/, so an agent can hand a produced file to the
+          # user as a URL — perms/symlink, caddy reachability, and the auth
+          # gate.
+          download-files = pkgs.testers.runNixOSTest
+            (import ./tests/download-files.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Guard (issue #132): the module's REAL generated Caddyfile (the VM
+          # test above swaps in a `tls internal` stand-in) must carry the
+          # authenticated downloads route for a web user — the handle, the
+          # strip_prefix, and file_server rooted at the caddy-readable backing
+          # dir. Cheap: realises only the tiny rendered config + a grep.
+          download-route =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "downloads.test";
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-download-route-ok"
+              { caddyfile = sys.config.services.caddy.configFile; } ''
+              grep -qF 'handle /agent/downloads/*' "$caddyfile"
+              grep -qF 'uri strip_prefix /agent/downloads' "$caddyfile"
+              grep -qF 'root * /var/lib/agent-box-downloads/agent' "$caddyfile"
+              grep -qF 'file_server browse' "$caddyfile"
+              printf 'downloads route present in generated Caddyfile\n' > "$out"
+            '';
+
           # Regression guard (issue #51): deployed boxes fetch
           # modules/agent-box.nix as a SINGLE file — the CFN user-data and
           # agent-box-update.service both fetchurl just that path — so the
