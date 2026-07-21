@@ -34,6 +34,11 @@ let
     session; the sign-in username is your own login name (`whoami`) and the
     password was set at deploy time.
 
+    The user connects to this box remotely over the web, so whenever you point
+    them at something the box serves, give the full absolute URL (build it from
+    $AGENT_BOX_URL) — never a bare local path or a link relative to the
+    terminal, which a remote user can't act on.
+
     ## Your environment
 
     - Only your home directory is writable — the rest of the filesystem is
@@ -61,6 +66,21 @@ let
       `--agent claude|codex|shell` and `--cwd DIR` — handy for fanning out
       work, spinning up a second reviewer agent, or opening a plain shell for
       investigation. Listed sessions start within ~2s.
+
+    ## Handing a file to the user
+
+    To let the user download a file you produced (report, build artifact,
+    archive, image), move or copy it into ~/downloads and give them the full
+    URL. That directory is served — behind the SAME login as your terminal —
+    at ''${AGENT_BOX_URL}downloads/ (a browsable index), so a file at
+    ~/downloads/report.pdf downloads from ''${AGENT_BOX_URL}downloads/report.pdf.
+
+        mv ./report.pdf ~/downloads/          # or cp, to keep the original
+
+    Always hand the user the complete https:// URL. Only files under
+    ~/downloads are exposed this way; nothing else in your home is reachable
+    over the web. For unauthenticated sharing, run your own web service and
+    expose it via ~/sites (see below).
 
     ## Serving a web app publicly
 
@@ -98,6 +118,14 @@ let
   # The per-user secrets file the settings page (issue #36) manages. User-
   # owned, 0600, read by envExecWrapper at every session spawn (issue 89).
   userEnvFile = name: "/home/${name}/.config/agent-box/env";
+  # Per-user file-drop directory served (behind the terminal's auth) at
+  # /<user>/downloads/ so the agent can hand a file it wrote to the user
+  # (issue #132). Backed OUTSIDE /home because caddy.service runs with
+  # ProtectHome=true and cannot read /home; same 0750 <user>:caddy model as
+  # the ~/sites snippet dir — the user writes, caddy reaches it via its group
+  # and reads each file through its world-read bit (default 0644). Symlinked
+  # into $HOME as ~/downloads so the agent never touches /var/lib directly.
+  downloadsDirOf = name: "/var/lib/agent-box-downloads/${name}";
 
   # Session-spawn env loader (issue 89). Sessions are (re)created by the
   # long-lived supervisor inside the agent unit, so a unit-level
@@ -3066,6 +3094,31 @@ in
             }
           }
         }
+        # ${name}'s file drop (issue #132): a browsable static index of
+        # ~/downloads, served from the caddy-readable /var/lib backing dir
+        # (caddy.service can't read /home). Same cookie-or-basic auth as the
+        # terminal, and MORE specific than /${name}/* below so Caddy routes it
+        # here first. The agent hands the user a ${name}/downloads/<file> URL.
+        redir /${name}/downloads /${name}/downloads/
+        handle /${name}/downloads/* {
+          @cookie_dl_${name} header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
+          handle @cookie_dl_${name} {
+            uri strip_prefix /${name}/downloads
+            root * ${downloadsDirOf name}
+            file_server browse
+          }
+          handle {
+            route {
+              basic_auth {$WEB_PASSWORD_ALGORITHM_${envName name}} ${name} {
+                ${name} {$WEB_PASSWORD_HASH_${envName name}}
+              }
+              header >Set-Cookie "__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}; Path=/; Max-Age=2592000; HttpOnly; Secure; SameSite=Strict"
+              uri strip_prefix /${name}/downloads
+              root * ${downloadsDirOf name}
+              file_server browse
+            }
+          }
+        }
         handle /${name}/* {
           @cookie_${name} header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
           handle @cookie_${name} {
@@ -3257,6 +3310,10 @@ in
         # the box can't peek. Kept OUTSIDE /var/lib/agent-box-web (0700) so
         # caddy's `import` can traverse without loosening the secrets dir.
         "d /var/lib/agent-box-sites 0755 root root - -"
+        # File-drop dirs (issue #132), same layout/permissions rationale as the
+        # snippet dirs above: parent world-traversable so caddy can reach the
+        # per-user 0750 <user>:caddy subdirs it serves at /<user>/downloads/.
+        "d /var/lib/agent-box-downloads 0755 root root - -"
         # Settings daemon sockets live here (issue #49). World-traversable is
         # fine: the per-user socket files themselves are 0660 <user>:caddy
         # (created by systemd, see systemd.sockets below), and connecting
@@ -3268,6 +3325,10 @@ in
         # symlink/file if the target differs from ours (idempotent across
         # renames). Users edit through this link and never touch /var/lib.
         "L+ /home/${name}/sites - - - - /var/lib/agent-box-sites/${name}"
+        # ~/downloads -> the caddy-readable file-drop dir served at
+        # /<user>/downloads/ (issue #132). Same L+/symlink rationale as ~/sites.
+        "d ${downloadsDirOf name} 0750 ${name} caddy - -"
+        "L+ /home/${name}/downloads - - - - ${downloadsDirOf name}"
       ]) (lib.attrNames cfg.users)
       # The settings page's env dir, per terminal user. User-owned 0700 so
       # only the agent user (and root) can read it; the settings daemon runs

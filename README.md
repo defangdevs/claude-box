@@ -257,6 +257,26 @@ deep-linkable standalone terminal at
 post-mortem shell open instead of being respawned over; delisted sessions
 stay gone.
 
+## Downloading files the agent produced (web setups)
+
+Files an agent writes live on its own disk, which isn't trivially reachable
+from a browser. Each web user gets a file-drop directory, `~/downloads`,
+served — behind the **same login as the terminal** — at
+`https://<domain>/<user>/downloads/` as a browsable index. The agent moves or
+copies a file there and hands you the full URL:
+
+```bash
+mv ./report.pdf ~/downloads/    # -> https://<domain>/<user>/downloads/report.pdf
+```
+
+Only `~/downloads` is exposed this way — nothing else in the agent's home is
+reachable over the web. (`caddy.service` runs with `ProtectHome=true` and
+can't read `/home` at all; the directory is backed by a caddy-readable path
+under `/var/lib` and symlinked in as `~/downloads`.) The seeded `AGENTS.md`
+tells the agent about this route, so "send me that file" just works. For
+unauthenticated sharing, an agent can instead run its own web service and
+expose it via `~/sites` (see the seeded `AGENTS.md`).
+
 ## VM image
 
 Build from the same config:
@@ -338,8 +358,8 @@ arbitrary command execution as the agent user.
 - **Tight sudo:** whatever's in `sudoAllowlist` is the entire root-capable
   surface. `NOPASSWD` only - no `SETENV`, no blanket sudo, no ALL.
 - **Nothing anonymous, brute-force damping (web deployments):** every path
-  on the vhost — terminal workspace, per-session terminals, settings — sits
-  behind the
+  on the vhost — terminal workspace, per-session terminals, settings, and the
+  `/<user>/downloads/` file drop — sits behind the
   login (the CI tests assert the 401s), new password hashes use Caddy's
   recommended Argon2id algorithm (legacy bcrypt hashes remain accepted until
   the password changes), and a fail2ban jail bans IPs that repeatedly fail it
