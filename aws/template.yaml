@@ -183,21 +183,38 @@ Parameters:
 
   AgentsMd:
     Type: String
-    Default: ""
+    Default: |
+      ## This box (AWS / EC2)
+
+      - This is an EC2 instance. The root disk persists but RAM does not: on a
+        reboot or Spot interruption (Spot is the default) the instance stops
+        and later restarts with the same disk, IP, and TLS cert, but the live
+        tmux session is gone. Save working context to disk under your home.
+      - Your URL is derived from the instance IP via sslip.io and changes if
+        the public IP changes, so always read $AGENT_BOX_URL rather than
+        hard-coding the hostname.
+      - The box is IPv6-only by default; IPv4-only sites such as github.com
+        are reached through a public NAT64 relay, so expect the occasional
+        IPv4 reachability quirk.
+      - Low on disk? Enlarge the EBS root volume in the EC2 console and reboot
+        — NixOS grows the filesystem automatically; scheduled nix garbage
+        collection also reclaims space.
     Description: >-
       Deployment-specific instructions APPENDED to agent-box's built-in
       default AGENTS.md, which the module always seeds to the agent user's
       ~/AGENTS.md on first agent start (skipped if the file already exists).
       The built-in default already covers the generic guidance — browser-
-      terminal URL ($AGENT_BOX_URL), installing tools with nix, self-update —
-      so leave this blank unless you have EC2/CloudFormation-specific notes to
-      add (they land below the default). Blank (the default) seeds just the
-      built-in default. AGENTS.md is the cross-vendor agent-instructions
-      convention read natively by codex and opencode, and by claude-code as a
-      CLAUDE.md fallback. Content is embedded into user-data as a Nix indented
-      string, so avoid the sequences `${` and `''` in the body — Nix will
-      otherwise try to antiquote / close the string mid-file. Plain $VAR (no
-      braces) is fine.
+      terminal URL ($AGENT_BOX_URL), the read-only-except-$HOME filesystem,
+      installing tools with nix, sibling sessions, serving a web app, and
+      self-update — so this default only adds the EC2/CloudFormation specifics
+      (persistence, sslip.io URL, IPv6/NAT64, growing the disk). Edit or clear
+      it to taste; whatever you leave here lands below the built-in default.
+      AGENTS.md is the cross-vendor agent-instructions convention read
+      natively by codex and opencode, and by claude-code as a CLAUDE.md
+      fallback. Content is embedded into user-data as a Nix indented string,
+      so avoid the sequences `${` and `''` in the body — Nix will otherwise
+      try to antiquote / close the string mid-file. Plain $VAR (no braces) is
+      fine.
 
   AllowCidr:
     Type: String
