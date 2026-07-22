@@ -60,8 +60,8 @@ Metadata:
 Description: >
   agent-box - 1-click NixOS host running a coding agent inside a persistent
   tmux session. Choose Claude Code or Codex at deployment time. Reach it through
-  a browser terminal (Caddy + ttyd); Claude Code sessions can also be driven
-  from the Claude desktop and mobile apps via Remote Control.
+  a browser terminal (Caddy + ttyd); sessions can also be driven
+  from the agent's desktop and mobile apps via Remote Control.
   Source: https://github.com/defangdevs/agent-box
 
 Parameters:
@@ -73,8 +73,10 @@ Parameters:
       - codex
     Description: >-
       Agent CLI to run in the persistent tmux session. Supported values:
-      claude (Claude Code) and codex (OpenAI Codex CLI). Claude-specific
-      Remote Control settings are ignored when codex is selected.
+      claude (Claude Code) and codex (OpenAI Codex CLI). Both support Remote
+      Control; the <user>@<stack> session name applies to claude only (codex
+      runs the `codex remote-control` daemon, which names itself from the
+      hostname).
 
   UserName:
     Type: String
@@ -774,8 +776,8 @@ Resources:
 Outputs:
   WebURL:
     Description: >-
-      Browser terminal for the selected agent. Claude Code deployments are also
-      drivable from the Claude apps via Remote Control after the first login.
+      Browser terminal for the selected agent. Deployments are also
+      drivable from the agent's apps via Remote Control after the first login.
       First load takes ~2-3 minutes while the instance provisions and Caddy
       issues an ACME cert. Sign in with the UserName (default "agent") and the
       WebPassword chosen at deployment time. (The URL deliberately carries no
@@ -796,8 +798,9 @@ Outputs:
       Claude Remote Control session name (<UserName>@<stack name>). After
       finishing `claude login` once in the browser terminal, the Claude
       desktop / mobile apps can drive this session directly (sign in with the
-      same Claude account). Only meaningful when Agent=claude; Codex has no
-      Remote Control channel.
+      same Claude account). Only meaningful when Agent=claude; Codex is
+      remote-controlled too, but its `codex remote-control` daemon names
+      itself from the hostname (pair it with `codex remote-control pair`).
     Value: !Sub ${UserName}@${AWS::StackName}
 
   PublicAddress:

@@ -187,6 +187,28 @@
         "/home/agent/.config/agent-box/sessions.json"
     )
 
+    # Codex honours remoteControl (issue 103): with the default
+    # remoteControl=true, a codex session starts the local app-server daemon,
+    # enables Remote Control on it, and does NOT run the interactive TUI. The
+    # offline-safe local start matters here because the VM has no Codex login.
+    # The daemon detaches, so the session's foreground command is the agent-box
+    # supervisor wrapper that owns its lifecycle;
+    # assert the wrapper runs and passes the autonomy -c overrides (the
+    # subcommand rejects the TUI's --dangerously-bypass flag, so skipPermissions
+    # rides in as -c approval_policy / sandbox_mode instead).
+    helper_cmdline = machine.wait_until_succeeds(
+        as_agent("pgrep -u agent -af agent-box-codex-remote-control"), timeout=60
+    )
+    assert "-c approval_policy=never" in helper_cmdline, helper_cmdline
+    assert "-c sandbox_mode=danger-full-access" in helper_cmdline, helper_cmdline
+    assert "--dangerously-bypass-approvals-and-sandbox" not in helper_cmdline, helper_cmdline
+    # The wrapper actually brings the daemon up: its control socket answers
+    # (`app-server daemon version` exits 0 only against a live daemon). This
+    # needs no codex login — starting the daemon is separate from pairing.
+    machine.wait_until_succeeds(
+        as_agent("codex app-server daemon version"), timeout=60
+    )
+
     # Re-adding an existing name errors out and must not clobber the stored
     # config (issue 100): helper keeps its codex agent.
     machine.fail(

@@ -163,6 +163,37 @@ let
     exec "$@"
   '';
 
+  # Codex Remote Control supervisor (issue 103). Unlike claude's
+  # `--remote-control` TUI flag, codex uses a dedicated app-server daemon.
+  # `remote-control start` eagerly connects to the backend and fails before
+  # creating the local control socket when the user is logged out or the
+  # network is unavailable. Start the offline-safe local daemon first, then
+  # enable Remote Control independently so the relay can attach once login and
+  # network are available. The local daemon detaches (reparents to init), so it
+  # can't be a session's foreground command directly — the tmux session would
+  # exit at once and the reconcile loop would respawn it every ~2s while the
+  # real daemon ran unsupervised. This wrapper is that foreground command: it
+  # (re)starts the daemon, then blocks for as long as its control socket
+  # answers. It also tears the daemon down when the session is killed or
+  # restarted, so no detached daemon is leaked. $1 is the codex binary; the
+  # rest is forwarded to `app-server daemon start` (the -c autonomy overrides
+  # seeded below, plus any extraArgs).
+  codexRemoteControl = pkgs.writeShellScript "agent-box-codex-remote-control" ''
+    codex=$1; shift
+    stop() { "$codex" app-server daemon stop >/dev/null 2>&1 || true; }
+    # A daemon left over from an earlier start would make ours a no-op and
+    # leave us supervising nothing, so clear it first, then own a fresh one.
+    stop
+    trap 'stop; exit 0' HUP INT TERM
+    "$codex" app-server daemon start "$@" || { stop; exit 1; }
+    "$codex" app-server daemon enable-remote-control >/dev/null || { stop; exit 1; }
+    # `sleep & wait` (not a bare sleep) so a signal interrupts the wait at
+    # once and the trap fires without waiting the interval out.
+    while "$codex" app-server daemon version >/dev/null 2>&1; do
+      sleep 5 & wait $!
+    done
+  '';
+
   # Reload command is granted when web is enabled so the agent can add a
   # virtual host and reload without root — pooled with the user-supplied
   # sudoAllowlist so NoNewPrivileges + sudo rules see the same list.
@@ -400,13 +431,14 @@ let
       remoteControl = lib.mkOption {
         type = lib.types.bool;
         default = true;
-        description = "Pass --remote-control (claude sessions only; see users.<name>.remoteControl).";
+        description = "Make the session drivable from the agent's apps (see users.<name>.remoteControl).";
       };
       remoteControlName = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
         default = null;
         description = ''
-          Remote Control session name. When null, defaults to
+          Remote Control session name (claude sessions only — codex derives
+          its own name from the hostname). When null, defaults to
           "<user>@<host>" for the session named "main" and
           "<user>-<session>@<host>" otherwise, where <host> is
           networking.fqdnOrHostName, or the live kernel hostname when that
@@ -481,16 +513,25 @@ let
         type = lib.types.bool;
         default = true;
         description = ''
-          Pass --remote-control so the session is drivable from the Claude
-          desktop and mobile apps. Default `true` because "drive it from
-          your phone" is one of the module's headline features.
+          Make the session drivable from the agent's desktop and mobile apps.
+          Default `true` because "drive it from your phone" is one of the
+          module's headline features.
 
           Set false to disable remote-app control for this user — then the
           agent is only reachable through the local tmux session (or the
           ttyd browser terminal in the AWS variant).
 
-          Applies only to the claude agent. Codex remote/app-server wiring is
-          separate future work; use extraArgs for explicit Codex flags.
+          How it is wired depends on the agent:
+          - claude: adds `--remote-control <remoteControlName>` to the normal
+            TUI, so the browser terminal still shows the interactive session.
+          - codex: starts the local app-server daemon and enables Remote Control
+            on it (issue 103) INSTEAD of the interactive TUI. The daemon starts
+            even while logged out or offline; its relay connects once login and
+            network are available. Pair a running box with `codex remote-control
+            pair`. With false, codex runs its normal TUI, reachable only via the
+            browser terminal. The codex daemon is a per-user singleton (one
+            control socket per user), so enable it on at most ONE codex session
+            per user; two would fight over the same daemon.
         '';
       };
       remoteControlName = lib.mkOption {
@@ -715,13 +756,37 @@ ${agentBinCases}          *) return 1 ;;
         # (extraArgs, remoteControlName, cwd) can't inject into the tmux
         # command line — the runtime equivalent of lib.escapeShellArg.
         cmd="$(printf '%q' "$bin")"
-        if [ "$skip" = true ]; then
+        # Codex remote control uses a dedicated app-server daemon, not a TUI
+        # flag (issue 103), whereas claude takes a `--remote-control <name>`
+        # flag on its normal TUI. So a
+        # remote-controlled codex session runs a DIFFERENT program, handled in
+        # its own branch below; every other case keeps the TUI + autonomy flag.
+        codex_remote=false
+        if [ "$agent" = codex ] && [ "$rc" = true ]; then codex_remote=true; fi
+        if [ "$skip" = true ] && [ "$codex_remote" = false ]; then
           case "$agent" in
             claude) cmd="$cmd --dangerously-skip-permissions" ;;
             codex) cmd="$cmd --dangerously-bypass-approvals-and-sandbox" ;;
           esac
         fi
-        if [ "$agent" = claude ] && [ "$rc" = true ]; then
+        if [ "$codex_remote" = true ]; then
+          # Run the codex app-server daemon under the foreground supervisor
+          # wrapper (the daemon detaches — see codexRemoteControl). The wrapper
+          # takes the codex binary as its first arg and forwards the rest to
+          # `app-server daemon start`. That subcommand rejects
+          # --dangerously-bypass-approvals-and-sandbox, so
+          # honour skipPermissions via the two -c overrides that flag sets
+          # (codex's documented config-override path). A bare value that isn't
+          # valid TOML is taken as a string literal, so no quoting is needed.
+          # remoteControlName is claude-only — the codex daemon derives its own
+          # machine name from the hostname. Pairing the Codex apps to a running
+          # daemon uses `codex remote-control pair`; the standalone-path shim
+          # seeded above is what lets the Nix codex serve as the app-server.
+          cmd="$(printf '%q' ${codexRemoteControl}) $cmd"
+          if [ "$skip" = true ]; then
+            cmd="$cmd -c approval_policy=never -c sandbox_mode=danger-full-access"
+          fi
+        elif [ "$agent" = claude ] && [ "$rc" = true ]; then
           if [ -z "$rcname" ]; then
             # Host suffix for the derived "<user>[-<session>]@<host>" name.
             # ${fqdn} is config.networking.fqdnOrHostName, fixed at build

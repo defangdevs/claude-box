@@ -14,7 +14,7 @@ Supported agents:
 | Agent | Package | Autonomy flag used by `skipPermissions = true` | Notes |
 | --- | --- | --- | --- |
 | Claude Code | `pkgs.claude-code` | `--dangerously-skip-permissions` | Supports Claude Remote Control. |
-| Codex | `pkgs.codex` | `--dangerously-bypass-approvals-and-sandbox` | Browser terminal access; Codex app-server/remote wiring is future work. |
+| Codex | `pkgs.codex` | `--dangerously-bypass-approvals-and-sandbox` | Browser terminal, plus Remote Control via the `codex remote-control` daemon (`remoteControl = true`). |
 
 ## 1-click AWS launch
 
@@ -320,8 +320,8 @@ All under `services.agent-box`:
 | `users.<name>.sessions.<s>.*` | `{}` | Seed sessions (first boot only): per session `agent`, `skipPermissions`, `remoteControl`, `remoteControlName`, `workingDirectory`, `extraArgs`. Empty = the legacy per-user options below seed a session named `main`. |
 | `users.<name>.agent` | `null` | Agent for the default `main` session; null uses `services.agent-box.agent`. |
 | `users.<name>.skipPermissions` | `true` | Pass the selected agent's autonomy flag. |
-| `users.<name>.remoteControl` | `true` | Pass Claude's `--remote-control` when `agent = "claude"`; ignored for Codex. |
-| `users.<name>.remoteControlName` | `<name>@<host>` | Claude Remote Control session name (null -> `<user>@<fqdnOrHostName>` for `main`, `<user>-<session>@<fqdnOrHostName>` for other sessions). Ignored for Codex. |
+| `users.<name>.remoteControl` | `true` | Make the session drivable from the agent's apps: claude gets `--remote-control`; codex runs the `codex remote-control` daemon instead of its TUI. |
+| `users.<name>.remoteControlName` | `<name>@<host>` | Claude Remote Control session name (null -> `<user>@<fqdnOrHostName>` for `main`, `<user>-<session>@<fqdnOrHostName>` for other sessions). Ignored for Codex (its daemon names itself from the hostname). |
 | `users.<name>.workingDirectory` | `/home/<name>` | Agent startup directory. |
 | `users.<name>.extraGroups` | `[]` | Extra groups for the user. |
 | `users.<name>.extraArgs` | `[]` | Extra args appended to the selected agent CLI. |
@@ -379,9 +379,13 @@ arbitrary command execution as the agent user.
 - `skipPermissions = true` - a headless agent runner with per-tool
   approval prompts and no human to answer them is useless. Flip to
   `false` per-user if you actually have a human at the terminal.
-- `remoteControl = true` - for Claude Code, this is the "drive it from your
-  phone" feature. Flip to `false` per-user if you don't want the session
-  reachable from the Claude apps. Codex ignores this option.
+- `remoteControl = true` - the "drive it from your phone" feature. For Claude
+  Code it adds `--remote-control`; for Codex it starts the local app-server
+  daemon, enables Remote Control on it, and lets the relay connect once login
+  and network are available instead of requiring either at daemon startup
+  (pair a box with `codex remote-control pair`). Flip to `false` per-user if
+  you don't want the session reachable from the agent's apps — then Codex runs
+  its normal TUI, reachable via the browser terminal.
 
 **Tradeoffs the module can't fully paper over:**
 
