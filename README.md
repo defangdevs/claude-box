@@ -380,11 +380,12 @@ arbitrary command execution as the agent user.
   approval prompts and no human to answer them is useless. Flip to
   `false` per-user if you actually have a human at the terminal.
 - `remoteControl = true` - the "drive it from your phone" feature. For Claude
-  Code it adds `--remote-control`; for Codex it runs the
-  `codex remote-control start` app-server daemon instead of the interactive
-  TUI (pair a box with `codex remote-control pair`). Flip to `false` per-user
-  if you don't want the session reachable from the agent's apps — then Codex
-  runs its normal TUI, reachable via the browser terminal.
+  Code it adds `--remote-control`; for Codex it starts the local app-server
+  daemon, enables Remote Control on it, and lets the relay connect once login
+  and network are available instead of requiring either at daemon startup
+  (pair a box with `codex remote-control pair`). Flip to `false` per-user if
+  you don't want the session reachable from the agent's apps — then Codex runs
+  its normal TUI, reachable via the browser terminal.
 
 **Tradeoffs the module can't fully paper over:**
 

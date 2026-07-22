@@ -164,28 +164,29 @@ let
   '';
 
   # Codex Remote Control supervisor (issue 103). Unlike claude's
-  # `--remote-control` TUI flag, codex ships a dedicated app-server daemon
-  # driven by `codex remote-control {start,stop,pair}`. `start` forks a
-  # DETACHED daemon (it reparents to init) and returns immediately, so it
+  # `--remote-control` TUI flag, codex uses a dedicated app-server daemon.
+  # `remote-control start` eagerly connects to the backend and fails before
+  # creating the local control socket when the user is logged out or the
+  # network is unavailable. Start the offline-safe local daemon first, then
+  # enable Remote Control independently so the relay can attach once login and
+  # network are available. The local daemon detaches (reparents to init), so it
   # can't be a session's foreground command directly — the tmux session would
   # exit at once and the reconcile loop would respawn it every ~2s while the
-  # real daemon ran unsupervised. This wrapper is that foreground command
-  # instead: it (re)starts the daemon, then blocks for as long as the daemon's
-  # control socket answers, so the session's life tracks the daemon's — a
-  # daemon crash exits the wrapper and the supervisor respawns a fresh one. It
-  # also tears the daemon down when the session is killed or restarted (tmux
-  # sends SIGHUP; a whole-service stop already cgroup-kills, but a single
-  # session bounce does not), so no detached daemon is ever leaked. $1 is the
-  # codex binary; the rest is forwarded to `remote-control start` (the -c
-  # autonomy overrides seeded below, plus any extraArgs).
+  # real daemon ran unsupervised. This wrapper is that foreground command: it
+  # (re)starts the daemon, then blocks for as long as its control socket
+  # answers. It also tears the daemon down when the session is killed or
+  # restarted, so no detached daemon is leaked. $1 is the codex binary; the
+  # rest is forwarded to `app-server daemon start` (the -c autonomy overrides
+  # seeded below, plus any extraArgs).
   codexRemoteControl = pkgs.writeShellScript "agent-box-codex-remote-control" ''
     codex=$1; shift
-    stop() { "$codex" remote-control stop >/dev/null 2>&1 || true; }
+    stop() { "$codex" app-server daemon stop >/dev/null 2>&1 || true; }
     # A daemon left over from an earlier start would make ours a no-op and
     # leave us supervising nothing, so clear it first, then own a fresh one.
     stop
     trap 'stop; exit 0' HUP INT TERM
-    "$codex" remote-control start "$@" || { stop; exit 1; }
+    "$codex" app-server daemon start "$@" || { stop; exit 1; }
+    "$codex" app-server daemon enable-remote-control >/dev/null || { stop; exit 1; }
     # `sleep & wait` (not a bare sleep) so a signal interrupts the wait at
     # once and the trap fires without waiting the interval out.
     while "$codex" app-server daemon version >/dev/null 2>&1; do
@@ -523,13 +524,14 @@ let
           How it is wired depends on the agent:
           - claude: adds `--remote-control <remoteControlName>` to the normal
             TUI, so the browser terminal still shows the interactive session.
-          - codex: runs `codex remote-control start` — the app-server daemon
-            the Codex apps drive (issue 103) — INSTEAD of the interactive TUI.
-            Pair a running box with `codex remote-control pair`. With false,
-            codex runs its normal TUI, reachable only via the browser terminal.
-            The codex daemon is a per-user singleton (one control socket per
-            user), so enable it on at most ONE codex session per user;
-            two would fight over the same daemon.
+          - codex: starts the local app-server daemon and enables Remote Control
+            on it (issue 103) INSTEAD of the interactive TUI. The daemon starts
+            even while logged out or offline; its relay connects once login and
+            network are available. Pair a running box with `codex remote-control
+            pair`. With false, codex runs its normal TUI, reachable only via the
+            browser terminal. The codex daemon is a per-user singleton (one
+            control socket per user), so enable it on at most ONE codex session
+            per user; two would fight over the same daemon.
         '';
       };
       remoteControlName = lib.mkOption {
@@ -754,10 +756,9 @@ ${agentBinCases}          *) return 1 ;;
         # (extraArgs, remoteControlName, cwd) can't inject into the tmux
         # command line — the runtime equivalent of lib.escapeShellArg.
         cmd="$(printf '%q' "$bin")"
-        # Codex remote control is a dedicated daemon subcommand, not a TUI
-        # flag (issue 103): `codex remote-control start` runs the app-server
-        # daemon the Codex desktop/mobile apps drive, whereas claude takes a
-        # `--remote-control <name>` flag on its normal TUI. So a
+        # Codex remote control uses a dedicated app-server daemon, not a TUI
+        # flag (issue 103), whereas claude takes a `--remote-control <name>`
+        # flag on its normal TUI. So a
         # remote-controlled codex session runs a DIFFERENT program, handled in
         # its own branch below; every other case keeps the TUI + autonomy flag.
         codex_remote=false
@@ -769,11 +770,11 @@ ${agentBinCases}          *) return 1 ;;
           esac
         fi
         if [ "$codex_remote" = true ]; then
-          # Run the codex remote-control daemon under the foreground
-          # supervisor wrapper (it can't run `remote-control start` directly —
-          # see codexRemoteControl). The wrapper takes the codex binary as its
-          # first arg and forwards the rest to `remote-control start`. The
-          # subcommand rejects --dangerously-bypass-approvals-and-sandbox, so
+          # Run the codex app-server daemon under the foreground supervisor
+          # wrapper (the daemon detaches — see codexRemoteControl). The wrapper
+          # takes the codex binary as its first arg and forwards the rest to
+          # `app-server daemon start`. That subcommand rejects
+          # --dangerously-bypass-approvals-and-sandbox, so
           # honour skipPermissions via the two -c overrides that flag sets
           # (codex's documented config-override path). A bare value that isn't
           # valid TOML is taken as a string literal, so no quoting is needed.

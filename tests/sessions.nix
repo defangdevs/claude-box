@@ -188,10 +188,11 @@
     )
 
     # Codex honours remoteControl (issue 103): with the default
-    # remoteControl=true, a codex session drives the `codex remote-control`
-    # app-server daemon (the mode the Codex apps pair with), NOT the
-    # interactive TUI. The daemon detaches, so the session's foreground
-    # command is the agent-box supervisor wrapper that owns its lifecycle;
+    # remoteControl=true, a codex session starts the local app-server daemon,
+    # enables Remote Control on it, and does NOT run the interactive TUI. The
+    # offline-safe local start matters here because the VM has no Codex login.
+    # The daemon detaches, so the session's foreground command is the agent-box
+    # supervisor wrapper that owns its lifecycle;
     # assert the wrapper runs and passes the autonomy -c overrides (the
     # subcommand rejects the TUI's --dangerously-bypass flag, so skipPermissions
     # rides in as -c approval_policy / sandbox_mode instead).
