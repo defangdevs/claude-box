@@ -51,6 +51,12 @@ let
     - Sessions live in RAM: a reboot loses them, so persist anything worth
       keeping to disk under $HOME. If an agent exits with an error you land in
       a shell for inspection; a clean exit is respawned within ~2s.
+    - A respawn or reboot starts a fresh context, but each agent keeps its own
+      conversation transcripts on disk under $HOME — Claude Code under
+      ~/.claude/projects/ (plus ~/.claude/history.jsonl), Codex under
+      ~/.codex/sessions/. When you resume after a respawn, or take over a
+      session another agent was driving, skim the most recent of these to
+      recover what was in flight before writing any code.
     - sudo is a tight allowlist (essentially caddy reload + self-update), not
       general root — don't plan around arbitrary sudo.
 
