@@ -140,6 +140,27 @@ let
   # into $HOME as ~/downloads so the agent never touches /var/lib directly.
   downloadsDirOf = name: "/var/lib/agent-box-downloads/${name}";
 
+  # Per-user webhook receiver (local-channels local-webhook plugin, issue #101).
+  # One receiver-only daemon per web user owns a UNIX-socket HTTP ingress
+  # (0660 <user>:caddy — same model as the settings socket, issue #49) and fans
+  # HMAC-verified deliveries out to that user's sessions over IPC. Caddy
+  # reverse-proxies the public path /<user>/webhook here WITHOUT auth: GitHub
+  # can't authenticate, so webhook.mjs's per-source HMAC check is the only trust
+  # boundary. State (sources.json + secrets, per-session filters) lives under
+  # the user's home, shared between the daemon and that user's session peers.
+  webhookSocketDir = "/run/agent-box-webhook";
+  webhookSocketOf = name: "${webhookSocketDir}/${name}.sock";
+  webhookStateDirOf = name: "/home/${name}/.local/state/local-webhook";
+  # local-channels pinned by rev+hash, fetched lazily (only forced when
+  # cfg.webhook.enable references it below). Node is stock; webhook.mjs is
+  # dependency-free, so nodejs-slim suffices.
+  localChannelsSrc = builtins.fetchTarball {
+    url = "https://github.com/${cfg.webhook.repo}/archive/${cfg.webhook.rev}.tar.gz";
+    sha256 = cfg.webhook.sha256;
+  };
+  localWebhookScript = "${localChannelsSrc}/local-webhook/webhook.mjs";
+  webhookNode = "${pkgs.nodejs-slim}/bin/node";
+
   # Session-spawn env loader (issue 89). Sessions are (re)created by the
   # long-lived supervisor inside the agent unit, so a unit-level
   # EnvironmentFile= snapshot of the user's env file goes stale the moment
@@ -696,7 +717,16 @@ ${lib.optionalString (installedCodexPackage != [ ]) ''
           seed_json ${home}/.claude/settings.json \
             '.skipDangerousModePermissionPrompt = true'
         fi
-      }
+${lib.optionalString cfg.webhook.enable ''
+        # Webhook channel (issue #101): register the local-channels marketplace
+        # and enable the local-webhook plugin non-interactively, so the session
+        # loads it as an MCP channel with no /plugin prompt. Idempotent (unique).
+        seed_json ${home}/.claude/settings.json \
+          --argjson mkt '{"local-channels":{"source":{"source":"github","repo":"${cfg.webhook.repo}"}}}' \
+          --argjson plug '{"marketplace":"local-channels","plugin":"local-webhook"}' \
+          '.extraKnownMarketplaces = ((.extraKnownMarketplaces // {}) + $mkt)
+           | .enabledPlugins = ((.enabledPlugins // []) + [$plug] | unique)'
+''}      }
 
       agent_bin() {
         case "$1" in
@@ -785,8 +815,20 @@ ${lib.optionalString (agentsMdFile != null) ''
         # nested inspection bash.
         postmortem=" || exec ${pkgs.bashInteractive}/bin/bash"
         [ "$agent" = shell ] && postmortem=""
-        $TMUX new-session -d -s "$sname" -c "$wd" \
-          "${envExecWrapper name} $cmd$postmortem"
+${lib.optionalString cfg.webhook.enable ''
+        # Per-session webhook identity (issue #101). The receiver daemon fans
+        # every verified delivery to all this user's sessions; each keeps its
+        # own subscription filter keyed on LOCAL_WEBHOOK_SESSION, so subs never
+        # leak between sessions. PORT=0 = pure IPC peer (the daemon owns the
+        # ingress). webhook.mjs reads these from its inherited env (the plugin's
+        # .mcp.json declares no env block). printf %q keeps the runtime session
+        # id from breaking the tmux command line.
+        whenv=
+        if [ "$agent" = claude ]; then
+          whenv="${pkgs.coreutils}/bin/env LOCAL_WEBHOOK_SESSION=$(printf '%q' "${name}-$sname") LOCAL_WEBHOOK_STATE_DIR=${webhookStateDirOf name} LOCAL_WEBHOOK_PORT=0 "
+        fi
+''}        $TMUX new-session -d -s "$sname" -c "$wd" \
+          "${envExecWrapper name} ${lib.optionalString cfg.webhook.enable "$whenv"}$cmd$postmortem"
       }
 
       # Reconcile forever; systemd stop tears the whole tree down (ExecStop
@@ -1040,6 +1082,38 @@ in
       };
     };
 
+    webhook = {
+      enable = lib.mkEnableOption ''
+        a per-user webhook receiver (the local-channels local-webhook plugin,
+        issue #101). Each web user (one with a passwordHashFile) gets a
+        receiver-only daemon reached at the UNAUTHENTICATED public path
+        /<user>/webhook, which HMAC-verifies deliveries and fans them out to
+        that user's agent sessions. Requires web.enable (it rides the same
+        per-user Caddy vhost). Off by default'';
+      repo = lib.mkOption {
+        type = lib.types.str;
+        default = "defangdevs/local-channels";
+        description = "GitHub owner/repo of the local-channels plugin marketplace.";
+      };
+      rev = lib.mkOption {
+        type = lib.types.str;
+        default = "5268be274575c35239b90dd2e0187b34319a650d";
+        description = ''
+          Pinned local-channels commit the receiver daemon runs webhook.mjs
+          from (fetched via builtins.fetchTarball). Sessions load the same
+          plugin as a Claude Code channel.
+        '';
+      };
+      sha256 = lib.mkOption {
+        type = lib.types.str;
+        # NOTE: builtins.fetchTarball --unpack hash of the pinned archive.
+        # Placeholder until defangdevs/local-channels is public and the exact
+        # GitHub-archive hash can be confirmed by a real fetch/rebuild.
+        default = "sha256-QIghOraCLYY06h2bW2rhN/w1XgskeHfWkNm929HLOfo=";
+        description = "builtins.fetchTarball hash of the pinned local-channels archive.";
+      };
+    };
+
     spotInterruption = {
       # Defaults to true (not mkEnableOption): the monitor is self-gating and
       # harmless on a non-Spot box, so the safe default is "on" — a Spot box
@@ -1207,6 +1281,9 @@ in
         path = [ "/home/${name}/.nix-profile" config.nix.package ]
           ++ agentRuntimePackages
           ++ [ pkgs.bashInteractive pkgs.coreutils pkgs.git pkgs.gh ]
+          # local-webhook's .mcp.json runs a bare `node` (issue #101); claude
+          # doesn't put one on PATH, so provide one when the channel is on.
+          ++ lib.optional cfg.webhook.enable pkgs.nodejs-slim
           ++ lib.optional (effectiveSudoAllowlist != [ ]) "/run/wrappers";
         # TMUX_TMPDIR puts the control socket under the /run RuntimeDirectory
         # below instead of /tmp. PrivateTmp (in serviceConfig) gives this unit a
@@ -3749,7 +3826,21 @@ in
             }
           }
         }
-        handle /${name}/* {
+${lib.optionalString cfg.webhook.enable ''
+        # ${name}'s webhook receiver (issue #101): the local-webhook daemon's
+        # UNIX-socket ingress, reached UNAUTHENTICATED — GitHub (and most
+        # senders) can't do basic auth, so webhook.mjs's per-source HMAC check
+        # is the trust boundary, not Caddy. MORE specific than /${name}/* below
+        # so Caddy routes it here first, and NO basic_auth (so no 401s for the
+        # fail2ban jail to count). Register this URL in the webhook provider:
+        # https://<domain>/${name}/webhook (a bare POST maps to the default
+        # source; /${name}/webhook/<source> selects a named one). strip_prefix
+        # so /${name}/webhook/github reaches webhook.mjs as /github.
+        handle /${name}/webhook* {
+          uri strip_prefix /${name}/webhook
+          reverse_proxy unix/${webhookSocketOf name}
+        }
+''}        handle /${name}/* {
           @cookie_${name} header_regexp Cookie "(^|; )__Host-agent_box_auth_${name}={$WEB_COOKIE_SECRET_${envName name}}(;|$)"
           handle @cookie_${name} {
             reverse_proxy 127.0.0.1:${toString portOf.${name}}
@@ -3967,7 +4058,11 @@ in
       # even before the user saves any key.
       ++ lib.map (name:
         "d /home/${name}/.config/agent-box 0700 ${name} ${name} - -"
-      ) terminalUsers;
+      ) terminalUsers
+      # Webhook ingress socket dir (issue #101). World-traversable parent; the
+      # per-user socket files themselves are 0660 <user>:caddy, systemd-created
+      # (see systemd.sockets). Only present when webhook.enable is set.
+      ++ lib.optional cfg.webhook.enable "d ${webhookSocketDir} 0755 root root - -";
 
       services.caddy = {
         enable = true;
@@ -4124,7 +4219,44 @@ in
           # selfUpdate enabled it also has the argument-free update trigger.
           NoNewPrivileges = false;
         };
-      }) terminalUsers);
+      }) terminalUsers)
+      # Webhook receiver daemon (issue #101), one per terminal user, gated on
+      # webhook.enable. Runs webhook.mjs in RECEIVER_ONLY mode as the agent
+      # user: owns the socket-activated UNIX ingress (the same-named .socket
+      # below) and fans HMAC-verified deliveries out to that user's sessions
+      # over IPC, with no MCP session of its own.
+      // lib.optionalAttrs cfg.webhook.enable (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-webhook-${name}" {
+        description = "Webhook receiver daemon (local-webhook) for ${name}";
+        after = [ "network-online.target" "agent-box-webhook-${name}.socket" ];
+        requires = [ "agent-box-webhook-${name}.socket" ];
+        wants = [ "network-online.target" ];
+        wantedBy = [ "multi-user.target" ];
+        environment = {
+          LOCAL_WEBHOOK_RECEIVER_ONLY = "1";
+          LOCAL_WEBHOOK_STATE_DIR = webhookStateDirOf name;
+          LOCAL_WEBHOOK_PORT = "0";
+        };
+        serviceConfig = {
+          User = name;
+          Restart = "always";
+          RestartSec = "5s";
+          ExecStart = "${webhookNode} ${localWebhookScript}";
+          # systemd passes the ingress socket on fd 3 (LISTEN_FDS) and wires
+          # stdin to /dev/null; RECEIVER_ONLY tolerates that (no MCP stdio).
+          StandardInput = "null";
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/home/${name}" ];
+          ProtectHome = false;
+          PrivateDevices = true;
+          ProtectKernelTunables = true;
+          ProtectKernelModules = true;
+          ProtectControlGroups = true;
+          RestrictSUIDSGID = true;
+          RestrictRealtime = true;
+          LockPersonality = true;
+          NoNewPrivileges = true;
+        };
+      }) terminalUsers));
 
       # The settings daemon's listening sockets (issue #49). systemd (root)
       # binds each unix socket with exact ownership BEFORE the daemon starts:
@@ -4141,7 +4273,21 @@ in
           SocketGroup = "caddy";
           SocketMode = "0660";
         };
-      }) terminalUsers);
+      }) terminalUsers)
+      # Webhook ingress sockets (issue #101). systemd binds each 0660
+      # <user>:caddy — same isolation as the settings socket — so only that
+      # user and the caddy reverse-proxy can POST; the daemon adopts it via
+      # socket activation (fd 3).
+      // lib.optionalAttrs cfg.webhook.enable (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-webhook-${name}" {
+        description = "Webhook ingress socket for ${name}";
+        wantedBy = [ "sockets.target" ];
+        socketConfig = {
+          ListenStream = webhookSocketOf name;
+          SocketUser = name;
+          SocketGroup = "caddy";
+          SocketMode = "0660";
+        };
+      }) terminalUsers));
     }
   ))
 
