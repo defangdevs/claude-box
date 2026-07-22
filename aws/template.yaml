@@ -660,10 +660,14 @@ Resources:
                   };
                   # Handle Spot interruptions gracefully (issue #20): on the
                   # ~2 min IMDS notice, prompt live agent sessions to persist
-                  # their context, then cleanly stop the agent units. Safe to
-                  # leave on when UseSpot=false — the monitor reads
-                  # instance-life-cycle and exits at once on a non-Spot box.
-                  spotInterruption.enable = true;
+                  # their context, then cleanly stop the agent units. Tied to
+                  # the UseSpot parameter — 'true'/'false' splice verbatim as
+                  # Nix booleans — so on-demand boxes omit the monitor unit
+                  # outright. (The module already defaults this on and the
+                  # monitor self-gates on instance-life-cycle, so leaving it
+                  # enabled on a non-Spot box would also be harmless; wiring it
+                  # to UseSpot just keeps the deployed config honest.)
+                  spotInterruption.enable = ${UseSpot};
                 };
 
               ${Nat64Config}

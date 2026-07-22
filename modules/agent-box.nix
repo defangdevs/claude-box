@@ -64,9 +64,12 @@ let
 
     - Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
       (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
-    - Secrets go in ~/.config/agent-box/env (KEY=value, one per line) or the
-      settings page, and load on the next session (re)start, eg. GH_TOKEN is read
-      automatically, so `git clone https://github.com/...` just works.
+    - Your config lives in the directory ~/.config/agent-box/. Secrets and
+      environment variables go in the file `env` there (KEY=value, one per
+      line; blank lines and `#` comment lines are ignored, so annotate freely)
+      or via the settings page, and load on the next session (re)start — e.g.
+      GH_TOKEN is read automatically, so `git clone https://github.com/...`
+      just works.
     - Manage your own sessions without a rebuild:
       `agent-box-session ls|add|rm|restart`. `add` takes an optional name plus
       `--agent claude|codex|shell` and `--cwd DIR` — handy for fanning out
@@ -1034,28 +1037,41 @@ in
     };
 
     spotInterruption = {
-      enable = lib.mkEnableOption ''
-        graceful handling of EC2 Spot interruptions (issue #20). A small
-        root monitor polls the instance metadata service (IMDS) for a
-        scheduled interruption; when AWS posts one (~2 min notice) it
-        injects a "save your context now" prompt into every live agent
-        session (via tmux send-keys, so it works for any agent CLI —
-        claude, codex, …), waits spotInterruption.gracePeriod for the
-        agents to write continuity notes to disk, then cleanly stops the
-        per-user agent units so a cleanly-exited session is NOT respawned
-        during the shutdown window.
+      # Defaults to true (not mkEnableOption): the monitor is self-gating and
+      # harmless on a non-Spot box, so the safe default is "on" — a Spot box
+      # that forgets to set it must not silently lose agent context (issue #20,
+      # the failure that motivated this). Set false to omit the unit entirely;
+      # aws/template.yaml ties it to the UseSpot parameter for that reason.
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        example = false;
+        description = ''
+          Whether to enable graceful handling of EC2 Spot interruptions
+          (issue #20). A small root monitor polls the instance metadata
+          service (IMDS) for a scheduled interruption; when AWS posts one
+          (~2 min notice) it injects a "save your context now" prompt into
+          every live agent session (via tmux send-keys, so it works for any
+          agent CLI — claude, codex, …), waits spotInterruption.gracePeriod
+          for the agents to write continuity notes to disk, then cleanly
+          stops the per-user agent units so a cleanly-exited session is NOT
+          respawned during the shutdown window.
 
-        It deliberately does NOT power the box off itself. This deployment
-        runs as a PERSISTENT Spot request with interruptionBehavior=stop,
-        and ONLY an AWS-initiated interruption-stop is auto-restarted when
-        capacity returns — a guest-initiated shutdown/stop counts as a
-        MANUAL stop, which AWS leaves stopped until someone starts it by
-        hand. So we let AWS perform the stop (its stop drives a graceful
-        systemd shutdown that flushes buffers anyway) and only prepare for
-        it. Harmless to leave enabled on a non-Spot (on-demand) box: the
-        monitor reads instance-life-cycle at startup and exits immediately
-        when it is not "spot" (or when IMDS is unreachable, e.g. a dev rig).
-      '';
+          It deliberately does NOT power the box off itself. This deployment
+          runs as a PERSISTENT Spot request with interruptionBehavior=stop,
+          and ONLY an AWS-initiated interruption-stop is auto-restarted when
+          capacity returns — a guest-initiated shutdown/stop counts as a
+          MANUAL stop, which AWS leaves stopped until someone starts it by
+          hand. So we let AWS perform the stop (its stop drives a graceful
+          systemd shutdown that flushes buffers anyway) and only prepare for
+          it.
+
+          Defaults to true and is harmless to leave enabled on a non-Spot
+          (on-demand) box: the monitor reads instance-life-cycle at startup
+          and exits immediately when it is not "spot" (or when IMDS is
+          unreachable, e.g. a dev rig).
+        '';
+      };
 
       gracePeriod = lib.mkOption {
         type = lib.types.ints.unsigned;
@@ -3902,21 +3918,28 @@ in
             sf="/home/$u/.config/agent-box/sessions.json"
             user_tmux "$u" list-sessions -F '#{session_name}' 2>/dev/null \
             | while IFS= read -r s; do
-                # Skip "shell" pseudo-agent sessions: text typed into a
-                # shell would run as a command, not read as a note.
                 agent=$($JQ -r --arg s "$s" \
                   '.sessions[$s].agent // ""' "$sf" 2>/dev/null)
-                [ "$agent" = shell ] && continue
-                # A single Escape interrupts any in-flight generation/tool
-                # call so the notice is handled NOW instead of queued behind
-                # a long operation that may outlast the ~2 min window. Only
-                # one — a double Escape opens claude's history picker. Then a
-                # short settle before typing: sent too fast, the TUI (still
-                # returning to its prompt) swallows the first characters.
                 # Target "=NAME:" — an EXACT session match resolved to its
                 # active pane. Bare "=NAME" is a session target that send-keys
                 # rejects as a pane ("can't find pane"); plain "NAME" would
                 # prefix-match (session "dev" could hit "devs").
+                if [ "$agent" = shell ]; then
+                  # A shell EXECUTES typed text as a command, so prefix '#' to
+                  # make the notice a harmless no-op comment the operator still
+                  # sees in scrollback. No Escape: there is no in-flight
+                  # generation to interrupt in a shell, and Escape+'#' would
+                  # trigger readline's meta bindings.
+                  user_tmux "$u" send-keys -t "=$s:" -l -- "# $MSG" \
+                    && user_tmux "$u" send-keys -t "=$s:" Enter
+                  continue
+                fi
+                # Agent session. A single Escape interrupts any in-flight
+                # generation/tool call so the notice is handled NOW instead of
+                # queued behind a long operation that may outlast the ~2 min
+                # window. Only one — a double Escape opens claude's history
+                # picker. Then a short settle before typing: sent too fast, the
+                # TUI (still returning to its prompt) swallows the first chars.
                 user_tmux "$u" send-keys -t "=$s:" Escape
                 sleep 1
                 # -l types MSG literally; a separate Enter submits it.
