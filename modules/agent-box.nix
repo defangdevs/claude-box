@@ -70,15 +70,19 @@ let
       (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
     - Your config lives in the directory ~/.config/agent-box/. Secrets and
       environment variables go in the file `env` there (KEY=value, one per
-      line; blank lines and `#` comment lines are ignored, so annotate freely)
-      or via the settings page, and load on the next session (re)start — e.g.
-      GH_TOKEN is read automatically, so `git clone https://github.com/...`
-      just works.
+      line; blank lines and `#` comment lines are ignored, so annotate freely).
+      Set them with `agent-box-session env set KEY VALUE` (or `env ls` /
+      `env rm KEY`, or the settings page); they load on the next session
+      (re)start — e.g. GH_TOKEN is read automatically, so
+      `git clone https://github.com/...` just works.
     - Manage your own sessions without a rebuild:
       `agent-box-session ls|add|rm|restart`. `add` takes an optional name plus
-      `--agent claude|codex|shell` and `--cwd DIR` — handy for fanning out
-      work, spinning up a second reviewer agent, or opening a plain shell for
-      investigation. Listed sessions start within ~2s.
+      `--agent claude|codex|shell`, `--cwd DIR`, and `--prompt "TASK"` to kick
+      the session off on a task — handy for fanning out work, spinning up a
+      second reviewer agent, or opening a plain shell. The kickoff prompt fires
+      once; if that session is later respawned (crash, reboot, Spot restart) the
+      supervisor resumes its prior transcript instead of redoing the work.
+      `restart --all` bounces every session. Listed sessions start within ~2s.
 
     ## Handing a file to the user
 
@@ -116,6 +120,24 @@ let
     `sudo systemctl start agent-box-update.service`
     (kills the running tmux session — save context first).
   '';
+  # The canonical guide is published READ-ONLY under /etc (see
+  # environment.etc below) rather than seeded into $HOME. environment.etc
+  # symlinks are relinked by `nixos-rebuild switch` — which the self-update
+  # service runs — so this path always reflects the CURRENT module, while the
+  # editable ~/AGENTS.md the agent owns is never clobbered. The full content
+  # (built-in default + per-user addendum) lives here so both the etc entry
+  # and any tooling share one definition; per-user because the addendum is
+  # per-user and environment.etc is global. null (agentsMd = null) opts out.
+  canonicalAgentsMd = name: u:
+    if u.agentsMd == null then null
+    else pkgs.writeText "agent-box-${name}-agents.md"
+      (defaultAgentsMd
+        + lib.optionalString (builtins.match "[[:space:]]*" u.agentsMd == null)
+          "\n${u.agentsMd}");
+  # Stable read-only path the seeded ~/AGENTS.md @imports. Refreshed on every
+  # `nixos-rebuild switch` (i.e. every box update); readable but not writable
+  # under ProtectSystem=strict.
+  canonicalAgentsPath = name: "/etc/agent-box/AGENTS.${name}.md";
   tmuxSocketName = "agent-box";
   runtimeDirectory = name: "agent-box-${name}";
   # ttyd port base; ports are assigned in sorted user-name order (see
@@ -230,6 +252,10 @@ let
       main = {
         inherit (u) agent skipPermissions remoteControl remoteControlName extraArgs;
         inherit (u) workingDirectory;
+        # No legacy top-level equivalents — the single "main" session just
+        # starts interactively and resumes on respawn like any other.
+        initialPrompt = null;
+        resumePrompt = null;
       };
     };
   sessionsSeedFile = name: u:
@@ -244,6 +270,12 @@ let
         workingDirectory =
           if s.workingDirectory != null then s.workingDirectory
           else "/home/${name}";
+        # Runtime state the supervisor manages; seeded so a declared kickoff
+        # prompt fires once and hasRun exists from the start.
+        initialPrompt = s.initialPrompt;
+        resumePrompt = s.resumePrompt;
+        boxSessionId = null;
+        hasRun = false;
       }) (seedSessions name u);
     });
   userSessionsFile = name: "/home/${name}/.config/agent-box/sessions.json";
@@ -263,15 +295,24 @@ let
     t() { ${pkgs.tmux}/bin/tmux -L ${tmuxSocketName} "$@"; }
     usage() {
       echo "usage: agent-box-session ls"
-      echo "       agent-box-session add [NAME] [--agent AGENT] [--cwd DIR] [-- EXTRA_ARGS...]"
+      echo "       agent-box-session add [NAME] [--agent AGENT] [--cwd DIR]"
+      echo "                             [--prompt TEXT] [--resume-prompt TEXT] [-- EXTRA_ARGS...]"
       echo "       agent-box-session rm NAME"
-      echo "       agent-box-session restart NAME"
+      echo "       agent-box-session restart NAME | --all"
+      echo "       agent-box-session env ls | set KEY VALUE | rm KEY"
       echo "agents: $AGENTS (default: $DEFAULT_AGENT)"
+      echo "--prompt kicks the session off with a task (first spawn only); a later"
+      echo "respawn resumes the prior transcript instead of redoing it."
       echo "Listed sessions are (re)started by the per-user supervisor within ~2s."
       echo "Attach: tmux -L ${tmuxSocketName} attach -t NAME, or the browser terminal /<user>/?arg=NAME"
     }
     valid_name() {
       case "$1" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
+    }
+    valid_key() {
+      # env var name charset — mirrors the settings daemon's KEY_RE and the
+      # env-exec wrapper: letters/digits/underscore, not starting with a digit.
+      case "$1" in (*[!A-Za-z0-9_]*|""|[0-9]*) return 1 ;; esac
     }
     ensure_file() {
       mkdir -p "$(dirname "$FILE")"
@@ -329,11 +370,13 @@ let
           ""|-*) ;;
           *) name="$1"; shift; valid_name "$name" || { usage >&2; exit 2; } ;;
         esac
-        agent="$DEFAULT_AGENT"; cwd=""
+        agent="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
         while [ $# -gt 0 ]; do
           case "$1" in
             --agent) agent="''${2:?--agent needs a value}"; shift 2 ;;
             --cwd) cwd="''${2:?--cwd needs a value}"; shift 2 ;;
+            --prompt) prompt="''${2?--prompt needs a value}"; has_prompt=1; shift 2 ;;
+            --resume-prompt) rprompt="''${2?--resume-prompt needs a value}"; has_rprompt=1; shift 2 ;;
             --) shift; break ;;
             *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
           esac
@@ -348,15 +391,30 @@ let
           echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
           exit 2
         fi
+        # The stable box-session id we own across respawns (Claude --session-id /
+        # --resume; Codex transcript marker). Minted here so it's set before the
+        # first spawn; the supervisor mints one too for legacy sessions.
+        bid=""
+        [ -r /proc/sys/kernel/random/uuid ] && read -r bid < /proc/sys/kernel/random/uuid || true
         # `--` after --args: jq otherwise still option-parses positional
         # args, so a dashed extra arg like --model would error out.
         jq_edit --arg n "$name" --arg a "$agent" --arg c "$cwd" \
+          --arg p "$prompt" --arg pp "$has_prompt" \
+          --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
           '.sessions[$n] = {agent: $a, skipPermissions: true, remoteControl: true,
                             remoteControlName: null,
                             workingDirectory: (if $c == "" then null else $c end),
-                            extraArgs: $ARGS.positional}' \
+                            extraArgs: $ARGS.positional,
+                            initialPrompt: (if $pp == "1" then $p else null end),
+                            resumePrompt: (if $rpp == "1" then $rp else null end),
+                            boxSessionId: (if $bid == "" then null else $bid end),
+                            hasRun: false}' \
           --args -- "$@"
-        echo "session '$name' ($agent) added — the supervisor starts it within ~2s"
+        if [ "$has_prompt" = 1 ]; then
+          echo "session '$name' ($agent) added with a kickoff prompt — the supervisor starts it within ~2s"
+        else
+          echo "session '$name' ($agent) added — the supervisor starts it within ~2s"
+        fi
         ;;
       rm)
         name="''${1:-}"
@@ -367,10 +425,76 @@ let
         echo "session '$name' removed"
         ;;
       restart)
-        name="''${1:-}"
-        valid_name "$name" || { usage >&2; exit 2; }
-        t kill-session -t "=$name"
-        echo "session '$name' killed — the supervisor restarts it within ~2s if still listed"
+        if [ "''${1:-}" = "--all" ]; then
+          ensure_file
+          "$JQ" -r '.sessions | keys[]' "$FILE" | while IFS= read -r n; do
+            [ -n "$n" ] && t kill-session -t "=$n" 2>/dev/null || true
+          done
+          echo "all sessions killed — the supervisor restarts each within ~2s (re-reading env)"
+        else
+          name="''${1:-}"
+          valid_name "$name" || { usage >&2; exit 2; }
+          t kill-session -t "=$name"
+          echo "session '$name' killed — the supervisor restarts it within ~2s if still listed"
+        fi
+        ;;
+      env)
+        # Manages the same ~/.config/agent-box/env the settings page writes and
+        # the env-exec wrapper reads at every session spawn. Applies on the next
+        # (re)start — see 'restart'. ls shows KEYS only, never values (matching
+        # the settings page, which never surfaces a stored secret).
+        ENV_FILE="$HOME/.config/agent-box/env"
+        env_header() {
+          printf '# Managed by agent-box settings page. KEY=value, one per line.\n'
+          printf '# Do not add secrets by hand here unless you know what you are doing.\n'
+        }
+        env_rewrite() {
+          # env_rewrite DROP_KEY [APPEND_KEY APPEND_VALUE] — atomically rewrite
+          # ENV_FILE dropping DROP_KEY, keeping every other valid KEY=value, then
+          # optionally appending a fresh pair.
+          mkdir -p "$(dirname "$ENV_FILE")"
+          tmp="$(mktemp "$ENV_FILE.XXXXXX")"
+          { env_header
+            if [ -f "$ENV_FILE" ]; then
+              while IFS= read -r line; do
+                case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
+                ek="''${line%%=*}"
+                valid_key "$ek" || continue
+                [ "$ek" = "$1" ] && continue
+                printf '%s\n' "$line"
+              done < "$ENV_FILE"
+            fi
+            if [ $# -ge 3 ]; then printf '%s=%s\n' "$2" "$3"; fi
+          } > "$tmp"
+          chmod 600 "$tmp"; mv "$tmp" "$ENV_FILE"
+        }
+        sub="''${1:-}"; shift || true
+        case "$sub" in
+          ls)
+            [ -f "$ENV_FILE" ] || exit 0
+            while IFS= read -r line; do
+              case "$line" in ('#'*|"") continue ;; (*=*) ;; (*) continue ;; esac
+              k="''${line%%=*}"
+              valid_key "$k" && printf '%s\n' "$k"
+            done < "$ENV_FILE" | sort -u
+            ;;
+          set)
+            k="''${1:-}"; v="''${2-}"
+            valid_key "$k" || { echo "invalid key '$k' (use letters, digits, underscore; not starting with a digit)" >&2; exit 2; }
+            case "$v" in (*"
+"*) echo "value may not contain a newline" >&2; exit 2 ;; esac
+            env_rewrite "$k" "$k" "$v"
+            echo "env '$k' set — applies on the next session (re)start ('agent-box-session restart --all')"
+            ;;
+          rm)
+            k="''${1:-}"
+            valid_key "$k" || { usage >&2; exit 2; }
+            [ -f "$ENV_FILE" ] || exit 0
+            env_rewrite "$k"
+            echo "env '$k' removed — applies on the next session (re)start ('agent-box-session restart --all')"
+            ;;
+          *) usage >&2; exit 2 ;;
+        esac
         ;;
       *)
         usage >&2
@@ -431,6 +555,26 @@ let
         type = lib.types.listOf lib.types.str;
         default = [ ];
         description = "Extra arguments appended to this session's agent invocation.";
+      };
+      initialPrompt = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Kickoff prompt handed to the agent on the FIRST spawn only (passed
+          as the harness's positional prompt argument). The supervisor clears
+          it after that first launch, so a respawn resumes the prior
+          transcript instead of redoing the task. Ignored for shell sessions.
+        '';
+      };
+      resumePrompt = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = ''
+          Prompt used when the supervisor RESUMES this session after any
+          respawn (crash, reboot, Spot stop→restart). Null uses a built-in
+          steer that continues unfinished work or stops if it was already
+          done. Ignored for shell sessions.
+        '';
       };
     };
   };
@@ -632,26 +776,39 @@ let
       # always resolvable, independent of installAgents.
       + "          shell) printf '%s\\n' ${lib.escapeShellArg (utils.toShellPath config.users.users.${name}.shell)} ;;\n";
       # AGENTS.md — cross-vendor agent-instructions file (codex, opencode
-      # native; claude-code as CLAUDE.md fallback). Content lives in the Nix
-      # store so no in-shell quoting; $AGENT_BOX_URL and other $refs in the
-      # content stay literal for the agent to expand at read time. Seeded
-      # per session in start_session below.
-      # null opts out entirely; otherwise seed the built-in default with the
-      # per-user addendum appended. A whitespace-only addendum (incl. the ""
-      # default and the lone "\n" that aws/template.yaml's block-scalar splice
-      # yields for an empty AgentsMd) appends nothing — the base is seeded as-is.
-      agentsMdFile =
+      # native; claude-code as CLAUDE.md fallback). What we SEED into $HOME is
+      # deliberately minimal and EDITABLE: a short notes header plus a claude
+      # `@import` of the read-only canonical guide at canonicalAgentsPath, so
+      # the up-to-date guidance is pulled in at load time without ever
+      # overwriting the agent's own edits. The canonical file itself is
+      # published via environment.etc and refreshed on every box update.
+      # null (agentsMd = null) opts out of seeding entirely.
+      # NOTE: claude-code expands `@path` imports; codex does not, so on a
+      # codex session the import line shows literally — the guide then has to
+      # be read explicitly from canonicalAgentsPath.
+      agentsMdPointer =
         if u.agentsMd == null then null
-        else pkgs.writeText "agent-box-${name}-agents.md"
-          (defaultAgentsMd
-            + lib.optionalString (builtins.match "[[:space:]]*" u.agentsMd == null)
-              "\n${u.agentsMd}");
+        else pkgs.writeText "agent-box-${name}-agents-pointer.md" ''
+          # agent-box — your notes
+
+          This file is yours to edit; anything you add here persists across
+          restarts. The canonical agent-box guide (environment, secrets,
+          serving files, self-update) is read-only and auto-updated on every
+          box update — it is imported below and also readable directly at
+          ${canonicalAgentsPath name}.
+
+          @${canonicalAgentsPath name}
+        '';
     in
     pkgs.writeShellScript "agent-box-${name}-start" ''
       set -u
       JQ=${pkgs.jq}/bin/jq
       TMUX="${pkgs.tmux}/bin/tmux -L ${tmuxSocketName}"
       SESSIONS_FILE=${lib.escapeShellArg (userSessionsFile name)}
+      # grep/find are NOT on the unit PATH (see the service's `path`); the
+      # transcript lookups below reference them by store path, as with jq/tmux.
+      GREP=${pkgs.gnugrep}/bin/grep
+      FIND=${pkgs.findutils}/bin/find
 
       # First boot only: seed the Nix-declared sessions. The file is RUNTIME
       # data afterwards — a rebuild must never clobber sessions the user
@@ -717,6 +874,58 @@ ${agentBinCases}          *) return 1 ;;
         esac
       }
 
+      # Deliver-once + resume bookkeeping. A session's kickoff prompt
+      # (initialPrompt) must fire on the FIRST spawn only; every later respawn
+      # (crash, clean exit, reboot, Spot stop→restart — all of which keep the
+      # on-disk transcript because /home is the persistent root EBS volume)
+      # must RESUME the prior transcript instead of redoing the task. We fold
+      # that state into sessions.json rather than a side file: after the first
+      # spawn mark_started sets hasRun, records the (possibly freshly minted)
+      # boxSessionId, and clears initialPrompt. boxSessionId is the STABLE id
+      # WE own across respawns — Claude consumes it directly as --session-id /
+      # --resume; for Codex (which mints its own id) we stamp it into the
+      # kickoff prompt so the transcript is findable by content (codex_rollout_uuid).
+      mark_started() {
+        # mark_started SESSION BOXID — best-effort; a failed rewrite just means
+        # the prompt re-fires next spawn, never a crash.
+        _tmp="$(mktemp "$SESSIONS_FILE.XXXXXX")" || return 0
+        if $JQ --arg s "$1" --arg b "$2" \
+             '(.sessions[$s]) |= (.hasRun = true | .boxSessionId = $b | .initialPrompt = null)' \
+             "$SESSIONS_FILE" > "$_tmp" 2>/dev/null; then
+          mv "$_tmp" "$SESSIONS_FILE"
+        else
+          rm -f "$_tmp"
+        fi
+      }
+
+      claude_has_transcript() {
+        # True when Claude has a saved conversation for this session id, so we
+        # can safely --resume it; else the caller starts fresh with --session-id
+        # (same id) instead of erroring on an unknown --resume target.
+        [ -n "$1" ] || return 1
+        $FIND ${home}/.claude/projects -maxdepth 3 -name "$1.jsonl" 2>/dev/null \
+          | $GREP -q .
+      }
+
+      codex_rollout_uuid() {
+        # Echo the Codex session UUID whose rollout transcript carries our
+        # "[agent-box session <boxid>]" marker (newest wins if a prior resume
+        # forked the rollout). Empty when none match — the caller then starts a
+        # FRESH codex session rather than risk `resume --last` grabbing a
+        # sibling session's transcript in a shared working directory.
+        [ -n "$1" ] || return 0
+        d=${home}/.codex/sessions
+        [ -d "$d" ] || return 0
+        f="$($GREP -rlF "agent-box session $1" "$d" 2>/dev/null \
+              | while IFS= read -r p; do printf '%s\t%s\n' "$(stat -c %Y "$p" 2>/dev/null)" "$p"; done \
+              | sort -rn | head -n1 | cut -f2-)"
+        [ -n "$f" ] || return 0
+        b="''${f##*/}"; b="''${b%.jsonl}"
+        # rollout-<date>T<time>-<uuid>.jsonl: the UUID is the fixed trailing 36
+        # chars (8-4-4-4-12), robust against the dashes inside the timestamp.
+        printf '%s' "''${b: -36}"
+      }
+
       start_session() {
         sname=$1
         sjson="$($JQ -c --arg s "$sname" '.sessions[$s] // empty' "$SESSIONS_FILE")" || return 0
@@ -731,40 +940,116 @@ ${agentBinCases}          *) return 1 ;;
         skip="$($JQ -r 'if .skipPermissions == false then "false" else "true" end' <<<"$sjson")"
         rc="$($JQ -r 'if .remoteControl == false then "false" else "true" end' <<<"$sjson")"
         rcname="$($JQ -r '.remoteControlName // empty' <<<"$sjson")"
-        # Build the command with printf %q so runtime-provided fields
-        # (extraArgs, remoteControlName, cwd) can't inject into the tmux
-        # command line — the runtime equivalent of lib.escapeShellArg.
-        cmd="$(printf '%q' "$bin")"
-        if [ "$skip" = true ]; then
-          case "$agent" in
-            claude) cmd="$cmd --dangerously-skip-permissions" ;;
-            codex) cmd="$cmd --dangerously-bypass-approvals-and-sandbox" ;;
-          esac
+        ip="$($JQ -r '.initialPrompt // ""' <<<"$sjson")"
+        rp="$($JQ -r '.resumePrompt // ""' <<<"$sjson")"
+        bid="$($JQ -r '.boxSessionId // ""' <<<"$sjson")"
+        hasrun="$($JQ -r 'if .hasRun == true then "true" else "false" end' <<<"$sjson")"
+        # Mint the stable box-session id on the first spawn if the file doesn't
+        # carry one (legacy/seed sessions, hand-edited files). /proc/.../uuid is
+        # the kernel's UUID source — a bash `read`, so nothing on PATH is needed
+        # and the value is a valid UUID for Claude's --session-id.
+        if [ -z "$bid" ] && [ -r /proc/sys/kernel/random/uuid ]; then
+          read -r bid < /proc/sys/kernel/random/uuid || bid=
         fi
-        if [ "$agent" = claude ] && [ "$rc" = true ]; then
-          if [ -z "$rcname" ]; then
-            # Host suffix for the derived "<user>-<session>@<host>" name.
-            # ${hostLabel} is baked at build time: remoteControlHost if set
-            # (the CloudFormation stack name on the AWS image), else the
-            # public web.domain — the address the box is actually reachable
-            # at. Fall back to the live kernel hostname only if both are
-            # empty; that kernel name is the INTERNAL fqdn on a cloud box
-            # (ip-10-x-x-x.<region>.compute.internal), which is why the public
-            # web.domain is preferred above it. Drop "@<host>" entirely when
-            # even the kernel name is empty rather than emitting a dangling
-            # "@". read is a bash builtin, so this needs nothing on PATH.
-            host=${hostLabel}
-            if [ -z "$host" ] && [ -r /proc/sys/kernel/hostname ]; then
-              read -r host < /proc/sys/kernel/hostname || host=
-            fi
-            rcname=${name}-$sname
-            [ -z "$host" ] || rcname="$rcname@$host"
+        # Resume on every respawn (hasRun already set); the kickoff prompt fires
+        # only on the very first spawn. The default resume steer both continues
+        # unfinished work AND lets an already-finished task exit instead of
+        # looping — resumePrompt overrides it per session.
+        resuming=false; prompt="$ip"
+        if [ "$hasrun" = true ]; then
+          resuming=true
+          if [ -n "$rp" ]; then
+            prompt="$rp"
+          else
+            prompt="You were interrupted and automatically restarted (agent-box session $bid). Your previous transcript for this session has been resumed — review what you had already done, verify the current state, and continue from where you left off. If that work was already complete, say so briefly and stop rather than redoing it."
           fi
-          cmd="$cmd --remote-control $(printf '%q' "$rcname")"
         fi
-        while IFS= read -r xarg; do
-          cmd="$cmd $(printf '%q' "$xarg")"
-        done < <($JQ -r '.extraArgs // [] | .[]' <<<"$sjson")
+
+        # Build the command with printf %q so runtime-provided fields
+        # (extraArgs, remoteControlName, cwd, prompts, ids) can't inject into
+        # the tmux command line — the runtime equivalent of lib.escapeShellArg.
+        cmd="$(printf '%q' "$bin")"
+        # extraArgs are appended by every branch below.
+        append_extra() {
+          while IFS= read -r xarg; do
+            cmd="$cmd $(printf '%q' "$xarg")"
+          done < <($JQ -r '.extraArgs // [] | .[]' <<<"$sjson")
+        }
+        case "$agent" in
+          claude)
+            [ "$skip" = true ] && cmd="$cmd --dangerously-skip-permissions"
+            if [ "$rc" = true ]; then
+              if [ -z "$rcname" ]; then
+                # Host suffix for the derived "<user>-<session>@<host>" name.
+                # ${hostLabel} is baked at build time: remoteControlHost if set
+                # (the CloudFormation stack name on the AWS image), else the
+                # public web.domain — the address the box is actually reachable
+                # at. Fall back to the live kernel hostname only if both are
+                # empty; that kernel name is the INTERNAL fqdn on a cloud box
+                # (ip-10-x-x-x.<region>.compute.internal), which is why the public
+                # web.domain is preferred above it. Drop "@<host>" entirely when
+                # even the kernel name is empty rather than emitting a dangling
+                # "@". read is a bash builtin, so this needs nothing on PATH.
+                host=${hostLabel}
+                if [ -z "$host" ] && [ -r /proc/sys/kernel/hostname ]; then
+                  read -r host < /proc/sys/kernel/hostname || host=
+                fi
+                rcname=${name}-$sname
+                [ -z "$host" ] || rcname="$rcname@$host"
+              fi
+              cmd="$cmd --remote-control $(printf '%q' "$rcname")"
+            fi
+            # Our own id: --resume it on respawn (exact, so concurrent sessions
+            # never cross), but only when a transcript actually exists — else
+            # reuse it as a fresh --session-id rather than erroring on resume.
+            if [ -n "$bid" ]; then
+              if [ "$resuming" = true ] && claude_has_transcript "$bid"; then
+                cmd="$cmd --resume $(printf '%q' "$bid")"
+              else
+                cmd="$cmd --session-id $(printf '%q' "$bid")"
+              fi
+            fi
+            append_extra
+            [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
+            ;;
+          codex)
+            if [ "$resuming" = true ]; then
+              # Find THIS session's transcript by our injected marker. A concrete
+              # match → resume it; no match → start fresh (never `resume --last`,
+              # which could grab a sibling session's transcript in a shared cwd).
+              target="$(codex_rollout_uuid "$bid")"
+              if [ -n "$target" ]; then
+                cmd="$cmd resume"
+                [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+                append_extra
+                cmd="$cmd $(printf '%q' "$target")"
+                [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
+              else
+                [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+                append_extra
+                [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "[agent-box session $bid] $prompt")"
+              fi
+            else
+              [ "$skip" = true ] && cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
+              append_extra
+              # Stamp the box id into the kickoff prompt so the transcript is
+              # findable on resume; skip the stamp when there's no prompt (an
+              # interactive session with no task shouldn't burn an opening turn).
+              if [ -n "$prompt" ]; then
+                cmd="$cmd $(printf '%q' "[agent-box session $bid] $prompt")"
+              fi
+            fi
+            ;;
+          shell)
+            append_extra
+            ;;
+          *)
+            # Unknown/future harness: pass the prompt positionally (the common
+            # convention) but skip id/resume wiring we can't verify.
+            append_extra
+            [ -n "$prompt" ] && cmd="$cmd $(printf '%q' "$prompt")"
+            ;;
+        esac
         if [ "$agent" = claude ]; then
           # Upstream claude-code bug: the client persists only
           # channelsEnabled to ~/.claude/remote-settings.json, losing the
@@ -774,14 +1059,14 @@ ${agentBinCases}          *) return 1 ;;
           rm -f ${home}/.claude/remote-settings.json
           seed_claude_state "$wd" "$skip"
         fi
-${lib.optionalString (agentsMdFile != null) ''
-        # Seed AGENTS.md into the session's working directory IFF absent, so
-        # the agent's own edits or a repo checkout there never get clobbered.
-        # Not for shell sessions: no agent reads it there, and scratch dirs
-        # shouldn't get littered.
+${lib.optionalString (agentsMdPointer != null) ''
+        # Seed the minimal editable AGENTS.md (which @imports the read-only
+        # canonical guide) IFF absent, so the agent's own edits or a repo
+        # checkout there never get clobbered. Not for shell sessions: no agent
+        # reads it there, and scratch dirs shouldn't get littered.
         if [ "$agent" != shell ] && [ ! -e "$wd/AGENTS.md" ]; then
           mkdir -p "$wd"
-          install -m 0644 ${agentsMdFile} "$wd/AGENTS.md"
+          install -m 0644 ${agentsMdPointer} "$wd/AGENTS.md"
         fi
 ''}        # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
         # time, not unit start — then execs the agent (issue 89), so
@@ -796,8 +1081,12 @@ ${lib.optionalString (agentsMdFile != null) ''
         # nested inspection bash.
         postmortem=" || exec ${pkgs.bashInteractive}/bin/bash"
         [ "$agent" = shell ] && postmortem=""
-        $TMUX new-session -d -s "$sname" -c "$wd" \
-          "${envExecWrapper name} $cmd$postmortem"
+        if $TMUX new-session -d -s "$sname" -c "$wd" \
+             "${envExecWrapper name} $cmd$postmortem"; then
+          # First spawn only: persist the id + hasRun and consume the kickoff
+          # prompt, so the next respawn resumes instead of redoing the task.
+          [ "$resuming" = true ] || mark_started "$sname" "$bid"
+        fi
       }
 
       # Reconcile forever; systemd stop tears the whole tree down (ExecStop
@@ -1212,6 +1501,18 @@ in
     }) cfg.users;
 
     environment.systemPackages = agentRuntimePackages;
+
+    # Canonical, read-only agent guide per user at /etc/agent-box/AGENTS.<user>.md.
+    # environment.etc symlinks are relinked by `nixos-rebuild switch` (which the
+    # self-update service runs), so this always tracks the current module while
+    # the seeded ~/AGENTS.md — which @imports this path — stays editable. Skipped
+    # for users that opted out of seeding (agentsMd = null).
+    environment.etc = lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (name: u:
+      lib.optional (u.agentsMd != null) (lib.nameValuePair "agent-box/AGENTS.${name}.md" {
+        source = canonicalAgentsMd name u;
+        mode = "0444";
+      })
+    ) cfg.users));
 
     systemd.services = lib.mapAttrs' (name: u:
       lib.nameValuePair "agent-box-${name}" {
@@ -2443,6 +2744,10 @@ in
                   </span>
                   <button type="submit" class="btn">Add session</button>
                 </div>
+                <div class="row">
+                  <textarea name="prompt" rows="2"
+                            placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
+                </div>
                 <p class="note">Working directory &mdash; where the agent
                 starts. Defaults to your home directory (<code>~</code>); type
                 to browse folders one level at a time.</p>
@@ -2481,6 +2786,10 @@ in
                 <ul class="ac" hidden></ul>
               </span>
               <button type="submit" class="btn">Add session</button>
+            </div>
+            <div class="row">
+              <textarea name="prompt" rows="2"
+                        placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
             </div>
             <p class="note">Working directory &mdash; where the agent starts.
             Defaults to your home directory (<code>~</code>); type to browse
@@ -3572,6 +3881,10 @@ in
                     except ValueError as exc:
                         self._send_html(render(str(exc)), status=400)
                         return
+                    # Optional kickoff prompt (first spawn only; the supervisor
+                    # clears it and resumes on later respawns). boxSessionId is
+                    # left null so the supervisor mints a real UUID at spawn.
+                    prompt = form.get("prompt", [""])[0].strip()
                     sessions = read_sessions()
                     # The name is always auto-derived from the agent — there is no
                     # name field in the form. Users rarely care what a session is
@@ -3586,6 +3899,10 @@ in
                         "remoteControlName": None,
                         "workingDirectory": cwd,
                         "extraArgs": [],
+                        "initialPrompt": prompt or None,
+                        "resumePrompt": None,
+                        "boxSessionId": None,
+                        "hasRun": False,
                     }
                     write_sessions(sessions)
                     # On the workspace, land on the new session's tab (gen_session_name

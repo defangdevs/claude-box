@@ -303,6 +303,55 @@
         "/home/agent/.config/agent-box/sessions.json"
     )
 
+    # --- kickoff prompt: fires once, then resumes -------------------------
+    sfile = "/home/agent/.config/agent-box/sessions.json"
+    with subtest("kickoff prompt is delivered once and consumed"):
+        machine.succeed(
+            "su -s /bin/sh agent -c "
+            + shlex.quote("agent-box-session add task1 --agent codex --prompt 'do the thing'")
+        )
+        # Stored as initialPrompt with an id minted up front; not yet run.
+        machine.succeed(
+            f"jq -e '.sessions.task1.initialPrompt == \"do the thing\"' {sfile}"
+        )
+        machine.succeed(
+            f"jq -e '.sessions.task1.hasRun == false and (.sessions.task1.boxSessionId | type == \"string\")' {sfile}"
+        )
+        # Once the supervisor spawns it, the prompt is consumed and hasRun set,
+        # so a later respawn resumes instead of re-running the task.
+        machine.wait_until_succeeds(tmux("has-session -t =task1"), timeout=60)
+        machine.wait_until_succeeds(
+            f"jq -e '.sessions.task1.hasRun == true and .sessions.task1.initialPrompt == null' {sfile}",
+            timeout=60,
+        )
+        # A respawn must NOT re-prime the kickoff prompt.
+        machine.succeed(tmux("kill-session -t =task1"))
+        machine.succeed("sleep 6")
+        machine.succeed(
+            f"jq -e '.sessions.task1.initialPrompt == null and .sessions.task1.hasRun == true' {sfile}"
+        )
+        machine.succeed("su -s /bin/sh agent -c 'agent-box-session rm task1'")
+
+    # --- env CLI writes the same file the settings page + wrapper use -----
+    with subtest("env set/ls/rm on ~/.config/agent-box/env"):
+        machine.succeed("su -s /bin/sh agent -c 'agent-box-session env set MY_TOKEN sekret'")
+        machine.succeed("grep -qx 'MY_TOKEN=sekret' /home/agent/.config/agent-box/env")
+        machine.succeed("stat -c '%a' /home/agent/.config/agent-box/env | grep -x 600")
+        env_ls = machine.succeed("su -s /bin/sh agent -c 'agent-box-session env ls'")
+        # ls surfaces the KEY but never the value (mirrors the settings page).
+        assert "MY_TOKEN" in env_ls and "sekret" not in env_ls, env_ls
+        machine.succeed("su -s /bin/sh agent -c 'agent-box-session env rm MY_TOKEN'")
+        machine.fail("grep -q MY_TOKEN /home/agent/.config/agent-box/env")
+
+    # --- restart --all bounces every listed session -----------------------
+    with subtest("restart --all"):
+        old_all = machine.succeed(tmux('display -p -t "=main:" "#{pane_pid}"')).strip()
+        machine.succeed("su -s /bin/sh agent -c 'agent-box-session restart --all'")
+        machine.wait_until_succeeds(
+            tmux('display -p -t "=main:" "#{pane_pid}"') + f" | grep . | grep -vx '{old_all}'",
+            timeout=60,
+        )
+
     # --- web surface -------------------------------------------------------
     machine_ip = machine.succeed("ip -4 -o addr show eth1 | head -1").split()[3].split("/")[0]
     curl = f"curl -sk --resolve box.test:443:{machine_ip}"
@@ -360,6 +409,27 @@
         f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
         "-d 'name=claude' "
         "https://box.test/sessions/delete | grep -x 303"
+    )
+    machine.succeed("sleep 6")
+    machine.fail(tmux("has-session -t =claude"))
+
+    # The add-session form carries an optional kickoff prompt through to
+    # initialPrompt (first-spawn only, cleared on resume like the CLI). The
+    # name is auto-derived and "claude" is free again, so assert on that key.
+    # Read initialPrompt right after the write, before the supervisor's next
+    # ~2s tick spawns the session and consumes the prompt.
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "-d 'agent=claude' --data-urlencode 'prompt=hello there' "
+        "https://box.test/sessions/add | grep -x 303"
+    )
+    machine.succeed(
+        "jq -e '.sessions.claude.initialPrompt == \"hello there\"' "
+        "/home/agent/.config/agent-box/sessions.json"
+    )
+    client.succeed(
+        f"{curl} -u agent:testpassword -o /dev/null -w '%{{http_code}}' "
+        "-d 'name=claude' https://box.test/sessions/delete | grep -x 303"
     )
     machine.succeed("sleep 6")
     machine.fail(tmux("has-session -t =claude"))

@@ -568,6 +568,10 @@ SESSIONS_SECTION_TPL = """<section>
           </span>
           <button type="submit" class="btn">Add session</button>
         </div>
+        <div class="row">
+          <textarea name="prompt" rows="2"
+                    placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
+        </div>
         <p class="note">Working directory &mdash; where the agent
         starts. Defaults to your home directory (<code>~</code>); type
         to browse folders one level at a time.</p>
@@ -606,6 +610,10 @@ HOME_BODY = """<body class="ws">
         <ul class="ac" hidden></ul>
       </span>
       <button type="submit" class="btn">Add session</button>
+    </div>
+    <div class="row">
+      <textarea name="prompt" rows="2"
+                placeholder="kickoff prompt (optional) &mdash; the task to start on; a respawn resumes it"></textarea>
     </div>
     <p class="note">Working directory &mdash; where the agent starts.
     Defaults to your home directory (<code>~</code>); type to browse
@@ -1180,6 +1188,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_html(render(str(exc)), status=400)
                 return
+            # Optional kickoff prompt (first spawn only; the supervisor
+            # clears it and resumes on later respawns). boxSessionId is
+            # left null so the supervisor mints a real UUID at spawn.
+            prompt = form.get("prompt", [""])[0].strip()
             sessions = read_sessions()
             # The name is always auto-derived from the agent — there is no
             # name field in the form. Users rarely care what a session is
@@ -1194,6 +1206,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "remoteControlName": None,
                 "workingDirectory": cwd,
                 "extraArgs": [],
+                "initialPrompt": prompt or None,
+                "resumePrompt": None,
+                "boxSessionId": None,
+                "hasRun": False,
             }
             write_sessions(sessions)
             # On the workspace, land on the new session's tab (gen_session_name
