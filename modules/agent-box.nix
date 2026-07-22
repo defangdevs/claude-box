@@ -1014,6 +1014,64 @@ in
         '';
       };
     };
+
+    spotInterruption = {
+      enable = lib.mkEnableOption ''
+        graceful handling of EC2 Spot interruptions (issue #20). A small
+        root monitor polls the instance metadata service (IMDS) for a
+        scheduled interruption; when AWS posts one (~2 min notice) it
+        injects a "save your context now" prompt into every live agent
+        session (via tmux send-keys, so it works for any agent CLI —
+        claude, codex, …), waits spotInterruption.gracePeriod for the
+        agents to write continuity notes to disk, then cleanly stops the
+        per-user agent units so a cleanly-exited session is NOT respawned
+        during the shutdown window.
+
+        It deliberately does NOT power the box off itself. This deployment
+        runs as a PERSISTENT Spot request with interruptionBehavior=stop,
+        and ONLY an AWS-initiated interruption-stop is auto-restarted when
+        capacity returns — a guest-initiated shutdown/stop counts as a
+        MANUAL stop, which AWS leaves stopped until someone starts it by
+        hand. So we let AWS perform the stop (its stop drives a graceful
+        systemd shutdown that flushes buffers anyway) and only prepare for
+        it. Harmless to leave enabled on a non-Spot (on-demand) box: the
+        monitor reads instance-life-cycle at startup and exits immediately
+        when it is not "spot" (or when IMDS is unreachable, e.g. a dev rig).
+      '';
+
+      gracePeriod = lib.mkOption {
+        type = lib.types.ints.unsigned;
+        default = 75;
+        description = ''
+          Seconds to wait, after notifying the agents, before stopping the
+          agent units. The AWS notice lead time is ~120 s, so the default
+          leaves headroom for the agents to react and for the units to stop
+          before AWS forcibly stops the instance. Notification is immediate;
+          this only controls how long the agents get uninterrupted to write
+          before their sessions are torn down.
+        '';
+      };
+
+      pollInterval = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 5;
+        description = ''
+          Seconds between IMDS polls for spot/instance-action. The notice
+          lead time is ~120 s, so 5 s adds negligible detection lag.
+        '';
+      };
+
+      message = lib.mkOption {
+        type = lib.types.str;
+        default = "⚠️ SPOT INTERRUPTION: AWS will stop this box within ~2 minutes and this in-memory session will be lost (the box restarts later with the SAME disk, IP, and TLS cert). Save any important working context, decisions, and next steps to disk under your home NOW (e.g. update your MEMORY/notes files) so you can resume after restart.";
+        description = ''
+          Single-line prompt injected into each live agent session on
+          interruption. Keep it ONE line: it is typed with tmux send-keys
+          and then submitted with a separate Enter — an embedded newline
+          would submit it prematurely in most agent TUIs.
+        '';
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable (lib.mkMerge [{
@@ -3511,5 +3569,128 @@ in
         };
       }) terminalUsers);
     }
-  ))]);
+  ))
+
+  (lib.mkIf cfg.spotInterruption.enable {
+    # EC2 Spot interruption handler (issue #20). One root monitor polls
+    # IMDS; on a scheduled interruption it prompts every live agent session
+    # to persist its working context, then cleanly stops the agent units.
+    # See services.agent-box.spotInterruption for the full rationale (esp.
+    # why it does NOT stop/poweroff the box itself under a persistent Spot
+    # request — only AWS's interruption-stop is auto-restarted).
+    systemd.services.agent-box-spot-monitor = {
+      description = "EC2 Spot interruption handler for agent-box sessions";
+      wantedBy = [ "multi-user.target" ];
+      # IMDS is link-local (169.254.169.254), up before any network config,
+      # so no network-online ordering is needed.
+      serviceConfig = {
+        Type = "simple";
+        # A clean exit (exit 0) means "handled" or "not a Spot box" — do NOT
+        # revive it. on-failure still recovers a crashed monitor before any
+        # interruption arrives.
+        Restart = "on-failure";
+        RestartSec = "5s";
+        ExecStart = pkgs.writeShellScript "agent-box-spot-monitor" ''
+          set -u
+          CURL="${pkgs.curl}/bin/curl -sS --max-time 3"
+          IMDS=http://169.254.169.254/latest
+          TMUX=${pkgs.tmux}/bin/tmux
+          JQ=${pkgs.jq}/bin/jq
+          RUNUSER=${pkgs.util-linux}/bin/runuser
+          SYSTEMCTL=${pkgs.systemd}/bin/systemctl
+          ENV=${pkgs.coreutils}/bin/env
+          SYNC=${pkgs.coreutils}/bin/sync
+          SOCK=${tmuxSocketName}
+          USERS=${lib.escapeShellArg (lib.concatStringsSep " " (lib.attrNames cfg.users))}
+          GRACE=${toString cfg.spotInterruption.gracePeriod}
+          POLL=${toString cfg.spotInterruption.pollInterval}
+          MSG=${lib.escapeShellArg cfg.spotInterruption.message}
+
+          # Fresh IMDSv2 session token (v1 may be disabled). Prints nothing
+          # and returns non-zero if IMDS is unreachable.
+          imds_token() {
+            $CURL -X PUT "$IMDS/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 300"
+          }
+          imds_get() { # imds_get TOKEN PATH
+            $CURL -H "X-aws-ec2-metadata-token: $1" "$IMDS/$2"
+          }
+          imds_code() { # imds_code TOKEN PATH -> HTTP status only
+            $CURL -o /dev/null -w '%{http_code}' \
+              -H "X-aws-ec2-metadata-token: $1" "$IMDS/$2"
+          }
+
+          # Run tmux against a user's own control socket, AS that user.
+          user_tmux() { # user_tmux USER ARGS...
+            u=$1; shift
+            $RUNUSER -u "$u" -- \
+              "$ENV" TMUX_TMPDIR="/run/agent-box-$u" "$TMUX" -L "$SOCK" "$@"
+          }
+
+          notify_user() {
+            u=$1
+            sf="/home/$u/.config/agent-box/sessions.json"
+            user_tmux "$u" list-sessions -F '#{session_name}' 2>/dev/null \
+            | while IFS= read -r s; do
+                # Skip "shell" pseudo-agent sessions: text typed into a
+                # shell would run as a command, not read as a note.
+                agent=$($JQ -r --arg s "$s" \
+                  '.sessions[$s].agent // ""' "$sf" 2>/dev/null)
+                [ "$agent" = shell ] && continue
+                # A single Escape interrupts any in-flight generation/tool
+                # call so the notice is handled NOW instead of queued behind
+                # a long operation that may outlast the ~2 min window. Only
+                # one — a double Escape opens claude's history picker. Then a
+                # short settle before typing: sent too fast, the TUI (still
+                # returning to its prompt) swallows the first characters.
+                # Target "=NAME:" — an EXACT session match resolved to its
+                # active pane. Bare "=NAME" is a session target that send-keys
+                # rejects as a pane ("can't find pane"); plain "NAME" would
+                # prefix-match (session "dev" could hit "devs").
+                user_tmux "$u" send-keys -t "=$s:" Escape
+                sleep 1
+                # -l types MSG literally; a separate Enter submits it.
+                user_tmux "$u" send-keys -t "=$s:" -l -- "$MSG" \
+                  && user_tmux "$u" send-keys -t "=$s:" Enter
+              done
+          }
+
+          # Startup gate: only Spot instances can be interrupted. Exit 0 (no
+          # restart) when this is on-demand, or when IMDS is unreachable (a
+          # dev rig with the option left enabled).
+          tok=$(imds_token) || { echo "spot-monitor: IMDS unreachable; nothing to monitor" >&2; exit 0; }
+          [ -n "$tok" ] || { echo "spot-monitor: no IMDS token; nothing to monitor" >&2; exit 0; }
+          lifecycle=$(imds_get "$tok" meta-data/instance-life-cycle)
+          if [ "$lifecycle" != spot ]; then
+            echo "spot-monitor: instance-life-cycle=''${lifecycle:-unknown}, not spot; nothing to monitor" >&2
+            exit 0
+          fi
+          echo "spot-monitor: watching IMDS for interruption (poll ''${POLL}s, grace ''${GRACE}s)" >&2
+
+          while true; do
+            # Token TTL is 300s but re-minting each loop is cheap and robust
+            # to expiry; skip this round if IMDS momentarily hiccups.
+            tok=$(imds_token) && [ -n "$tok" ] || { sleep "$POLL"; continue; }
+            # 404 until an interruption is scheduled; 200 = committed (~2 min).
+            if [ "$(imds_code "$tok" meta-data/spot/instance-action)" = 200 ]; then
+              action=$(imds_get "$tok" meta-data/spot/instance-action)
+              echo "spot-monitor: interruption scheduled ($action) — notifying agents" >&2
+              for u in $USERS; do notify_user "$u"; done
+              $SYNC
+              echo "spot-monitor: waiting ''${GRACE}s for agents to save context" >&2
+              sleep "$GRACE"
+              echo "spot-monitor: stopping agent units (no respawn)" >&2
+              for u in $USERS; do
+                $SYSTEMCTL stop "agent-box-$u.service" || true
+              done
+              $SYNC
+              echo "spot-monitor: prepared; leaving the stop to AWS (preserves persistent-Spot auto-restart)" >&2
+              exit 0
+            fi
+            sleep "$POLL"
+          done
+        '';
+      };
+    };
+  })]);
 }

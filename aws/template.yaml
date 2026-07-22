@@ -658,6 +658,12 @@ Resources:
                     rev = pin.rev;
                     agentNixpkgs = agentPin;
                   };
+                  # Handle Spot interruptions gracefully (issue #20): on the
+                  # ~2 min IMDS notice, prompt live agent sessions to persist
+                  # their context, then cleanly stop the agent units. Safe to
+                  # leave on when UseSpot=false — the monitor reads
+                  # instance-life-cycle and exits at once on a non-Spot box.
+                  spotInterruption.enable = true;
                 };
 
               ${Nat64Config}
