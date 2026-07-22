@@ -344,6 +344,31 @@
         "systemctl is-failed --quiet agent-box-update.service", timeout=60
     )
 
+    # The settings page long-polls {base}/status for restart/update progress.
+    # It is read-only JSON behind the same auth gate as the page (401 without
+    # credentials), reports the running rev and a live session count, and —
+    # because selfUpdate is on — an `update` block read straight from the
+    # update unit via an unprivileged `systemctl show` (no sudo). Having just
+    # driven that unit to `failed`, the endpoint must reflect it: this proves
+    # the AGENT_BOX_UPDATE_UNIT/SYSTEMCTL wiring and that the daemon's hardening
+    # still permits the world-readable unit-state query.
+    client.succeed(
+        f"{curl} -o /dev/null -w '%{{http_code}}' "
+        "https://box.test/agent/settings/status | grep -x 401"
+    )
+    status = client.succeed(
+        f"{curl} -u agent:testpassword https://box.test/agent/settings/status"
+    )
+    assert (
+        '"rev": "0000000000000000000000000000000000000000"' in status
+    ), f"status should report the running rev: {status}"
+    assert '"sessions"' in status and '"configured"' in status, (
+        f"status should report a session count: {status}"
+    )
+    assert '"update"' in status and '"active": "failed"' in status, (
+        f"status should surface the failed update run: {status}"
+    )
+
     # mallory (not an agent-box user) must not be able to trigger an update.
     machine.fail(
         "su -s /bin/sh mallory -c '/run/wrappers/bin/sudo -n "

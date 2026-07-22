@@ -1805,6 +1805,14 @@ in
         # used by its non-blocking GitHub update check.
         REPO = os.environ.get("AGENT_BOX_REPO", "")
         REV = os.environ.get("AGENT_BOX_REV", "")
+        # Read-only handles for the {BASE}/status progress endpoint the page
+        # polls after triggering an update: the update oneshot's unit name and
+        # a systemctl binary to `show` its state with. Both empty unless
+        # selfUpdate is on (no unit to watch) or on dev rigs without systemd;
+        # the endpoint then simply omits the update block. Querying unit state
+        # is unprivileged — no sudo, unlike the trigger in UPDATE_CMD.
+        UPDATE_UNIT = os.environ.get("AGENT_BOX_UPDATE_UNIT", "")
+        SYSTEMCTL = os.environ.get("AGENT_BOX_SYSTEMCTL", "")
         # Per-user, no-argument privileged helper (issue 91). Passwords are sent
         # as JSON on stdin, never argv or environment, and helper output is never
         # reflected into HTTP responses.
@@ -2063,6 +2071,65 @@ in
                 sys.stderr.write("update_box: trigger rc=%d\n" % proc.returncode)
             except OSError as exc:
                 sys.stderr.write("update_box: %s\n" % exc)
+
+
+        def update_service_state():
+            """Read-only state of the box update oneshot, for the UI progress
+            line. Returns None when self-update is off (no unit wired) or
+            systemctl is unavailable (dev rigs) — the caller then omits the
+            update block. `since` is the run's monotonic start time (usec since
+            boot, 0 if it never ran): the page captures it before triggering
+            and waits for a strictly newer value, which is stable even though
+            the rebuild may restart this daemon (same boot). No privilege
+            needed — `systemctl show` is a world-readable query."""
+            if not UPDATE_UNIT or not SYSTEMCTL:
+                return None
+            try:
+                proc = subprocess.run(
+                    [SYSTEMCTL, "show", UPDATE_UNIT, "--property",
+                     "ActiveState,Result,ExecMainStartTimestampMonotonic"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            except OSError:
+                return None
+            if proc.returncode != 0:
+                return None
+            props = {}
+            for line in proc.stdout.splitlines():
+                key, _, value = line.partition("=")
+                props[key] = value
+            try:
+                since = int(props.get("ExecMainStartTimestampMonotonic", "0") or "0")
+            except ValueError:
+                since = 0
+            return {
+                "active": props.get("ActiveState", ""),
+                "result": props.get("Result", ""),
+                "since": since,
+            }
+
+
+        def session_counts():
+            """How many configured sessions are currently live — the signal the
+            page watches to confirm a 'Restart all' has bounced and recovered."""
+            configured = [n for n in read_sessions() if SESSION_RE.match(n)]
+            live = live_sessions()
+            return {
+                "configured": len(configured),
+                "live": sum(1 for n in configured if n in live),
+            }
+
+
+        def status_payload():
+            """Compact JSON the settings page long-polls for restart/update
+            progress. Never includes secret values or command output."""
+            payload = {"rev": REV, "sessions": session_counts()}
+            update = update_service_state()
+            if update is not None:
+                payload["update"] = update
+            return payload
 
 
         def change_password(previous, new):
@@ -2325,8 +2392,10 @@ in
                 <span class="dz"><strong>Restart all sessions</strong>
                 <span class="note">Restarts the whole agent service: every
                 session comes back with the current secrets and token files.
-                Live sessions are killed &mdash; unsaved in-flight work is lost.</span></span>
-                <form method="post" action="{base}/restart"
+                Live sessions are killed &mdash; unsaved in-flight work is lost.
+                <span id="restart-status" class="update-state" aria-live="polite"></span></span></span>
+                <form method="post" action="{base}/restart" data-poll="restart"
+                      data-status="{base}/status"
                       onsubmit="return confirm('Restart all sessions now? Live sessions will be killed and any unsaved in-flight work is lost.');">
                   <button type="submit" class="btn danger-btn">Restart all</button>
                 </form>
@@ -2373,7 +2442,8 @@ in
                 <span class="note">Fetches the latest agent-box release and agent
                 CLI versions, then rebuilds the system. Takes a few minutes; sessions
                 restart if their software changed.{update_line}</span></span>
-                <form method="post" action="{base}/update"
+                <form method="post" action="{base}/update" data-poll="update"
+                      data-status="{base}/status"
                       onsubmit="return confirm('Update the box now? This rebuilds the system and may restart the agent sessions.');">
                   <button type="submit" class="btn danger-btn">Update box</button>
                 </form>
@@ -2423,6 +2493,118 @@ in
           }
           function parseHTML(text) {
             return new DOMParser().parseFromString(text, "text/html");
+          }
+
+          // Shared writer for the Danger-zone progress spans (#restart-status,
+          // #update-status): set the data-state colour + text, optionally
+          // appending a trailing link.
+          function setStatus(el, state, text, linkText, href) {
+            if (!el) { return; }
+            el.setAttribute("data-state", state);
+            el.textContent = text;
+            if (linkText && href) {
+              var link = document.createElement("a");
+              link.href = href;
+              link.textContent = linkText;
+              link.rel = "noreferrer";
+              el.appendChild(document.createTextNode(" "));
+              el.appendChild(link);
+            }
+          }
+          // One GET of the JSON progress feed; resolves null on any error so
+          // callers treat "daemon briefly gone" (mid-rebuild) like any other
+          // not-yet-ready poll rather than a hard failure.
+          function fetchStatus(url) {
+            return fetch(url, { headers: { "Accept": "application/json" } })
+              .then(function (r) { if (!r.ok) { throw new Error(); } return r.json(); })
+              .catch(function () { return null; });
+          }
+          // Re-fetch the current page and patch the live session list/tabs, so
+          // the visible list tracks a restart even when nothing was "starting"
+          // at submit time (which is what otherwise gates schedulePoll).
+          function pollPageOnce() {
+            return fetch(window.location.pathname + window.location.search)
+              .then(function (r) { return r.text(); })
+              .then(function (t) { applyDoc(parseHTML(t), ["sessions-list", "tab-bar"]); wsSync(); })
+              .catch(function () {});
+          }
+
+          // After "Update box": watch the update oneshot from `baseline` (its
+          // start time before we triggered) until a strictly newer run
+          // finishes. The rebuild may restart this daemon, so a failed fetch is
+          // "still rebuilding", not an error.
+          function watchUpdate(url, baseline, rev0) {
+            var el = document.getElementById("update-status");
+            if (!el) { return; }
+            var tries = 0, MAX = 300;             // ~12 min at 2.5s
+            setStatus(el, "checking", "Starting update…");
+            (function tick() {
+              if (tries++ > MAX) {
+                setStatus(el, "blocked", "Update still running — check the box shortly.");
+                return;
+              }
+              fetchStatus(url).then(function (s) {
+                if (!s || !s.update) {           // daemon switching, or no unit to watch
+                  setStatus(el, "checking", "Rebuilding the system…");
+                  window.setTimeout(tick, 2500);
+                  return;
+                }
+                var u = s.update;
+                if (u.active === "activating" || u.active === "active") {
+                  setStatus(el, "available", "Update in progress…");
+                  window.setTimeout(tick, 2500);
+                  return;
+                }
+                if (u.since > baseline) {        // a newer run started and is no longer active → done
+                  if (u.active === "failed" || u.result !== "success") {
+                    setStatus(el, "blocked", "Update failed — check the update service journal.");
+                  } else if (s.rev && rev0 && s.rev !== rev0) {
+                    var repo = el.getAttribute("data-repo");
+                    var short = s.rev.slice(0, 12);
+                    if (repo) {
+                      var href = "https://github.com/" +
+                        repo.split("/").map(encodeURIComponent).join("/") +
+                        "/commit/" + encodeURIComponent(s.rev);
+                      setStatus(el, "current", "Updated — now at " + short + ".", "View commit", href);
+                    } else {
+                      setStatus(el, "current", "Updated — now at " + short + ".");
+                    }
+                  } else {
+                    setStatus(el, "current", "Update finished.");
+                  }
+                  return;
+                }
+                setStatus(el, "checking", "Starting update…");   // triggered, run not registered yet
+                window.setTimeout(tick, 2500);
+              });
+            })();
+          }
+          // After "Restart all": watch the live session count recover. Wait to
+          // see it dip below the configured count before declaring success, so
+          // the pre-kill "all live" state isn't misread as "done".
+          function watchRestart(url) {
+            var el = document.getElementById("restart-status");
+            if (!el) { return; }
+            var dipped = false, tries = 0, MAX = 40;   // ~100s at 2.5s
+            setStatus(el, "checking", "Restarting sessions…");
+            (function tick() {
+              if (tries++ > MAX) {
+                setStatus(el, "blocked", "Still restarting — check the session list.");
+                return;
+              }
+              pollPageOnce();
+              fetchStatus(url).then(function (s) {
+                if (!s || !s.sessions) { window.setTimeout(tick, 2500); return; }
+                var conf = s.sessions.configured, live = s.sessions.live;
+                if (conf === 0) { setStatus(el, "current", "Restart requested."); return; }
+                if (live < conf) { dipped = true; }
+                if (dipped && live >= conf) {
+                  setStatus(el, "current", "All sessions restarted.");
+                  return;
+                }
+                window.setTimeout(tick, 2500);
+              });
+            })();
           }
 
           // The page itself never waits on GitHub. Once it is visible, make a
@@ -2640,17 +2822,40 @@ in
               (f.getAttribute("action") || "").endsWith("/sessions/add") && tabBar()
                 ? body.get("name") : null;
             var wasActive = wsActive();
-            fetch(f.getAttribute("action"), { method: "POST", body: body })
-              .then(function (r) { return r.text(); })
-              .then(function (t) {
-                applyDoc(parseHTML(t), ["msg-slot", "secrets-list", "sessions-list", "tab-bar"]);
-                var ed = f.closest(".editor");
-                if (ed) { f.reset(); ed.hidden = true; }
-                if (addedSession && tabEl(addedSession)) { wsSelect(addedSession, true); }
-                else if (wasActive && tabEl(wasActive)) { wsSelect(wasActive, false); }
-                wsSync();
-                startPolling(8);
+            var poll = f.getAttribute("data-poll");
+            var statusUrl = f.getAttribute("data-status");
+
+            function afterPost(t) {
+              applyDoc(parseHTML(t), ["msg-slot", "secrets-list", "sessions-list", "tab-bar"]);
+              var ed = f.closest(".editor");
+              if (ed) { f.reset(); ed.hidden = true; }
+              if (addedSession && tabEl(addedSession)) { wsSelect(addedSession, true); }
+              else if (wasActive && tabEl(wasActive)) { wsSelect(wasActive, false); }
+              wsSync();
+            }
+            function post() {
+              return fetch(f.getAttribute("action"), { method: "POST", body: body })
+                .then(function (r) { return r.text(); });
+            }
+
+            // The two Danger-zone actions get a long-polled progress line;
+            // everything else keeps the brief session-state poll.
+            if (poll === "update" && statusUrl) {
+              // Snapshot the run's start time + rev BEFORE triggering, so the
+              // watcher can distinguish the new run from any earlier one.
+              fetchStatus(statusUrl).then(function (s0) {
+                var baseline = (s0 && s0.update && typeof s0.update.since === "number")
+                  ? s0.update.since : 0;
+                var rev0 = s0 ? s0.rev : null;
+                post().then(function (t) { afterPost(t); watchUpdate(statusUrl, baseline, rev0); });
               });
+              return;
+            }
+            if (poll === "restart" && statusUrl) {
+              post().then(function (t) { afterPost(t); watchRestart(statusUrl); });
+              return;
+            }
+            post().then(function (t) { afterPost(t); startPolling(8); });
           });
 
           checkForUpdate();
@@ -2872,6 +3077,16 @@ in
                 self.end_headers()
                 self.wfile.write(data)
 
+            def _send_json(self, obj, status=200):
+                data = json.dumps(obj).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(data)
+
             def _redirect(self, query="", page=None):
                 target = (page or BASE + "/") + (("?" + query) if query else "")
                 self.send_response(303)
@@ -2906,6 +3121,11 @@ in
                     return
                 if not self._under_base(parsed.path):
                     self._send_html("<h1>404</h1>", status=404)
+                    return
+                # Progress feed the page long-polls after a restart/update
+                # (read-only, same auth block as the page it lives under).
+                if parsed.path.rstrip("/") == BASE + "/status":
+                    self._send_json(status_payload())
                     return
                 self._send_html(render_page(message))
 
@@ -3562,6 +3782,14 @@ in
           # commit link and used for its non-blocking compare request.
           AGENT_BOX_REPO = cfg.selfUpdate.repo;
           AGENT_BOX_REV = cfg.selfUpdate.rev;
+          # Read-only handles for the {BASE}/status progress endpoint the page
+          # long-polls after "Update box": the update oneshot to watch and an
+          # unprivileged `systemctl show` binary to read its state with (no
+          # sudo — unlike AGENT_BOX_UPDATE_CMD, which triggers the run). Only
+          # wired when selfUpdate is on, so the status endpoint omits the update
+          # block otherwise.
+          AGENT_BOX_UPDATE_UNIT = "agent-box-update.service";
+          AGENT_BOX_SYSTEMCTL = "/run/current-system/sw/bin/systemctl";
         };
         serviceConfig = {
           User = name;
