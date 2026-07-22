@@ -4,7 +4,10 @@ CloudFormation template that provisions a single-agent agent-box host on
 EC2 with a browser terminal (Caddy + ttyd). The deployment form lets the user
 choose Claude Code or Codex.
 
-- `template.yaml` - the template. Source of truth; anything else is derived.
+- `template.yaml` - the EC2 template. Source of truth; anything else is derived.
+- `lightsail-template.yaml` - an alternative that runs the same agent-box on
+  **AWS Lightsail** for one flat monthly bundle price. See
+  ["Lightsail variant"](#lightsail-variant-lightsail-templateyaml) below.
 
 ## What the template does
 
@@ -276,6 +279,114 @@ Unicode punctuation like an em dash is
 rejected by EC2's API but cfn-lint only checks the group description.
 The template avoids em-dashes anywhere that becomes a rule description
 to sidestep this.
+
+## Lightsail variant (`lightsail-template.yaml`)
+
+A separate template (not a toggle on the EC2 one) that runs the same
+`services.agent-box` on **AWS Lightsail** instead of EC2. The draw is billing
+shape: Lightsail is one flat monthly bundle that folds compute, the SSD, the
+attached static IPv4, and a multi-TB transfer allowance into a single price,
+with **no separate EBS or public-IPv4 line items**. At the small tier the two
+come out within a few percent of each other:
+
+| | EC2 `t4g.small` (this repo's default region set) | Lightsail `small_3_0` |
+| --- | --- | --- |
+| vCPU / RAM | 2 / 2 GiB | 2 / 2 GiB |
+| Disk | 30 GiB gp3 (billed separately) | 60 GiB SSD (in bundle) |
+| Public IPv4 | ~$3.60/mo (billed separately) | included |
+| Transfer | 100 GB free, then $0.09/GB | multi-TB included |
+| Price | ~$13.4/mo on-demand-equivalent (~$12.6 measured on Spot) | **$12.0/mo flat** |
+
+So Lightsail slightly undercuts the EC2 on-demand-equivalent and roughly ties
+Spot, while bundling 2x the disk and a large transfer allowance and removing
+Spot's interruption risk. EC2 keeps the edge on flexibility (arbitrary instance
+types, deep Spot discounts, IaC-native networking).
+
+### How it works (nixos-infect)
+
+Lightsail has **no NixOS blueprint** and CloudFormation's `AWS::Lightsail::Instance`
+cannot boot a custom image — it only takes a public `BlueprintId`. So the box
+launches the stock **Ubuntu 24.04** blueprint and converts itself to NixOS
+in-place on first boot with [`nixos-infect`](https://github.com/elitak/nixos-infect)
+(pinned by commit in the `NixosInfectRev` parameter):
+
+- The `UserData` script pre-writes `/etc/nixos/configuration.nix` **before**
+  invoking `nixos-infect`. The script's `makeConf()` early-returns when that
+  file already exists, so it never clobbers our config.
+- `PROVIDER=lightsail` is first-class in `nixos-infect`: it relabels the root
+  filesystem to `nixos` and its generated config imports
+  `virtualisation/amazon-image.nix` — **the same module the EC2 template uses**.
+  Our pre-written config imports that module too, so the platform layer is the
+  proven one; only the delivery (infect over Ubuntu) is new.
+- That baked config is essentially the EC2 template's config minus Spot and
+  NAT64, plus the Lightsail platform bits (`amazon-image.nix` import,
+  `boot.loader.grub.device = "/dev/nvme0n1"`). `services.agent-box`,
+  `selfUpdate`, the web-password-hash activation script, the first-boot
+  WaitCondition signal, disk-GC watchdog, and the `amazon-init` disable all
+  carry over unchanged.
+
+### Differences from the EC2 template
+
+- **No VPC/subnet/IGW/SG/EIP/IAM** resources — Lightsail manages networking;
+  the per-instance firewall is the `Networking.Ports` block (443 always, 22
+  when `DebugSsh=true`).
+- **IPv4-native**, so no `PublicIpv4`/`Nat64` parameters and no NAT64 plumbing.
+- **No Spot** (`UseSpot` is gone; `spotInterruption` is disabled in the config).
+- **No `RootVolumeSize`** — the SSD is fixed by the bundle; grow by
+  snapshot-and-restore onto a larger bundle.
+- **A static IP is always attached** (free on Lightsail while attached, and
+  stable across a stop/start), so the `sslip.io` URL keeps working. Because the
+  attach happens after instance creation, `UserData` can't reference the static
+  IP without a dependency cycle, so the box discovers its own settled public
+  IPv4 at runtime (a `sleep` past the attach window + a stability poll) and
+  bakes `<ip>.sslip.io`. The stack `Outputs` report the same address via
+  `GetAtt StaticIp.IpAddress`.
+- **Debug access is root SSH with the Lightsail default key** (`DebugSsh=true`
+  opens 22), not SSM — Lightsail has no Session Manager, and after infection the
+  console's browser-SSH (which logs in as `ubuntu`) stops working. Infect logs
+  land in `/var/log/agent-box-infect.log`.
+
+### Deploying (CLI)
+
+The 1-click S3 publish path is not wired up for this template yet (see
+below), so deploy it directly. `AgentBoxRev`/`AgentBoxSha256` are a pinned
+pair, exactly as for the EC2 template:
+
+```bash
+REV=$(git rev-parse HEAD)   # or any pushed agent-box commit
+SHA=$(nix store prefetch-file --json \
+  "https://raw.githubusercontent.com/defangdevs/agent-box/${REV}/modules/agent-box.nix" \
+  | jq -r .hash)
+
+aws cloudformation deploy \
+  --region eu-central-1 \
+  --stack-name agent-box-lightsail \
+  --template-file aws/lightsail-template.yaml \
+  --parameter-overrides \
+      WebPassword='<16-64 chars>' \
+      AgentBoxRev="$REV" \
+      AgentBoxSha256="$SHA"
+```
+
+The stack blocks on the first-boot `WaitCondition` (timeout 45 min — a small
+bundle's initial closure build is slow) and then emits `WebURL`,
+`PublicAddress`, `RemoteControlSession`, and an `SshCommand` hint.
+
+### Validation status
+
+`cfn-lint` passes and the generated `configuration.nix` parses as valid Nix
+(both checked in PR CI via `aws-ci.yml`). The end-to-end `nixos-infect`
+bootstrap has **not** yet been exercised by an automated live deploy — treat a
+first real launch as the acceptance test. Follow-ups before this is
+first-class:
+
+- A Lightsail leg in `deploy-test.yml` (create stack, assert `WebURL` reachable
+  over IPv4, tear down). GitHub runners are IPv4-only and Lightsail is
+  IPv4-native, so unlike the EC2 IPv6-only leg this can smoke-test the live URL.
+- S3 publish + a Launch button. `publish-template.yml` currently publishes only
+  `template.yaml` and scopes the bucket policy to that one object; publishing a
+  second template means covering both objects in one policy (the two must not
+  fight over `PutBucketPolicy`). Deferred to keep this PR's diff focused.
 
 ## Refreshing the AMI map
 

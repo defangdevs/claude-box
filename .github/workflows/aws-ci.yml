@@ -5,6 +5,7 @@ on:
     branches: [ master ]
     paths: &aws-ci-paths
       - 'aws/template.yaml'
+      - 'aws/lightsail-template.yaml'
       - 'docs/index.html'
       - 'scripts/ws_smoke.py'
       - '.github/workflows/aws-ci.yml'
@@ -30,8 +31,8 @@ jobs:
       - name: Install cfn-lint
         run: python3 -m pip install --quiet cfn-lint
 
-      - name: Validate CloudFormation template
-        run: cfn-lint aws/template.yaml
+      - name: Validate CloudFormation templates
+        run: cfn-lint aws/template.yaml aws/lightsail-template.yaml
 
       - name: Compile WebSocket smoke helper
         run: python3 -m py_compile scripts/ws_smoke.py

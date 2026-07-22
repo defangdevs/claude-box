@@ -1,0 +1,569 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Terminal access
+        Parameters:
+          - Agent
+          - UserName
+          - WebPassword
+      - Label:
+          default: Compute and cost
+        Parameters:
+          - BundleId
+      - Label:
+          default: Agent instructions
+        Parameters:
+          - AgentsMd
+      - Label:
+          default: Advanced (rarely needed)
+        Parameters:
+          - AllowCidr
+          - DebugSsh
+          - NixChannel
+          - NixosInfectRev
+          - AgentBoxRev
+          - AgentBoxSha256
+          - AgentNixpkgsUrl
+          - AgentNixpkgsSha256
+    ParameterLabels:
+      WebPassword:
+        default: Web terminal password (16-64 chars — save it, AWS masks it)
+      Agent:
+        default: Agent CLI
+      UserName:
+        default: Linux user the agent runs as
+      BundleId:
+        default: Lightsail bundle (size / price)
+      AllowCidr:
+        default: IPv4 CIDR allowed to reach 443 (and 22 when DebugSsh=true)
+      DebugSsh:
+        default: Open port 22 for root SSH with the Lightsail default key
+      AgentsMd:
+        default: AGENTS.md seeded on first agent start
+      NixChannel:
+        default: NixOS channel nixos-infect installs
+      NixosInfectRev:
+        default: nixos-infect commit pin
+      AgentBoxRev:
+        default: agent-box git rev
+      AgentBoxSha256:
+        default: agent-box module sha256
+Description: >
+  agent-box (Lightsail) - 1-click coding-agent host on AWS Lightsail, priced as
+  one flat monthly bundle (compute + SSD + a static IP + a multi-TB transfer
+  allowance). Lightsail has no NixOS blueprint, so the box launches from the
+  Ubuntu 24.04 blueprint and converts itself to NixOS in-place with nixos-infect
+  (PROVIDER=lightsail imports the same virtualisation/amazon-image.nix the EC2
+  template uses), then runs the agent inside a persistent tmux session reachable
+  through a browser terminal (Caddy + ttyd). Claude Code sessions can also be
+  driven from the Claude desktop and mobile apps via Remote Control.
+  Source: https://github.com/defangdevs/agent-box
+
+Parameters:
+  Agent:
+    Type: String
+    Default: claude
+    AllowedValues:
+      - claude
+      - codex
+    Description: >-
+      Agent CLI to run in the persistent tmux session. Supported values:
+      claude (Claude Code) and codex (OpenAI Codex CLI). Claude-specific
+      Remote Control settings are ignored when codex is selected.
+
+  UserName:
+    Type: String
+    Default: agent
+    AllowedPattern: ^[a-z_][a-z0-9_-]{0,30}$
+    Description: >-
+      Linux user the agent CLI runs as. Doubles as the browser-terminal
+      sign-in username (the basic-auth username picks the terminal), the
+      /<user>/ path in the WebURL, the home directory (/home/<user>), and
+      the <user>@<stack> Remote Control session name. Lowercase letters,
+      digits, "_" and "-", starting with a letter or "_", max 31 chars.
+
+  # The picker annotates each value with vCPU/RAM/price because the
+  # CloudFormation console renders AllowedValues verbatim — there is no separate
+  # label field. The Lightsail API only ever sees the first token: the Instance
+  # resource splits on the first space. No commas in the values, so
+  # `ParameterKey=BundleId,ParameterValue=...` CLI shorthand still parses.
+  BundleId:
+    Type: String
+    Default: small_3_0 (2 vCPU / 2 GiB / 60 GiB SSD / $12 mo)
+    AllowedValues:
+      - micro_3_0 (2 vCPU / 1 GiB / 40 GiB SSD / $7 mo)
+      - small_3_0 (2 vCPU / 2 GiB / 60 GiB SSD / $12 mo)
+      - medium_3_0 (2 vCPU / 4 GiB / 80 GiB SSD / $24 mo)
+      - large_3_0 (2 vCPU / 8 GiB / 160 GiB SSD / $44 mo)
+      - xlarge_3_0 (4 vCPU / 16 GiB / 320 GiB SSD / $84 mo)
+    Description: >-
+      Lightsail bundle (the id before the parenthesis; specs shown for
+      convenience). The flat price bundles compute, the SSD, the attached
+      static IPv4, and a multi-TB/month transfer allowance — no separate EBS
+      or public-IPv4 line items like the EC2 template. All are dual-stack
+      (IPv4 + IPv6). small_3_0 (2 GiB) is the default and matches a t4g.small
+      EC2 box: fine for a single light agent, but 2 GiB is tight while
+      nixos-rebuild evaluates a self-update — the UserData adds a 3 GiB swap
+      file to carry both the initial infect build and later rebuilds. Pick
+      medium_3_0 (4 GiB) for comfortable rebuild headroom. Lightsail disks are
+      fixed by the bundle: to grow later you snapshot and restore onto a larger
+      bundle (there is no live volume-resize like EBS).
+
+  WebPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    MaxLength: 64
+    AllowedPattern: ^.{16,64}$
+    Description: >-
+      Shared secret for the browser terminal. Log in with the UserName chosen
+      above (default "agent") and this password; Caddy then sets an HttpOnly
+      Secure cookie so the WebSocket upgrade can authenticate without putting
+      the secret in the URL. Use any 16-64 characters; password-manager symbols
+      are supported. AWS masks this field with dots after you type it and never
+      emits it in stack outputs, so save it somewhere before you launch — there
+      is no way to recover it later. Even Claude Code stacks that plan to drive
+      the box via Remote Control need this the first time, to complete `claude
+      login` in the browser terminal.
+
+  AgentsMd:
+    Type: String
+    Default: |
+      ## This box (AWS / Lightsail)
+
+      - This is an AWS Lightsail instance that converted itself to NixOS on
+        first boot. The SSD persists but RAM does not: a reboot or stop/start
+        loses the live tmux session, so save working context to disk under your
+        home. A static IP is attached, so the public address (and your URL)
+        survives a stop/start.
+      - Your URL is derived from the instance's static IP via sslip.io. It is
+        stable, but always read $AGENT_BOX_URL rather than hard-coding it.
+      - This bundle has limited RAM; heavy nixos-rebuild self-updates lean on a
+        swap file. If an update feels slow, that is why.
+      - Low on disk? Lightsail bundles have a fixed SSD — snapshot the instance
+        and restore it onto a larger bundle to grow. Scheduled nix garbage
+        collection reclaims store space in the meantime.
+    Description: >-
+      Deployment-specific instructions APPENDED to agent-box's built-in
+      default AGENTS.md, which the module always seeds to the agent user's
+      ~/AGENTS.md on first agent start (skipped if the file already exists).
+      The built-in default already covers the generic guidance — browser-
+      terminal URL ($AGENT_BOX_URL), the read-only-except-$HOME filesystem,
+      installing tools with nix, sibling sessions, serving a web app, and
+      self-update — so this default only adds the Lightsail specifics. Edit or
+      clear it to taste; whatever you leave here lands below the built-in
+      default. Content is embedded into the generated configuration.nix as a
+      Nix indented string, so avoid the sequences `${` and `''` in the body —
+      Nix will otherwise try to antiquote / close the string mid-file. Plain
+      $VAR (no braces) is fine.
+
+  AllowCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: ^\d{1,3}(\.\d{1,3}){3}/\d{1,2}$
+    Description: >-
+      IPv4 CIDR allowed to reach 443 (the web terminal) and, when DebugSsh is
+      true, 22. Default is open. IPv6 ingress to 443 is always ::/0 — tighten
+      the instance firewall in the Lightsail console after launch if needed.
+
+  DebugSsh:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      true (default): open port 22 so you can reach a root shell with the
+      Lightsail default SSH key (download it from Account -> SSH keys, then
+      `ssh -i <key> root@<static-ip>`). Lightsail has no SSM Session Manager,
+      and after the NixOS conversion the browser-based SSH console (which logs
+      in as the Ubuntu "ubuntu" user) no longer works, so this key-only root
+      path is the debug hatch for a broken first boot — nixos-infect logs land
+      in /var/log/agent-box-infect.log. Password auth is disabled either way.
+      false: leave 22 closed.
+
+  NixChannel:
+    Type: String
+    Default: nixos-25.05
+    AllowedPattern: ^nixos-[0-9]{2}\.[0-9]{2}$
+    Description: >-
+      NixOS release channel nixos-infect installs as the base system (matches
+      the repo's stateVersion). The agent CLIs (claude-code, codex) resolve
+      from their own pinned nixpkgs (AgentNixpkgs*) independently of this.
+
+  NixosInfectRev:
+    Type: String
+    Default: 40f62a680bb0e8f2f607d79abfaaecd99d59401c
+    AllowedPattern: ^[0-9a-f]{40}$
+    Description: >-
+      Commit of elitak/nixos-infect to run, pinned by full SHA (the script is
+      fetched from raw.githubusercontent.com at this ref). PROVIDER=lightsail is
+      first-class in this script: it relabels the root filesystem to `nixos` so
+      the imported amazon-image.nix can mount it. Bump deliberately after review
+      — an unpinned "master" would silently change the bootstrap.
+
+  AgentBoxRev:
+    Type: String
+    Description: >-
+      Git commit sha of defangdevs/agent-box. The module (a single .nix file)
+      is fetched from raw.githubusercontent.com at this ref during the first
+      nixos-rebuild. No Default here on purpose — Rev + Sha256 are a pinned
+      pair and `builtins.fetchurl` hard-fails on any drift, so we can't ship a
+      moving default like "master". The 1-click Launch buttons hit the
+      S3-published copy of this template, into which the publish workflow
+      injects a Default for both fields at every master push.
+
+  AgentBoxSha256:
+    Type: String
+    Description: >-
+      Nix sha256 of modules/agent-box.nix at AgentBoxRev (SRI form:
+      sha256-<base64>). Must match AgentBoxRev's content exactly.
+      Regenerate with `nix store prefetch-file
+      https://raw.githubusercontent.com/defangdevs/agent-box/<REV>/modules/agent-box.nix`
+      (no unpack; we fetch the file, not a tarball). See AgentBoxRev for
+      why there is no Default here.
+
+  AgentNixpkgsUrl:
+    Type: String
+    Default: ''
+    Description: >-
+      Immutable nixos-unstable channel-release tarball to use for agent CLI
+      packages (claude-code, codex). The S3-published 1-click template gets a
+      fresh Default injected by the publish workflow; empty (the source
+      template's default) falls back to the base channel. When set,
+      AgentNixpkgsUrl + AgentNixpkgsSha256 are a pinned pair, and
+      `builtins.fetchTarball` hard-fails on drift.
+
+  AgentNixpkgsSha256:
+    Type: String
+    Default: ''
+    Description: >-
+      Unpacked Nix sha256 of AgentNixpkgsUrl (the output of
+      `nix-prefetch-url --unpack <AgentNixpkgsUrl>`). Must match
+      AgentNixpkgsUrl exactly; leave empty when AgentNixpkgsUrl is empty.
+
+Conditions:
+  OpenSsh: !Equals [!Ref DebugSsh, 'true']
+
+Resources:
+  # The Lightsail instance. Unlike the EC2 template there is no VPC / subnet /
+  # IGW / route table / security group to build — Lightsail manages all of that
+  # and the per-instance firewall lives in the Networking block below. The box
+  # boots the stock Ubuntu 24.04 blueprint and the UserData converts it to NixOS
+  # in place (see the script). CloudFormation reports CREATE_COMPLETE as soon as
+  # the instance is running the blueprint; it does NOT wait for UserData, so the
+  # real first-boot gate is the FirstBootDone WaitCondition below.
+  Instance:
+    Type: AWS::Lightsail::Instance
+    Properties:
+      InstanceName: !Ref AWS::StackName
+      AvailabilityZone: !Select [0, !GetAZs '']
+      BlueprintId: ubuntu_24_04
+      # First token of the annotated picker value (see the BundleId parameter)
+      # — "small_3_0 (2 vCPU / ...)" -> "small_3_0".
+      BundleId: !Select [0, !Split [' ', !Ref BundleId]]
+      Networking:
+        Ports:
+          - FromPort: 443
+            ToPort: 443
+            Protocol: tcp
+            Cidrs: [!Ref AllowCidr]
+            Ipv6Cidrs: ['::/0']
+          - !If
+            - OpenSsh
+            - FromPort: 22
+              ToPort: 22
+              Protocol: tcp
+              Cidrs: [!Ref AllowCidr]
+            - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+      UserData:
+        Fn::Sub:
+          - |
+            #!/usr/bin/env bash
+            # agent-box Lightsail bootstrap: turn this Ubuntu box into a NixOS
+            # agent-box with nixos-infect. Runs once, as root, via Lightsail's
+            # launch-script mechanism. All output is teed to a log so a failed
+            # conversion is debuggable over SSH (DebugSsh=true).
+            set -euxo pipefail
+            exec > >(tee /var/log/agent-box-infect.log) 2>&1
+
+            # 0. curl is used below before nixos-infect installs its own deps.
+            #    Ubuntu cloud images ship it, but don't assume.
+            command -v curl >/dev/null || { apt-get update -y && apt-get install -y curl; }
+
+            # 1. Extra swap. The nix build of the system closure (and later
+            #    nixos-rebuild self-updates) is the OOM risk on 1-2 GiB bundles.
+            #    nixos-infect makes only a 1 GiB swap; pre-make 3 GiB and tell it
+            #    to leave swap alone (NO_SWAP=1).
+            if ! swapon --show=NAME --noheadings | grep -qx /agent-box-swap; then
+              fallocate -l 3G /agent-box-swap || dd if=/dev/zero of=/agent-box-swap bs=1M count=3072
+              chmod 600 /agent-box-swap
+              mkswap /agent-box-swap
+              swapon /agent-box-swap
+            fi
+
+            # 2. Settle the public IPv4. CloudFormation attaches the static IP a
+            #    minute or two after the instance starts; the sleep clears that
+            #    window and the stability loop then confirms the address stopped
+            #    changing before we bake it into the sslip.io hostname. The whole
+            #    NixOS build/reboot that follows takes far longer than the attach,
+            #    so the settled address is the STATIC one the Outputs also report.
+            sleep 150
+            prev=""; stable=0; ip=""
+            for _ in $(seq 1 60); do
+              ip=$(curl -4 -fsS --max-time 5 https://checkip.amazonaws.com | tr -d '[:space:]' || true)
+              if [ -n "$ip" ] && [ "$ip" = "$prev" ]; then stable=$((stable + 1)); else stable=0; fi
+              prev="$ip"
+              [ "$stable" -ge 3 ] && break
+              sleep 10
+            done
+            [ -n "$ip" ] || { echo "agent-box: no public IPv4 to derive hostname"; exit 1; }
+            dom="$(echo "$ip" | tr . -).sslip.io"
+
+            # 3. Capture the Lightsail-injected SSH public key before infection.
+            #    The NixOS "lustrate" wipes /home and /root on the first NixOS
+            #    boot, and amazon-init (which would otherwise re-sync keys from
+            #    IMDS) is disabled below, so the key must be baked into the Nix
+            #    config now or root SSH is lost.
+            key="$(grep -hE '^(ssh|ecdsa|sk-)' /home/ubuntu/.ssh/authorized_keys /root/.ssh/authorized_keys 2>/dev/null | head -n1 || true)"
+
+            # 4. Write /etc/nixos/configuration.nix BEFORE running nixos-infect.
+            #    The script's makeConf() returns early when this file already
+            #    exists, so it will not clobber our config; PROVIDER=lightsail
+            #    still performs the mandatory root-fs relabel. The config mirrors
+            #    the EC2 template's proven agent-box config, minus Spot/NAT64 and
+            #    plus the Lightsail platform bits (amazon-image import + GRUB on
+            #    nvme). @@DOMAIN@@ / @@SSHKEY@@ are spliced by sed in step 5;
+            #    every Nix antiquote is written as ${!...} so CloudFormation's
+            #    Fn::Sub leaves it intact.
+            mkdir -p /etc/nixos
+            cat > /etc/nixos/configuration.nix <<'AGENTBOX_NIXCFG'
+            { config, pkgs, lib, modulesPath, ... }:
+            let
+              # Module pin. First boot uses the launch-time parameters; after
+              # that, agent-box-update.service owns the pin file and advances it,
+              # so the same configuration.nix keeps working across self-updates.
+              pin =
+                if builtins.pathExists /etc/nixos/agent-box-pin.nix
+                then import /etc/nixos/agent-box-pin.nix
+                else { rev = "${AgentBoxRev}"; sha256 = "${AgentBoxSha256}"; };
+              # Agent-CLI nixpkgs pin (claude-code, codex). Empty URL -> null ->
+              # fall back to the base channel rather than feeding fetchTarball a
+              # blank URL and bricking first boot.
+              agentPin =
+                if builtins.pathExists /etc/nixos/agent-box-agent-pin.nix
+                then import /etc/nixos/agent-box-agent-pin.nix
+                else if "${AgentNixpkgsUrl}" == "" then null
+                else { url = "${AgentNixpkgsUrl}"; sha256 = "${AgentNixpkgsSha256}"; };
+              # raw.githubusercontent.com is dual-stack; the box has IPv4, so the
+              # single-file module fetches directly with no NAT64 hop.
+              agent-box-module = builtins.fetchurl {
+                url = "https://raw.githubusercontent.com/defangdevs/agent-box/${!pin.rev}/modules/agent-box.nix";
+                sha256 = pin.sha256;
+              };
+              hostname = "@@DOMAIN@@";
+              sshKey = "@@SSHKEY@@";
+              # Fn::Sub receives a base64 projection of WebPassword so every
+              # password-manager symbol stays inert Nix source; decoded only into
+              # a shell variable in the activation script below.
+              webPasswordBase64 = "${WebPasswordBase64}";
+            in {
+              imports = [
+                "${!modulesPath}/virtualisation/amazon-image.nix"
+                agent-box-module
+              ];
+
+              # Lightsail (Nitro) roots on nvme and boots BIOS/GRUB (no EFI).
+              # amazon-image.nix mounts / by the label `nixos`, which
+              # nixos-infect's PROVIDER=lightsail path applied during infection.
+              boot.loader.grub.device = lib.mkForce "/dev/nvme0n1";
+
+              services.agent-box = {
+                enable = true;
+                agent = "${Agent}";
+                users."${UserName}" = {
+                  environment = { TERM = "xterm-256color"; };
+                  remoteControlName = "${UserName}@${StackName}";
+                  web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                  # AGENTS.md addendum from the CFN AgentsMd parameter, spliced
+                  # into a Nix indented string; the module appends it below its
+                  # built-in default. The placeholder sits at column 0 after YAML
+                  # strips the block-scalar indent, so multi-line values line up.
+                  agentsMd = ''
+            ${AgentsMd}
+            '';
+                };
+                web = {
+                  enable = true;
+                  domain = hostname;
+                  user = "${UserName}";
+                };
+                # Lets the agent update the box on request:
+                #   sudo systemctl start agent-box-update.service
+                selfUpdate = {
+                  enable = true;
+                  rev = pin.rev;
+                  agentNixpkgs = agentPin;
+                };
+                # No Spot on Lightsail — nothing for the interruption monitor to
+                # watch, so leave it off (the module also self-gates on IMDS
+                # instance-life-cycle, but keep the deployed config honest).
+                spotInterruption.enable = false;
+              };
+
+              # SSH is the only privileged path in (no SSM on Lightsail). Bake the
+              # Lightsail default key for root; password auth stays off.
+              services.openssh.enable = true;
+              services.openssh.settings.PasswordAuthentication = false;
+              users.users.root.openssh.authorizedKeys.keys =
+                lib.optional (sshKey != "") sshKey;
+
+              # First-boot health signal: PUT to the WaitCondition handle once
+              # this config has actually switched, so a box that never applied
+              # user-data surfaces as CREATE_FAILED instead of a black-holed URL.
+              systemd.services.agent-box-first-boot-signal = {
+                wantedBy = [ "multi-user.target" ];
+                after = [ "network-online.target" ];
+                wants = [ "network-online.target" ];
+                serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+                script = ''
+                  marker=/var/lib/agent-box-web/first-boot-signaled
+                  [ -e "$marker" ] && exit 0
+                  ${!pkgs.curl}/bin/curl -s -X PUT -H 'Content-Type:' \
+                    --retry 10 --retry-delay 15 --retry-all-errors \
+                    --data-binary '{"Status":"SUCCESS","Reason":"first nixos-rebuild switch complete","UniqueId":"first-boot","Data":"ok"}' \
+                    "${FirstBootHandle}" && touch "$marker" || true
+                '';
+              };
+
+              # Materialize the web password hash from the plaintext CFN
+              # parameter before any service reads it. Subshell so the umask 077
+              # does not leak into later activation snippets (they share one
+              # shell). Hash lives outside /nix/store so it stays private.
+              system.activationScripts.agent-web-password-hash.text = ''
+                install -d -m 0700 /var/lib/agent-box-web
+                if [ ! -s /var/lib/agent-box-web/password-hash ]; then
+                  (
+                    umask 077
+                    webPassword="$(
+                      ${!pkgs.coreutils}/bin/printf '%s' ${!lib.escapeShellArg webPasswordBase64} \
+                        | ${!pkgs.coreutils}/bin/base64 --decode
+                    )"
+                    ${!pkgs.coreutils}/bin/printf '%s\n' "$webPassword" \
+                      | ${!pkgs.caddy}/bin/caddy hash-password --algorithm argon2id \
+                        > /var/lib/agent-box-web/password-hash
+                    unset webPassword
+                  )
+                  chmod 0600 /var/lib/agent-box-web/password-hash
+                fi
+              '';
+
+              # Disk watchdog: the nix store grows on every rebuild / self-update
+              # and a full root wedges the whole box. GC on a timer plus mid-build
+              # when free space dips.
+              nix.gc = {
+                automatic = true;
+                options = "--delete-older-than 7d";
+              };
+              nix.settings = {
+                min-free = 1073741824;  # start GC below 1 GiB free
+                max-free = 5368709120;  # ... and free up to 5 GiB
+              };
+              services.journald.extraConfig = "SystemMaxUse=200M";
+
+              # The Lightsail user-data is THIS shell script, not a NixOS config.
+              # amazon-init would try to re-run it on every boot (it starts with
+              # "#!"), re-triggering infection — disable it, same as the EC2
+              # template disables re-applying user-data.
+              systemd.services.amazon-init.enable = lib.mkForce false;
+
+              system.stateVersion = "${NixChannelVersion}";
+            }
+            AGENTBOX_NIXCFG
+
+            # 5. Splice the runtime-discovered values into the config.
+            sed -i "s|@@DOMAIN@@|$dom|g; s|@@SSHKEY@@|$key|g" /etc/nixos/configuration.nix
+
+            # 6. Fetch the pinned nixos-infect and run it. makeConf() early-returns
+            #    (our configuration.nix exists), PROVIDER=lightsail relabels the
+            #    root fs to `nixos`, and the script reboots into NixOS at the end.
+            curl -fsSL "https://raw.githubusercontent.com/elitak/nixos-infect/${NixosInfectRev}/nixos-infect" -o /root/nixos-infect
+            NO_SWAP=1 PROVIDER=lightsail NIX_CHANNEL="${NixChannel}" bash /root/nixos-infect
+          - WebPasswordBase64:
+              Fn::Base64: !Ref WebPassword
+            StackName: !Ref AWS::StackName
+            # stateVersion wants "25.05", not "nixos-25.05" — strip the prefix.
+            NixChannelVersion: !Select [1, !Split ['-', !Ref NixChannel]]
+            FirstBootHandle: !Ref FirstBootHandle
+
+  # Static IPv4 — free while attached on Lightsail, and stable across a
+  # stop/start (unlike the bundle's default public IP), so the sslip.io URL
+  # keeps working. AttachedTo takes the instance NAME (Ref returns it), which
+  # also orders creation after the instance. UserData does NOT reference this
+  # resource (it discovers the address at runtime) so there is no dependency
+  # cycle between the two.
+  StaticIp:
+    Type: AWS::Lightsail::StaticIp
+    Properties:
+      StaticIpName: !Sub '${AWS::StackName}-ip'
+      AttachedTo: !Ref Instance
+
+  # First-boot health gate (mirrors the EC2 template's issue-106 gate). The box
+  # PUTs a success signal after its first nixos-rebuild switch. nixos-infect
+  # plus the initial closure build and reboot take a while on a small bundle,
+  # so the timeout is generous. No IPv4/NAT64 conditionals — Lightsail always
+  # has a public IPv4, so the presigned (IPv4-only) handle is always reachable.
+  FirstBootHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  FirstBootDone:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: Instance
+    Properties:
+      Handle: !Ref FirstBootHandle
+      Count: 1
+      Timeout: '2700'
+
+Outputs:
+  WebURL:
+    Description: >-
+      Browser terminal for the selected agent. Claude Code deployments are also
+      drivable from the Claude apps via Remote Control after the first login.
+      First load takes several minutes while the box converts to NixOS and Caddy
+      issues an ACME cert. Sign in with the UserName (default "agent") and the
+      WebPassword chosen at deployment time. (The URL deliberately carries no
+      user@ prefix: Chrome answers the auth challenge with URL userinfo plus an
+      EMPTY password, and credentials typed into the prompt cannot override the
+      URL-embedded identity.)
+    Value: !Sub
+      - 'https://${Host}.sslip.io/${UserName}/'
+      - Host: !Join ['-', !Split ['.', !GetAtt StaticIp.IpAddress]]
+
+  RemoteControlSession:
+    Description: >-
+      Claude Remote Control session name (<UserName>@<stack name>). After
+      finishing `claude login` once in the browser terminal, the Claude
+      desktop / mobile apps can drive this session directly (sign in with the
+      same Claude account). Only meaningful when Agent=claude; Codex has no
+      Remote Control channel.
+    Value: !Sub '${UserName}@${AWS::StackName}'
+
+  PublicAddress:
+    Description: Attached static IPv4 address.
+    Value: !GetAtt StaticIp.IpAddress
+
+  SshCommand:
+    Description: >-
+      Root SSH for debugging (only when DebugSsh=true). Download the Lightsail
+      default key from the console (Account -> SSH keys) first.
+    Value: !Sub
+      - 'ssh -i <lightsail-default-key> root@${Ip}'
+      - Ip: !GetAtt StaticIp.IpAddress
+
+  InstanceName:
+    Description: Lightsail instance name.
+    Value: !Ref Instance
