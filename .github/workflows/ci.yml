@@ -5,6 +5,13 @@ on:
     branches: [ master ]
     paths: &build-paths
       - '**.nix'
+      # Sources of the generated modules/agent-box.nix (issue #140): a change
+      # here can reassemble to the same bytes (a pure refactor), so it would
+      # not touch a *.nix file — match them explicitly so the module-generated-
+      # up-to-date guard (and the rest of CI) still runs.
+      - 'modules/agent-box.nix.in'
+      - 'modules/src/**'
+      - 'bin/assemble-module.py'
       - 'flake.lock'
       - '.github/workflows/ci.yml'
   pull_request:

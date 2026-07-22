@@ -1,0 +1,123 @@
+body { margin: 0; min-height: 100vh; background: #0d1117; color: #e6edf3;
+       font: 14px/1.5 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+main { max-width: 720px; margin: 0 auto; padding: 32px 20px 48px; }
+h1 { font-size: 24px; font-weight: 600; margin: 8px 0 4px; }
+h2 { font-size: 16px; font-weight: 600; margin: 0; }
+section { margin: 28px 0; }
+.sec-head { display: flex; align-items: center; justify-content: space-between;
+            gap: 12px; }
+.repo { position: fixed; top: 16px; right: 16px; display: inline-flex;
+        align-items: center; gap: 8px; padding: 8px 10px;
+        border: 1px solid #30363d; border-radius: 8px; background: #161b22;
+        color: #e6edf3; font-size: 13px; text-decoration: none; }
+.repo:hover { border-color: #e8a087; color: #e8a087; text-decoration: none; }
+.repo svg { width: 16px; height: 16px; fill: currentColor; }
+a.back { color: #8b949e; text-decoration: none; font-size: 13px; }
+a.back:hover { color: #e6edf3; }
+.note { color: #8b949e; font-size: 13px; margin: 6px 0 0; }
+.note a { color: #58a6ff; text-decoration: none; }
+.note a:hover { text-decoration: underline; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+       font-size: 13px; }
+.tbl { list-style: none; margin: 12px 0 0; padding: 0;
+       border: 1px solid #30363d; border-radius: 8px; overflow: hidden; }
+.tbl li { display: flex; align-items: center; justify-content: space-between;
+          gap: 12px; padding: 10px 16px; border-top: 1px solid #30363d; }
+.tbl li:first-child { border-top: 0; }
+.tbl-head { background: #161b22; color: #8b949e; font-size: 13px;
+            font-weight: 600; }
+li.empty { color: #8b949e; font-size: 13px; }
+.nm { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.nm svg { color: #8b949e; flex: none; }
+a.sess { color: #58a6ff; text-decoration: none; }
+a.sess:hover { text-decoration: underline; }
+.acts { display: flex; align-items: center; gap: 4px; flex: none; }
+.meta { color: #8b949e; font-size: 12px; }
+.state { font-size: 12px; color: #8b949e; }
+.state::before { content: ""; display: inline-block; width: 8px; height: 8px;
+                 border-radius: 50%; background: currentColor; margin-right: 5px; }
+.state[data-state=live] { color: #3fb950; }
+.state[data-state=starting] { color: #d29922; }
+.btn { font: inherit; font-size: 13px; font-weight: 500; padding: 5px 14px;
+       border-radius: 6px; border: 1px solid #30363d; background: #21262d;
+       color: #e6edf3; cursor: pointer; white-space: nowrap; }
+.btn:hover { background: #30363d; }
+.btn.small { padding: 3px 10px; font-size: 12px; }
+button.icon { display: inline-flex; padding: 5px 8px; background: transparent;
+              border: 0; border-radius: 6px; color: #8b949e; cursor: pointer; }
+button.icon:hover { background: #21262d; color: #e6edf3; }
+button.icon.idanger:hover { color: #f85149; background: rgba(248,81,73,.1); }
+.danger-btn { color: #f85149; }
+.danger-btn:hover { background: #da3633; border-color: #f85149; color: #fff; }
+.tbl.danger { border-color: rgba(248,81,73,.4); }
+.dz { display: flex; flex-direction: column; min-width: 0; }
+.dz strong { font-size: 14px; }
+.dz .note { margin: 2px 0 0; }
+.update-state { color: #8b949e; }
+.update-state[data-state=available] { color: #d29922; }
+.update-state[data-state=current] { color: #3fb950; }
+.update-state[data-state=blocked] { color: #f85149; }
+.editor { border: 1px solid #30363d; border-radius: 8px; background: #161b22;
+          padding: 14px 16px; margin: 12px 0 0; }
+input, select { font: inherit; font-size: 13px; padding: 6px 10px;
+                border-radius: 6px; border: 1px solid #30363d;
+                background: #0d1117; color: #e6edf3; }
+input[type=text] { width: 200px; max-width: 100%; }
+input[type=password] { width: 280px; max-width: 100%; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+/* Working-directory combobox (issue #131): the input plus an
+   absolutely-positioned suggestions list the daemon fills one
+   directory level at a time. */
+.combo { position: relative; display: inline-block; }
+input.cwd { width: 260px; max-width: 100%;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.ac { position: absolute; z-index: 20; left: 0; top: calc(100% + 4px);
+      margin: 0; padding: 4px; list-style: none; min-width: 100%;
+      max-width: 360px; max-height: 220px; overflow-y: auto;
+      background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+      box-shadow: 0 8px 24px rgba(1,4,9,.6); }
+.ac[hidden] { display: none; }
+.ac li { padding: 5px 10px; border-radius: 6px; cursor: pointer;
+         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+         font-size: 13px; color: #e6edf3; white-space: nowrap; }
+.ac li:hover, .ac li[aria-selected=true] { background: #30363d; }
+.ac li.empty { color: #8b949e; cursor: default; }
+.ac li.empty:hover { background: transparent; }
+.fields { display: grid; grid-template-columns: 1fr; gap: 12px; }
+.field { display: flex; flex-direction: column; align-items: flex-start;
+         gap: 4px; color: #8b949e; font-size: 13px; }
+.field input { box-sizing: border-box; width: 100%; }
+form.inline { display: inline; }
+.msg { padding: 10px 14px; border-radius: 8px; margin: 12px 0;
+       border: 1px solid rgba(63,185,80,.4); background: #10251a;
+       color: #7ee787; font-size: 13px; }
+/* Tabbed terminal workspace (the HOME root page, issue #119). The
+   page is a fixed-viewport column: tab bar on top, terminal panes
+   filling the rest. Panes are stacked and toggled with visibility
+   (NOT display) so a hidden terminal keeps its layout size — xterm
+   would otherwise re-measure a 0x0 box on every tab switch. */
+body.ws { display: flex; flex-direction: column; height: 100vh;
+          height: 100dvh; min-height: 0; overflow: hidden; }
+.tabs { display: flex; align-items: flex-end; gap: 2px; flex: none;
+        padding: 8px 8px 0; background: #010409;
+        border-bottom: 1px solid #30363d; overflow-x: auto; }
+.tab { display: inline-flex; align-items: center; padding: 6px 14px 8px;
+       font-size: 13px; color: #8b949e; text-decoration: none;
+       border: 1px solid transparent; border-bottom: 0;
+       border-radius: 8px 8px 0 0; white-space: nowrap; }
+.tab:hover { color: #e6edf3; }
+.tab[aria-current] { background: #0d1117; border-color: #30363d;
+                     color: #e6edf3; }
+.tab-empty { color: #8b949e; font-size: 13px; padding: 6px 8px 8px; }
+.tabs .btn.add { margin: 0 4px 6px; padding: 2px 9px; }
+.tabs .spacer { flex: 1; }
+.tabs a.gear { color: #8b949e; text-decoration: none; font-size: 15px;
+               padding: 2px 8px 8px; }
+.tabs a.gear:hover { color: #e6edf3; }
+.ws .editor, .ws .msg { margin: 8px; flex: none; }
+.panes { position: relative; flex: 1; min-height: 0; }
+.pane { position: absolute; inset: 0; width: 100%; height: 100%;
+        border: 0; visibility: hidden; }
+.pane.active { visibility: visible; }
+.pane.placeholder { display: flex; align-items: center;
+                    justify-content: center; color: #8b949e; }
