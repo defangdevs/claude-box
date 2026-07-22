@@ -10,6 +10,7 @@ on:
       - 'scripts/ws_smoke.py'
       - '.github/workflows/aws-ci.yml'
       - '.github/workflows/deploy-test.yml'
+      - '.github/workflows/deploy-test-lightsail.yml'
   pull_request:
     paths: *aws-ci-paths
   workflow_dispatch:

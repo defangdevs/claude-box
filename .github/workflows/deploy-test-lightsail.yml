@@ -1,0 +1,365 @@
+name: Deploy test — Lightsail (CFN create + destroy)
+
+# End-to-end test for aws/lightsail-template.yaml. Kept SEPARATE from
+# deploy-test.yml because the Lightsail model shares almost nothing with the
+# EC2 one operationally: no ipv4/ipv6 matrix (Lightsail is always dual-stack
+# with a public IPv4, so a GH runner can always reach it), no Spot, no SSM,
+# and no `ec2 get-console-output` for diagnostics. The one thing that IS
+# shared — the browser-terminal smoke suite — is reused verbatim, including
+# scripts/ws_smoke.py.
+#
+# Because Lightsail is IPv4-native and GH runners are IPv4-only, this single
+# leg runs the FULL connectivity smoke tests (unlike the EC2 template's
+# ipv6-outputs leg, which can only assert outputs). The template's
+# FirstBootDone WaitCondition gates CREATE_COMPLETE on the first nixos-rebuild
+# switch, so a box that never applied its user-data surfaces as CREATE_FAILED
+# rather than a black-holed URL — meaning we don't need the EC2 leg's
+# serial-console amazon-init probe here.
+
+on:
+  push:
+    branches: [ master ]
+    paths:
+      - 'aws/lightsail-template.yaml'
+      - 'modules/**'
+      - 'scripts/ws_smoke.py'
+      - '.github/workflows/deploy-test-lightsail.yml'
+  workflow_dispatch:
+    inputs:
+      region:
+        # The test account's SCP only allows us-west-2 — other choices are kept
+        # for forks running against their own account. Must be a Lightsail
+        # region.
+        description: Region to deploy into
+        type: choice
+        options:
+          - us-west-2
+          - us-east-1
+          - eu-central-1
+          - eu-west-1
+        default: us-west-2
+      bundle_id:
+        # Must be one of the template's annotated AllowedValues (comma-free, so
+        # the ParameterKey=...,ParameterValue=... shorthand still parses). Only
+        # the first token reaches Lightsail; the rest is a console label.
+        description: Lightsail bundle (template AllowedValues form)
+        type: string
+        default: small_3_0 (2 vCPU / 2 GiB / 60 GiB SSD / $12 mo)
+      destroy:
+        description: Delete the stack at the end (uncheck to keep it up for debugging)
+        type: boolean
+        default: true
+      web_password:
+        description: >-
+          WebPassword override (16-64 chars). Empty = random hex. Use to
+          reproduce auth issues with specific password shapes; it WILL appear
+          in the run log, so throwaway values only.
+        type: string
+        default: ''
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-test-lightsail-${{ inputs.region || 'us-west-2' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy-test-lightsail:
+    runs-on: ubuntu-latest
+    # Fork? Override with a repo-scoped var AGENT_BOX_ENVIRONMENT, or edit the fallback.
+    environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
+    # nixos-infect + the initial closure build + reboot is slow on a small
+    # bundle; the template's WaitCondition allows 45 min. Give the job headroom
+    # over that plus the smoke-test retry budget.
+    timeout-minutes: 60
+    env:
+      AWS_REGION: ${{ inputs.region || 'us-west-2' }}
+      ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      STACK_NAME: agent-box-e2e-lightsail-${{ github.run_id }}
+    steps:
+      - name: Sanity-check required variables
+        run: |
+          if [ -z "$ROLE_ARN" ]; then
+            echo "::error::Missing repo variable: AWS_ROLE_ARN. See aws/README.md."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v5
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate WebPassword
+        id: pw
+        run: |
+          # 48 hex chars — satisfies the template's ^.{16,64}$ AllowedPattern.
+          # Dispatch runs may override to reproduce shape-specific auth bugs;
+          # the override is intentionally not masked.
+          if [ -n '${{ inputs.web_password }}' ]; then
+            echo "value=${{ inputs.web_password }}" >> "$GITHUB_OUTPUT"
+            echo "::notice::Using dispatch-provided WebPassword override."
+          else
+            echo "value=$(openssl rand -hex 24)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute module pin (AgentBoxRev + AgentBoxSha256)
+        id: pin
+        # AgentBoxRev/AgentBoxSha256 have no Default in the source template (a
+        # pinned pair; builtins.fetchurl hard-fails on drift) — publish-template
+        # injects Defaults on the S3 path. Here we pin to the commit that
+        # triggered this run so the test exercises the module content that just
+        # landed. Same computation as deploy-test.yml.
+        run: |
+          rev="${{ github.sha }}"
+          sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
+            | openssl dgst -sha256 -binary | base64)"
+          echo "rev=$rev" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "::notice::Pinned AgentBoxRev=$rev AgentBoxSha256=$sha"
+
+      - name: Create stack
+        id: create
+        env:
+          # Passed via env (not inlined into the script) so the shell never
+          # expands the "$12" in the bundle's price annotation as a positional
+          # parameter — that would corrupt the value and fail AllowedValues
+          # validation. Same guard for a dispatch WebPassword override that may
+          # contain shell metacharacters.
+          BUNDLE_ID: ${{ inputs.bundle_id || 'small_3_0 (2 vCPU / 2 GiB / 60 GiB SSD / $12 mo)' }}
+          WEB_PASSWORD: ${{ steps.pw.outputs.value }}
+          AGENT_BOX_REV: ${{ steps.pin.outputs.rev }}
+          AGENT_BOX_SHA: ${{ steps.pin.outputs.sha }}
+        run: |
+          # No --capabilities: the Lightsail template creates no IAM. DebugSsh
+          # stays false — this is a short-lived, publicly-reachable box and
+          # there is no SSM/console diagnostic path we'd feed the SSH key into,
+          # so leaving 22 closed costs nothing. AgentsMd/AllowCidr/NixChannel/
+          # NixosInfectRev/Agent/UserName ride their template defaults. No comma
+          # in any value, so the ParameterKey=...,ParameterValue=... shorthand
+          # still parses (BundleId's spaces/parens are fine).
+          aws cloudformation create-stack \
+            --stack-name "$STACK_NAME" \
+            --template-body "file://aws/lightsail-template.yaml" \
+            --parameters \
+              "ParameterKey=BundleId,ParameterValue=$BUNDLE_ID" \
+              "ParameterKey=WebPassword,ParameterValue=$WEB_PASSWORD" \
+              "ParameterKey=DebugSsh,ParameterValue=false" \
+              "ParameterKey=AgentBoxRev,ParameterValue=$AGENT_BOX_REV" \
+              "ParameterKey=AgentBoxSha256,ParameterValue=$AGENT_BOX_SHA" \
+            --on-failure DO_NOTHING \
+            --tags "Key=Purpose,Value=agent-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
+          echo "::notice::Waiting for stack ${STACK_NAME} to reach CREATE_COMPLETE (FirstBootDone gates on the first nixos-rebuild switch; up to ~45 min)..."
+          aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
+
+      - name: Dump failed stack state
+        if: failure() && steps.create.outcome == 'failure'
+        run: |
+          # No serial console on Lightsail. The WaitCondition timing out is the
+          # usual failure (first nixos-rebuild never signaled) — the stack
+          # events carry the reason. Also dump the instance's own state.
+          echo "::group::Stack events (CREATE_FAILED only)"
+          aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+            --query 'reverse(StackEvents[?ResourceStatus==`CREATE_FAILED`].[LogicalResourceId,ResourceStatusReason])' \
+            --output table || true
+          echo "::endgroup::"
+          echo "::group::Stack status"
+          aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].[StackStatus,StackStatusReason]' --output table || true
+          echo "::endgroup::"
+          echo "::group::Lightsail instance state"
+          aws lightsail get-instance-state --instance-name "$STACK_NAME" \
+            --query 'state.name' --output text 2>/dev/null || echo "(instance not queryable)"
+          echo "::endgroup::"
+
+      - name: Fetch outputs
+        id: outputs
+        run: |
+          web_url=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`WebURL`].OutputValue | [0]' --output text)
+          public_ip=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`PublicAddress`].OutputValue | [0]' --output text)
+          instance_name=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`InstanceName`].OutputValue | [0]' --output text)
+          echo "web_url=$web_url"   >> "$GITHUB_OUTPUT"
+          echo "public_ip=$public_ip" >> "$GITHUB_OUTPUT"
+          echo "instance_name=$instance_name" >> "$GITHUB_OUTPUT"
+          echo "::notice::Stack up. WebURL=$web_url  PublicIP=$public_ip  InstanceName=$instance_name"
+
+      - name: Assert outputs are populated
+        run: |
+          ip='${{ steps.outputs.outputs.public_ip }}'
+          url='${{ steps.outputs.outputs.web_url }}'
+          fail=0
+          if [ -z "$ip" ] || [ "$ip" = "None" ]; then
+            echo "::error::PublicAddress output is empty."; fail=1
+          fi
+          # The host must be present. Also reject any userinfo in the authority:
+          # Chrome answers the auth challenge with URL userinfo + an EMPTY
+          # password, and typed credentials can't override it (issue 56).
+          rest=${url#https://}
+          authority=${rest%%/*}
+          case "$authority" in *@*)
+            echo "::error::WebURL must not contain userinfo (user@): $url"; fail=1 ;;
+          esac
+          host=${authority%.sslip.io}
+          if [ -z "$host" ]; then
+            echo "::error::WebURL host is blank: $url"; fail=1
+          fi
+          if [ "$fail" = 0 ]; then
+            echo "::notice::Outputs OK - PublicAddress=$ip host=$host"
+          fi
+          exit $fail
+
+      - name: Smoke test — wait for authenticated terminal URL to serve ttyd HTML
+        env:
+          WEB_PASSWORD: ${{ steps.pw.outputs.value }}
+        run: |
+          url='${{ steps.outputs.outputs.web_url }}'
+          terminal_url="$url"
+          # CREATE_COMPLETE means the first switch is done, but Caddy's ACME
+          # cert issuance can still lag by a couple of minutes.
+          for i in $(seq 1 60); do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 \
+              -u "agent:${WEB_PASSWORD}" "$terminal_url" || true)
+            echo "[$i/60] authenticated GET $terminal_url -> $code"
+            if [ "$code" = "200" ]; then
+              echo "::notice::Authenticated terminal URL is serving (HTTP 200) - Caddy + ttyd are up."
+              break
+            fi
+            sleep 10
+          done
+          if [ "$code" != "200" ]; then
+            echo "::error::Never got 200 from $terminal_url after 10 min."
+            exit 1
+          fi
+
+      - name: Smoke test — verify unauthenticated URL returns 401
+        run: |
+          url='${{ steps.outputs.outputs.web_url }}'
+          terminal_url="$url"
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 5 "$terminal_url" || true)
+          if [ "$code" = "401" ]; then
+            echo "::notice::Unauthenticated terminal URL returns 401 as expected."
+          else
+            echo "::error::Expected 401 at $terminal_url (no Basic auth), got $code."
+            exit 1
+          fi
+
+      - name: Smoke test — root serves the tabbed workspace behind auth
+        env:
+          WEB_PASSWORD: ${{ steps.pw.outputs.value }}
+        run: |
+          url='${{ steps.outputs.outputs.web_url }}'
+          terminal_url="$url"
+          root_url="${terminal_url%agent/}"
+          # The root workspace must never be public: it iframes the terminal
+          # and can create sessions.
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 10 "$root_url" || true)
+          if [ "$code" != "401" ]; then
+            echo "::error::Expected 401 at $root_url without credentials, got $code."
+            exit 1
+          fi
+          body=$(curl -sS --max-time 10 -u "agent:${WEB_PASSWORD}" "$root_url" || true)
+          if echo "$body" | grep -q 'href="https://[^/"]*@'; then
+            echo "::error::Workspace at $root_url embeds URL userinfo (user@) in an href — Chrome auto-sends an empty password and typed credentials can't override it (issue 56):"
+            echo "$body" | head -20
+            exit 1
+          fi
+          # The tabbed workspace (issue 119): the tab bar carries the ttyd base
+          # for iframe panes, and each session is a ?tab= link. The iframe
+          # itself is NOT asserted — it only renders once the session's tmux is
+          # live, which can lag boot.
+          if ! echo "$body" | grep -qF 'data-term-base="/agent/"'; then
+            echo "::error::Workspace at $root_url isn't wired to the ttyd base /agent/ (no data-term-base):"
+            echo "$body" | head -20
+            exit 1
+          fi
+          if echo "$body" | grep -qF 'href="/?tab='; then
+            echo "::notice::Workspace tab bar lists the sessions (no credentials in the URL)."
+          else
+            echo "::error::Workspace at $root_url has no session tabs (href=\"/?tab=\"):"
+            echo "$body" | head -20
+            exit 1
+          fi
+
+      - name: Smoke test — verify ttyd HTML body
+        env:
+          WEB_PASSWORD: ${{ steps.pw.outputs.value }}
+        run: |
+          url='${{ steps.outputs.outputs.web_url }}'
+          terminal_url="$url"
+          body=$(curl -sS --max-time 15 -u "agent:${WEB_PASSWORD}" "$terminal_url")
+          if echo "$body" | grep -qi "ttyd\|terminal"; then
+            echo "::notice::ttyd HTML served correctly."
+          else
+            echo "::error::Response body doesn't look like ttyd:"
+            echo "$body" | head -20
+            exit 1
+          fi
+
+      - name: Smoke test — WebSocket upgrade
+        env:
+          WEB_PASSWORD: ${{ steps.pw.outputs.value }}
+        run: |
+          url='${{ steps.outputs.outputs.web_url }}'
+          terminal_url="$url"
+          cookie_jar=$(mktemp)
+          curl -sS -o /dev/null --max-time 15 -u "agent:${WEB_PASSWORD}" -c "$cookie_jar" "$terminal_url"
+          # 101 = Switching Protocols (success). Browsers send cookies on the
+          # upgrade request, so this proves the Basic-auth bootstrap cookie works.
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --http1.1 --max-time 10 \
+            -b "$cookie_jar" \
+            -H "Connection: Upgrade" \
+            -H "Upgrade: websocket" \
+            -H "Sec-WebSocket-Version: 13" \
+            -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+            -H "Sec-WebSocket-Protocol: tty" \
+            "${terminal_url}ws" || true)
+          echo "WebSocket upgrade attempt -> HTTP $code"
+          if [ "$code" = "101" ]; then
+            echo "::notice::WebSocket upgrade succeeded (101 Switching Protocols)."
+          else
+            echo "::error::WebSocket upgrade failed (got $code, expected 101)."
+            exit 1
+          fi
+
+      - name: Smoke test — tmux session is live (not just ttyd reachable)
+        env:
+          WEB_PASSWORD: ${{ steps.pw.outputs.value }}
+        run: |
+          # 101 above only proves ttyd upgrades the socket; it says nothing about
+          # whether `tmux attach` found a session. Attach for real and assert the
+          # terminal isn't showing tmux's "no sessions". Retries because the
+          # agent's session can take a moment to come up after boot.
+          python3 -m pip install --quiet websocket-client
+          url='${{ steps.outputs.outputs.web_url }}'
+          for i in $(seq 1 12); do
+            if python3 scripts/ws_smoke.py "$url" "$WEB_PASSWORD"; then
+              exit 0
+            fi
+            echo "[$i/12] no live session yet; retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Browser terminal never attached to a live tmux session."
+          exit 1
+
+      - name: Destroy stack
+        # Push runs (no inputs) always destroy; dispatched runs honor inputs.destroy.
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.destroy) }}
+        run: |
+          # No Spot requests to cancel (Lightsail has none). delete-stack tears
+          # down the instance and detaches+deletes the static IP.
+          echo "Deleting $STACK_NAME..."
+          aws cloudformation delete-stack --stack-name "$STACK_NAME"
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" || true
+
+      - name: Flag kept stack
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && !inputs.destroy }}
+        run: |
+          echo "::warning::Stack '$STACK_NAME' was kept (destroy=false). It's still billing."
+          echo "::warning::Delete manually: aws cloudformation delete-stack --stack-name $STACK_NAME --region $AWS_REGION"
